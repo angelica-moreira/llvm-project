@@ -39,7 +39,8 @@ static cl::OptionCategory *BoltCategories[] = {&BoltCategory,
                                                &BoltOptCategory,
                                                &BoltRelocCategory,
                                                &BoltInstrCategory,
-                                               &BoltOutputCategory};
+                                               &BoltOutputCategory,
+                                               &BoltInferenceCategory};
 
 static cl::OptionCategory *BoltDiffCategories[] = {&BoltDiffCategory};
 
@@ -124,7 +125,7 @@ void perf2boltMode(int argc, char **argv) {
            << "': expected valid perf.data file.\n";
     exit(1);
   }
-  if (opts::OutputFilename.empty()) {
+  if (!opts::GenFeatures && opts::OutputFilename.empty()) {
     errs() << ToolName << ": expected -o=<output file> option.\n";
     exit(1);
   }

@@ -564,6 +564,18 @@ public:
     return false;
   }
 
+  /// Return true if the instruction is a load instruction.
+  virtual bool isLoad(const MCInst &Inst) const {
+    llvm_unreachable("not implemented");
+    return false;
+  }
+
+  /// Return true if the instruction is a store instruction.
+  virtual bool isStore(const MCInst &Inst) const {
+    llvm_unreachable("not implemented");
+    return false;
+  }
+
   /// Return the width, in bytes, of the memory access performed by \p Inst, if
   /// this is a pop instruction. Return zero otherwise.
   virtual int getPopSize(const MCInst &Inst) const {

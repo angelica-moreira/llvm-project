@@ -58,6 +58,9 @@ extern cl::OptionCategory BoltCategory;
 extern cl::OptionCategory BoltOptCategory;
 
 extern cl::opt<bool> EnableBAT;
+extern cl::opt<bool> FreqInference;
+extern cl::opt<bool> FuncFreqInference;
+extern cl::opt<bool> GenFeatures;
 extern cl::opt<bool> Instrument;
 extern cl::opt<bool> StrictMode;
 extern cl::opt<bool> UpdateDebugSections;
@@ -2931,7 +2934,8 @@ bool BinaryFunction::finalizeCFIState() {
 }
 
 bool BinaryFunction::requiresAddressTranslation() const {
-  return opts::EnableBAT || hasSDTMarker() || hasPseudoProbe();
+  return opts::EnableBAT || opts::GenFeatures || opts::FreqInference ||
+         opts::FuncFreqInference || hasSDTMarker() || hasPseudoProbe();
 }
 
 bool BinaryFunction::requiresAddressMap() const {

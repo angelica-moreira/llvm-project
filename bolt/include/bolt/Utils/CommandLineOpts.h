@@ -26,6 +26,7 @@ extern llvm::cl::OptionCategory BoltRelocCategory;
 extern llvm::cl::OptionCategory BoltOutputCategory;
 extern llvm::cl::OptionCategory AggregatorCategory;
 extern llvm::cl::OptionCategory BoltInstrCategory;
+extern llvm::cl::OptionCategory BoltInferenceCategory;
 extern llvm::cl::OptionCategory HeatmapCategory;
 
 extern llvm::cl::opt<unsigned> AlignText;
@@ -35,6 +36,9 @@ extern llvm::cl::opt<unsigned> BucketsPerLine;
 extern llvm::cl::opt<bool> DiffOnly;
 extern llvm::cl::opt<bool> EnableBAT;
 extern llvm::cl::opt<bool> EqualizeBBCounts;
+extern llvm::cl::opt<bool> FreqInference;
+extern llvm::cl::opt<bool> FuncFreqInference;
+extern llvm::cl::opt<bool> GenFeatures;
 extern llvm::cl::opt<bool> RemoveSymtab;
 extern llvm::cl::opt<unsigned> ExecutionCountThreshold;
 extern llvm::cl::opt<unsigned> HeatmapBlock;

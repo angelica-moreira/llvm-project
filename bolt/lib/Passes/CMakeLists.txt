@@ -11,6 +11,7 @@ add_llvm_library(LLVMBOLTPasses
   CallGraphWalker.cpp
   DataflowAnalysis.cpp
   DataflowInfoManager.cpp
+  FeatureMiner.cpp
   FrameAnalysis.cpp
   FrameOptimizer.cpp
   FixRelaxationPass.cpp
@@ -40,6 +41,7 @@ add_llvm_library(LLVMBOLTPasses
   StackAvailableExpressions.cpp
   StackPointerTracking.cpp
   StackReachingUses.cpp
+  StaticBranchInfo.cpp
   StokeInfo.cpp
   TailDuplication.cpp
   ThreeWayBranch.cpp

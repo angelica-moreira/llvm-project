@@ -37,6 +37,7 @@ cl::OptionCategory BoltRelocCategory("BOLT options in relocation mode");
 cl::OptionCategory BoltOutputCategory("Output options");
 cl::OptionCategory AggregatorCategory("Data aggregation options");
 cl::OptionCategory BoltInstrCategory("BOLT instrumentation options");
+cl::OptionCategory BoltInferenceCategory("BOLT static infered profile options");
 cl::OptionCategory HeatmapCategory("Heatmap options");
 
 cl::opt<unsigned> AlignText("align-text",
@@ -89,6 +90,25 @@ ExecutionCountThreshold("execution-count-threshold",
   cl::ZeroOrMore,
   cl::Hidden,
   cl::cat(BoltOptCategory));
+
+cl::opt<bool> FreqInference(
+    "infer-local-counts",
+    cl::desc(
+        "calculates local blocks and edge frequencies for a function based "
+        "on its probabilities."),
+    cl::ZeroOrMore, cl::cat(BoltInferenceCategory));
+
+cl::opt<bool> FuncFreqInference(
+    "infer-global-counts",
+    cl::desc("calculates global function call and funtion invocation based on "
+             "intraprocedural block frequencies."),
+    cl::ZeroOrMore, cl::cat(BoltInferenceCategory));
+
+cl::opt<bool> GenFeatures(
+    "gen-features",
+    cl::desc("Captures features capable of describing and encoding branch "
+             "information, and then save them in a CSV format file."),
+    cl::ZeroOrMore, cl::cat(BoltInferenceCategory));
 
 cl::opt<unsigned>
     HeatmapBlock("block-size",

@@ -18,6 +18,7 @@
 #include "bolt/Core/ParallelUtilities.h"
 #include "bolt/Core/Relocation.h"
 #include "bolt/Passes/CacheMetrics.h"
+#include "bolt/Passes/FeatureMiner.h"
 #include "bolt/Passes/ReorderFunctions.h"
 #include "bolt/Profile/BoltAddressTranslation.h"
 #include "bolt/Profile/DataAggregator.h"
@@ -77,6 +78,9 @@ extern cl::opt<bool> X86AlignBranchWithin32BBoundaries;
 namespace opts {
 
 extern cl::opt<MacroFusionType> AlignMacroOpFusion;
+extern cl::opt<bool> FreqInference;
+extern cl::opt<bool> FuncFreqInference;
+extern cl::opt<bool> GenFeatures;
 extern cl::list<std::string> HotTextMoveSections;
 extern cl::opt<bool> Hugify;
 extern cl::opt<bool> Instrument;
@@ -239,6 +243,11 @@ static cl::opt<bool>
     TimeRewrite("time-rewrite",
                 cl::desc("print time spent in rewriting passes"), cl::Hidden,
                 cl::cat(BoltCategory));
+
+static cl::opt<bool>
+    TimeFeatureMiner("time-feature-miner",
+                cl::desc("print time spent in capturing and persisting features"), cl::Hidden,
+                cl::cat(BoltInferenceCategory));
 
 static cl::opt<bool>
 SequentialDisassembly("sequential-disassembly",
@@ -568,7 +577,8 @@ Error RewriteInstance::discoverStorage() {
           SectionContents.data() - InputFile->getData().data();
     }
 
-    if (!opts::HeatmapMode &&
+    if (!opts::GenFeatures && !opts::HeatmapMode && 
+        !opts::FreqInference && !opts::FuncFreqInference &&
         !(opts::AggregateOnly && BAT->enabledFor(InputFile)) &&
         (SectionName.starts_with(getOrgSecPrefix()) ||
          SectionName == getBOLTTextSectionName()))
@@ -777,6 +787,11 @@ Error RewriteInstance::run() {
 
   postProcessFunctions();
 
+  if(opts::GenFeatures){
+    extractFeatures();
+    return Error::success();
+  }
+    
   processMetadataPostCFG();
 
   if (opts::DiffOnly)
@@ -805,6 +820,15 @@ Error RewriteInstance::run() {
   // Rewrite allocatable contents and copy non-allocatable parts with mods.
   rewriteFile();
   return Error::success();
+}
+
+void RewriteInstance::extractFeatures() {
+  NamedRegionTimer T("extractFeatures", "extract features", "features",
+                     "Extract Features from Binary Functions", opts::TimeFeatureMiner);
+  std::unique_ptr<FeatureMiner> FM =
+      std::make_unique<FeatureMiner>(opts::GenFeatures);
+  BC->logBOLTErrorsAndQuitOnFatal(FM->runOnFunctions(*BC));
+  // exit(EXIT_SUCCESS);
 }
 
 void RewriteInstance::discoverFileObjects() {
