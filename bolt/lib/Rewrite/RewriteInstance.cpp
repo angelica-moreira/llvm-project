@@ -11,6 +11,8 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryEmitter.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Passes/BlockEdgeFrequency.h"
+#include "bolt/Passes/FunctionCallFrequency.h"
 #include "bolt/Core/DebugData.h"
 #include "bolt/Core/Exceptions.h"
 #include "bolt/Core/FunctionLayout.h"
@@ -78,6 +80,8 @@ extern cl::opt<bool> X86AlignBranchWithin32BBoundaries;
 namespace opts {
 
 extern cl::opt<MacroFusionType> AlignMacroOpFusion;
+extern cl::opt<bool> BoostStaleProfile;
+extern cl::opt<bool> Bmat;
 extern cl::opt<bool> FreqInference;
 extern cl::opt<bool> FuncFreqInference;
 extern cl::opt<bool> GenFeatures;
@@ -90,6 +94,8 @@ extern cl::list<std::string> ReorderData;
 extern cl::opt<bolt::ReorderFunctions::ReorderType> ReorderFunctions;
 extern cl::opt<bool> TerminalTrap;
 extern cl::opt<bool> TimeBuild;
+extern cl::opt<bool> VespaStaleProfile;
+extern cl::opt<bool> WuLarusStaleProfile;
 
 cl::opt<bool> AllowStripped("allow-stripped",
                             cl::desc("allow processing of stripped binaries"),
@@ -112,6 +118,11 @@ cl::opt<bool> DumpDotAll(
     cl::desc("dump function CFGs to graphviz format after each stage;"
              "enable '-print-loops' for color-coded blocks"),
     cl::Hidden, cl::cat(BoltCategory));
+
+cl::opt<bool>
+    DumpAll("dump-all",
+            cl::desc("dump function CFGs to text file format after each stage"),
+            cl::ZeroOrMore, cl::cat(BoltCategory));
 
 static cl::list<std::string>
 ForceFunctionNames("funcs",
@@ -781,6 +792,18 @@ Error RewriteInstance::run() {
 
   processProfileData();
 
+  if (opts::BoostStaleProfile) {
+    staleProfileBooster();
+  }
+
+  if (opts::Bmat) {
+    if (opts::WuLarusStaleProfile) {
+      std::unique_ptr<BlockEdgeFrequency> BEF =
+          std::make_unique<BlockEdgeFrequency>(opts::WuLarusStaleProfile);
+      BEF->updateStaleEdgesFrequencies(*BC);
+    }
+  }
+
   // Save input binary metadata if BAT section needs to be emitted
   if (opts::EnableBAT)
     BAT->saveMetadata(*BC);
@@ -829,6 +852,72 @@ void RewriteInstance::extractFeatures() {
       std::make_unique<FeatureMiner>(opts::GenFeatures);
   BC->logBOLTErrorsAndQuitOnFatal(FM->runOnFunctions(*BC));
   // exit(EXIT_SUCCESS);
+}
+
+
+void RewriteInstance::staleProfileBooster() {
+  NamedRegionTimer T("staleProfBooster", "run beetle", "beetle",
+                     "Improve stale profile", opts::TimeBuild);
+  std::unique_ptr<BlockEdgeFrequency> BEF =
+      std::make_unique<BlockEdgeFrequency>(opts::FreqInference);
+  int CountStale = 0, CountNewStale = 0, CountValid = 0, CountNewValid = 0;
+  std::set<uint64_t> StaleFunctionsAddresses;
+
+  auto &BFs = BC->getBinaryFunctions();
+  for (auto &BFI : BFs) {
+
+    BinaryFunction &Function = BFI.second;
+
+    if (!Function.hasProfile() || !Function.isSimple() ||
+        Function.isPLTFunction() || Function.hasUnknownControlFlow() ||
+        Function.empty())
+      continue;
+
+    if (Function.hasValidProfile()) {
+      // has valid profile info
+      CountValid += 1;
+      continue;
+    } else {
+      CountStale += 1;
+      StaleFunctionsAddresses.insert(Function.getAddress());
+      Function.setExecutionCount(0);
+    }
+  }
+  if (CountStale > 0) {
+    BEF->runOnStaleFunctions(*BC, StaleFunctionsAddresses); // beetle technique
+    CountNewStale = StaleFunctionsAddresses.size();
+    CountNewValid = CountValid + (CountStale - CountNewStale);
+    for (uint64_t FunctionAddress : StaleFunctionsAddresses) {
+      BinaryFunction *Function =
+          BC->getBinaryFunctionAtAddress(FunctionAddress);
+      Function->setExecutionCount(0);
+      Function->unsetProfileMatchRatio();
+    }
+  }
+
+  BC->outs() << "BOLT-INFO: number of functions with STALE profile "
+             << CountStale << "\n";
+  BC->outs() << "BOLT-INFO: number of functions with VALID profile  "
+             << CountValid << "\n";
+  BC->outs() << "BOLT-INFO: NEW number of functions with STALE profile "
+             << CountNewStale << "\n";
+  BC->outs() << "BOLT-INFO: NEW number of functions with VALID profile "
+             << CountNewValid << "\n";
+}
+
+void RewriteInstance::genStaticProfile(bool Intraprocedural) {
+  NamedRegionTimer T(
+      "genStaticProfile", "generate static profile", "staticProf",
+      "Generate Static Profile for Binary Functions", opts::TimeBuild);
+  if (Intraprocedural) { // intra-procedural inference
+    std::unique_ptr<BlockEdgeFrequency> BEF =
+        std::make_unique<BlockEdgeFrequency>(opts::FreqInference);
+    BC->logBOLTErrorsAndQuitOnFatal(BEF->runOnFunctions(*BC));
+  } else { // inter-procedural inference
+    std::unique_ptr<FunctionCallFrequency> FCF =
+        std::make_unique<FunctionCallFrequency>(opts::FuncFreqInference);
+    BC->logBOLTErrorsAndQuitOnFatal(FCF->runOnFunctions(*BC));
+  }
 }
 
 void RewriteInstance::discoverFileObjects() {
@@ -3382,6 +3471,9 @@ void RewriteInstance::postProcessFunctions() {
 
     if (opts::DumpDotAll)
       Function.dumpGraphForPass("00_build-cfg");
+
+    if(opts::DumpAll)
+      Function.dumpGraphToTextFile();
 
     if (opts::PrintLoopInfo) {
       Function.calculateLoopInfo();

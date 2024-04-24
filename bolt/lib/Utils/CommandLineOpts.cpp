@@ -38,6 +38,7 @@ cl::OptionCategory BoltOutputCategory("Output options");
 cl::OptionCategory AggregatorCategory("Data aggregation options");
 cl::OptionCategory BoltInstrCategory("BOLT instrumentation options");
 cl::OptionCategory BoltInferenceCategory("BOLT static infered profile options");
+cl::OptionCategory BoltStaleCategory("BOLT stale profile boster options");
 cl::OptionCategory HeatmapCategory("Heatmap options");
 
 cl::opt<unsigned> AlignText("align-text",
@@ -55,10 +56,19 @@ AggregateOnly("aggregate-only",
   cl::Hidden,
   cl::cat(AggregatorCategory));
 
+cl::opt<bool> Bmat("bmat", cl::desc("use bmat strategy"), cl::init(false),
+                                    cl::ZeroOrMore, cl::Hidden,
+                                    cl::cat(BoltStaleCategory));
+
 cl::opt<unsigned>
     BucketsPerLine("line-size",
                    cl::desc("number of entries per line (default 256)"),
                    cl::init(256), cl::Optional, cl::cat(HeatmapCategory));
+
+cl::opt<bool> BoostStaleProfile(
+    "boost-stale-profile",
+    cl::desc("enhance bolt's capability to use stale profile"), cl::init(false),
+    cl::Hidden, cl::ZeroOrMore, cl::cat(BoltStaleCategory));
 
 cl::opt<bool>
 DiffOnly("diff-only",
@@ -213,6 +223,24 @@ cl::opt<unsigned>
     Verbosity("v", cl::desc("set verbosity level for diagnostic output"),
               cl::init(0), cl::ZeroOrMore, cl::cat(BoltCategory),
               cl::sub(cl::SubCommand::getAll()));
+
+cl::opt<bool>
+WuLarusStaleProfile(
+    "wularus-stale-profile",
+    cl::desc("empower stale profile boster with wu larus heuristics"),
+    cl::init(false),
+    cl::Hidden,
+    cl::ZeroOrMore,
+    cl::cat(BoltStaleCategory));
+
+cl::opt<bool>
+VespaStaleProfile(
+    "vespa-stale-profile",
+    cl::desc("empower stale profile boster with vespa"),
+    cl::init(false),
+    cl::Hidden,
+    cl::ZeroOrMore,
+    cl::cat(BoltStaleCategory));
 
 bool processAllFunctions() {
   if (opts::AggregateOnly)

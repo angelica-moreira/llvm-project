@@ -149,6 +149,7 @@ struct BinaryFunctionProfile {
   uint32_t NumBasicBlocks{0};
   uint32_t Id{0};
   llvm::yaml::Hex64 Hash{0};
+  llvm::yaml::Hex64 BBHash{0};
   uint64_t ExecCount{0};
   std::vector<BinaryBasicBlockProfile> Blocks;
   bool Used{false};

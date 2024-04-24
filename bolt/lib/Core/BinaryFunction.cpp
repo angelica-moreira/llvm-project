@@ -3223,6 +3223,20 @@ void BinaryFunction::dumpGraphForPass(std::string Annotation) const {
   dumpGraphToFile(Filename);
 }
 
+void BinaryFunction::dumpGraphToTextFile(std::string Annotation) const{
+  std::string Filename = constructFilename(getPrintName(), Annotation, ".txt");
+  BC.outs() << "BOLT-DEBUG: Dumping CFG to "<< Filename << "\n";
+  std::error_code EC;
+  raw_fd_ostream Printer(Filename, EC, sys::fs::OF_None);
+  if (EC) {
+    if (opts::Verbosity >= 1) {
+      BC.errs() << "BOLT-WARNING: " << EC.message() << ", unable to open "
+                << Filename << " for output.\n";
+    }
+    return;
+  }
+}
+
 void BinaryFunction::dumpGraphToFile(std::string Filename) const {
   std::error_code EC;
   raw_fd_ostream of(Filename, EC, sys::fs::OF_None);
