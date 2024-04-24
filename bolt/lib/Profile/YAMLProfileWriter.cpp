@@ -62,6 +62,7 @@ YAMLProfileWriter::convert(const BinaryFunction &BF, bool UseDFS,
   YamlBF.Name = BF.getPrintName();
   YamlBF.Id = BF.getFunctionNumber();
   YamlBF.Hash = BF.getHash();
+  YamlBF.BBHash = BF.getBBHash();
   YamlBF.NumBasicBlocks = BF.size();
   YamlBF.ExecCount = BF.getKnownExecutionCount();
 

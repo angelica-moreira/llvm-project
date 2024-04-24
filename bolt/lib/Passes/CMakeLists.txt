@@ -5,6 +5,8 @@ add_llvm_library(LLVMBOLTPasses
   AsmDump.cpp
   BinaryPasses.cpp
   BinaryFunctionCallGraph.cpp
+  BlockEdgeFrequency.cpp
+  BranchHeuristicsInfo.cpp
   CMOVConversion.cpp
   CacheMetrics.cpp
   CallGraph.cpp
@@ -16,6 +18,7 @@ add_llvm_library(LLVMBOLTPasses
   FrameOptimizer.cpp
   FixRelaxationPass.cpp
   FixRISCVCallsPass.cpp
+  FunctionCallFrequency.cpp
   HFSort.cpp
   Hugify.cpp
   IdenticalCodeFolding.cpp
@@ -42,6 +45,7 @@ add_llvm_library(LLVMBOLTPasses
   StackPointerTracking.cpp
   StackReachingUses.cpp
   StaticBranchInfo.cpp
+  StaticBranchProbabilities.cpp
   StokeInfo.cpp
   TailDuplication.cpp
   ThreeWayBranch.cpp

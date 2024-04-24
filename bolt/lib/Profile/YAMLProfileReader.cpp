@@ -20,6 +20,7 @@ using namespace llvm;
 namespace opts {
 
 extern cl::opt<unsigned> Verbosity;
+extern cl::opt<bool> Bmat;
 extern cl::OptionCategory BoltOptCategory;
 extern cl::opt<bool> InferStaleProfile;
 
@@ -100,7 +101,8 @@ bool YAMLProfileReader::parseFunctionProfile(
   BF.setRawBranchCount(FuncRawBranchCount);
 
   if (!opts::IgnoreHash &&
-      YamlBF.Hash != BF.computeHash(IsDFSOrder, HashFunction)) {
+      YamlBF.Hash != BF.computeHash(IsDFSOrder, HashFunction) ||
+      (opts::Bmat && YamlBF.Hash != static_cast<uint64_t>(BF.getBBHash()))) {
     if (opts::Verbosity >= 1)
       errs() << "BOLT-WARNING: function hash mismatch\n";
     ProfileMatched = false;
@@ -343,6 +345,11 @@ Error YAMLProfileReader::readProfile(BinaryContext &BC) {
 
   auto profileMatches = [](const yaml::bolt::BinaryFunctionProfile &Profile,
                            BinaryFunction &BF) {
+    if (opts::Bmat) {
+      BF.markProfiled(2); // validating profile information based on th last
+                          // conditional branch hash code
+      return Profile.BBHash == static_cast<uint64_t>(BF.getBBHash());
+    }
     if (opts::IgnoreHash)
       return Profile.NumBasicBlocks == BF.size();
     return Profile.Hash == static_cast<uint64_t>(BF.getHash());

@@ -27,6 +27,7 @@ extern llvm::cl::OptionCategory BoltOutputCategory;
 extern llvm::cl::OptionCategory AggregatorCategory;
 extern llvm::cl::OptionCategory BoltInstrCategory;
 extern llvm::cl::OptionCategory BoltInferenceCategory;
+extern llvm::cl::OptionCategory BoltStaleCategory;
 extern llvm::cl::OptionCategory HeatmapCategory;
 
 extern llvm::cl::opt<unsigned> AlignText;
@@ -76,6 +77,9 @@ extern llvm::cl::opt<bool> UpdateDebugSections;
 // errs() for errors and warnings.
 // dbgs() for output within DEBUG().
 extern llvm::cl::opt<unsigned> Verbosity;
+
+extern llvm::cl::opt<bool> VespaStaleProfile;
+extern llvm::cl::opt<bool> WuLarusStaleProfile;
 
 /// Return true if we should process all functions in the binary.
 bool processAllFunctions();

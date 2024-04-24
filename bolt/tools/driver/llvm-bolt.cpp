@@ -40,6 +40,7 @@ static cl::OptionCategory *BoltCategories[] = {&BoltCategory,
                                                &BoltRelocCategory,
                                                &BoltInstrCategory,
                                                &BoltOutputCategory,
+                                               &BoltStaleCategory,
                                                &BoltInferenceCategory};
 
 static cl::OptionCategory *BoltDiffCategories[] = {&BoltDiffCategory};

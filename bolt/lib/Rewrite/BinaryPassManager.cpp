@@ -50,6 +50,7 @@ namespace opts {
 extern cl::opt<bool> PrintAll;
 extern cl::opt<bool> PrintDynoStats;
 extern cl::opt<bool> DumpDotAll;
+extern cl::opt<bool> DumpAll;
 extern cl::opt<std::string> AsmDump;
 extern cl::opt<bolt::PLTCall::OptType> PLT;
 
@@ -326,6 +327,9 @@ Error BinaryFunctionPassManager::runPasses() {
 
       if (opts::DumpDotAll)
         Function.dumpGraphForPass(PassIdName);
+
+      if(opts::DumpAll)
+        Function.dumpGraphToTextFile();  
     }
   }
   return Error::success();
