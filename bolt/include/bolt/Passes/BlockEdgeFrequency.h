@@ -56,11 +56,11 @@ class BlockEdgeFrequency : public BinaryFunctionPass {
 
 private:
   //static constexpr 
-	  double SCALING_FACTOR = 100000.0; //10000.0;
+	uint64_t SCALING_FACTOR = 100000ULL;
   //static constexpr 
-  double EPSILON = 0.01 * SCALING_FACTOR;
+  double EPSILON = 0.01 * static_cast<double>(SCALING_FACTOR);
   //static constexpr 
-  double LOOSEBOUND = 0.2 * SCALING_FACTOR;
+  double LOOSEBOUND = 0.2 * static_cast<double>(SCALING_FACTOR);
 
   using Edge = StaticBranchInfo::Edge;
 
