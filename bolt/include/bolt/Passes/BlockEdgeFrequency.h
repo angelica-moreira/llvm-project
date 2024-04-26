@@ -56,7 +56,7 @@ class BlockEdgeFrequency : public BinaryFunctionPass {
 
 private:
   //static constexpr 
-	uint64_t SCALING_FACTOR = 100000ULL;
+	uint64_t SCALING_FACTOR = 10000ULL;
   //static constexpr 
   double EPSILON = 0.01 * static_cast<double>(SCALING_FACTOR);
   //static constexpr 

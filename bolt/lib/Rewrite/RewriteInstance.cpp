@@ -804,6 +804,36 @@ Error RewriteInstance::run() {
     }
   }
 
+if (!opts::BoostStaleProfile) {
+  int CountStale = 0, CountValid = 0;
+  auto &BFs = BC->getBinaryFunctions();
+  for (auto &BFI : BFs) {
+
+    BinaryFunction &Function = BFI.second;
+
+    if (!Function.hasProfile() || !Function.isSimple() ||
+        Function.isPLTFunction() || Function.hasUnknownControlFlow() ||
+        Function.empty())
+      continue;
+
+    if (Function.hasValidProfile()) {
+      // has valid profile info
+      CountValid += 1;
+      continue;
+    } else {
+      CountStale += 1;
+    }
+  }
+  BC->outs() << "BOLT-INFO: number of functions with STALE profile "
+              << CountStale << "\n";
+  BC->outs() << "BOLT-INFO: number of functions with VALID profile "
+              << CountValid << "\n";
+}
+
+if (opts::FreqInference || opts::FuncFreqInference) {
+  genStaticProfile(opts::FreqInference);
+}
+
   // Save input binary metadata if BAT section needs to be emitted
   if (opts::EnableBAT)
     BAT->saveMetadata(*BC);
@@ -855,7 +885,6 @@ void RewriteInstance::extractFeatures() {
   std::unique_ptr<FeatureMiner> FM =
       std::make_unique<FeatureMiner>(opts::GenFeatures);
   BC->logBOLTErrorsAndQuitOnFatal(FM->runOnFunctions(*BC));
-  // exit(EXIT_SUCCESS);
 }
 
 
