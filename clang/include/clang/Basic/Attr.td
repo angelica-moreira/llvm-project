@@ -966,10 +966,12 @@ def AnalyzerNoReturn : InheritableAttr {
 }
 
 def Annotate : InheritableParamOrStmtAttr {
-  let Spellings = [Clang<"annotate">];
+  let Spellings = [Clang<"annotate">, Clang<"pulse">];
   let Args = [StringArgument<"Annotation">, VariadicExprArgument<"Args">];
   // Ensure that the annotate attribute can be used with
   // '#pragma clang attribute' even though it has no subject list.
+  let Subjects = SubjectList<[Stmt, WhileStmt, Function, Var, ParmVar, GlobalVar, LocalVar],
+                             ErrorDiag, "'for', 'while', and 'do' statements">;
   let AdditionalMembers = [{
   static AnnotateAttr *Create(ASTContext &Ctx, llvm::StringRef Annotation, \
               const AttributeCommonInfo &CommonInfo) {
