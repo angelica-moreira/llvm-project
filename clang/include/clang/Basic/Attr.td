@@ -970,7 +970,7 @@ def Annotate : InheritableParamOrStmtAttr {
   let Args = [StringArgument<"Annotation">, VariadicExprArgument<"Args">];
   // Ensure that the annotate attribute can be used with
   // '#pragma clang attribute' even though it has no subject list.
-  let Subjects = SubjectList<[Stmt, WhileStmt, Function, Var, ParmVar, GlobalVar, LocalVar],
+  let Subjects = SubjectList<[Stmt, WhileStmt, Function, Var, ParmVar, GlobalVar, LocalVar, Record, TypedefName, Field],
                              ErrorDiag, "'for', 'while', and 'do' statements">;
   let AdditionalMembers = [{
   static AnnotateAttr *Create(ASTContext &Ctx, llvm::StringRef Annotation, \
