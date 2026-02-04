@@ -696,6 +696,31 @@ static void addPGOAndCoverageFlags(const ToolChain &TC, Compilation &C,
           Args.MakeArgString("-coverage-data-file=" + CoverageFilename));
     }
   }
+
+  // Handle -fstatic-profile-dump and -fstatic-profile-dump=<path>
+  if (auto *StaticProfileArg = Args.getLastArg(
+          options::OPT_fstatic_profile_dump,
+          options::OPT_fstatic_profile_dump_EQ)) {
+    // Check for conflicts with instrumentation-based profiling
+    if (PGOGenerateArg)
+      D.Diag(diag::err_drv_argument_not_allowed_with)
+          << StaticProfileArg->getSpelling() << PGOGenerateArg->getSpelling();
+    if (ProfileGenerateArg)
+      D.Diag(diag::err_drv_argument_not_allowed_with)
+          << StaticProfileArg->getSpelling() << ProfileGenerateArg->getSpelling();
+    if (CSPGOGenerateArg)
+      D.Diag(diag::err_drv_argument_not_allowed_with)
+          << StaticProfileArg->getSpelling() << CSPGOGenerateArg->getSpelling();
+    // Setting profile file name
+    if (StaticProfileArg->getOption().matches(
+            options::OPT_fstatic_profile_dump_EQ)) {
+      StringRef Path = StaticProfileArg->getValue();
+      CmdArgs.push_back(Args.MakeArgString(
+          "-fstatic-profile-dump-path=" + Path));
+    } else {
+      CmdArgs.push_back("-fstatic-profile-dump-path=default.profdata");
+    }
+  }
 }
 
 static void
