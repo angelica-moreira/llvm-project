@@ -22,6 +22,7 @@ add_llvm_component_library(LLVMInstrumentation
   PGOMemOPSizeOpt.cpp
   SanitizerCoverage.cpp
   SanitizerBinaryMetadata.cpp
+  StaticProfileExporter.cpp
   ValueProfileCollector.cpp
   ThreadSanitizer.cpp
   TypeSanitizer.cpp
