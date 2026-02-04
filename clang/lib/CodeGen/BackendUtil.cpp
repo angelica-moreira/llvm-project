@@ -83,6 +83,7 @@
 #include "llvm/Transforms/Instrumentation/RealtimeSanitizer.h"
 #include "llvm/Transforms/Instrumentation/SanitizerBinaryMetadata.h"
 #include "llvm/Transforms/Instrumentation/SanitizerCoverage.h"
+#include "llvm/Transforms/Instrumentation/StaticProfileExporter.h"
 #include "llvm/Transforms/Instrumentation/ThreadSanitizer.h"
 #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
 #include "llvm/Transforms/ObjCARC.h"
@@ -1110,6 +1111,18 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         MPM.addPass(createModuleToFunctionPassAdaptor(MemProfilerPass()));
         MPM.addPass(ModuleMemProfilerPass());
       });
+    }
+
+    // Add static profile exporter if requested
+    if (CodeGenOpts.StaticProfileDump) {
+      std::string ProfilePath = CodeGenOpts.StaticProfileDumpPath.empty()
+                                     ? "default.profdata"
+                                     : CodeGenOpts.StaticProfileDumpPath;
+      PB.registerOptimizerLastEPCallback(
+          [ProfilePath](ModulePassManager &MPM, OptimizationLevel Level,
+                        ThinOrFullLTOPhase) {
+            MPM.addPass(StaticProfileExporterPass(ProfilePath));
+          });
     }
 
     if (CodeGenOpts.FatLTO) {
