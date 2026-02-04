@@ -2304,6 +2304,10 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
 
   Opts.StaticClosure = Args.hasArg(options::OPT_static_libclosure);
 
+  // Enable static profile dump if path is specified
+  if (!Opts.StaticProfileDumpPath.empty())
+    Opts.StaticProfileDump = true;
+
   return Diags.getNumErrors() == NumErrorsBefore;
 }
 
