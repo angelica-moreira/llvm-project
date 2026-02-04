@@ -1858,6 +1858,13 @@ def fno_profile_instr_generate : Flag<["-"], "fno-profile-instr-generate">,
 def fno_profile_generate : Flag<["-"], "fno-profile-generate">,
     Group<f_Group>, Visibility<[ClangOption, CLOption]>,
     HelpText<"Disable generation of profile instrumentation.">;
+def fstatic_profile_dump : Flag<["-"], "fstatic-profile-dump">,
+    Group<f_Group>, Visibility<[ClangOption, CLOption]>,
+    HelpText<"Dump statically inferred profile information into default.profdata">;
+def fstatic_profile_dump_EQ : Joined<["-"], "fstatic-profile-dump=">,
+    Group<f_Group>, Visibility<[ClangOption, CLOption]>,
+    MetaVarName<"<file>">,
+    HelpText<"Dump statically inferred profile information into <file>">;
 def fno_profile_instr_use : Flag<["-"], "fno-profile-instr-use">,
     Group<f_Group>, Visibility<[ClangOption, CLOption]>,
     HelpText<"Disable using instrumentation data for profile-guided optimization">;
@@ -8170,6 +8177,9 @@ def fprofile_instrument_use_path_EQ :
     Joined<["-"], "fprofile-instrument-use-path=">,
     HelpText<"Specify the profile path in PGO use compilation">,
     MarshallingInfoString<CodeGenOpts<"ProfileInstrumentUsePath">>;
+def fstatic_profile_dump_path_EQ : Joined<["-"], "fstatic-profile-dump-path=">,
+    HelpText<"Specify the path for static profile dump">,
+    MarshallingInfoString<CodeGenOpts<"StaticProfileDumpPath">>;
 def flto_visibility_public_std:
     Flag<["-"], "flto-visibility-public-std">,
     HelpText<"Use public LTO visibility for classes in std and stdext namespaces">,
