@@ -345,6 +345,9 @@ public:
   /// by -fprofile-sample-use or -fprofile-instr-use.
   std::string ProfileRemappingFile;
 
+  /// Name of the profile file to dump statically inferred profile data.
+  std::string StaticProfileDumpPath;
+
   /// Name of the function summary index file to use for ThinLTO function
   /// importing.
   std::string ThinLTOIndexFile;
