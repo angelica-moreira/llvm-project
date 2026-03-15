@@ -6365,8 +6365,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   if (Arg *A = Args.getLastArg(options::OPT_fbasic_block_address_map,
                                options::OPT_fno_basic_block_address_map)) {
-    if (((Triple.isX86() || Triple.isAArch64()) && Triple.isOSBinFormatELF()) ||
-        (Triple.isX86() && Triple.isOSBinFormatCOFF())) {
+    if ((Triple.isX86() || Triple.isAArch64()) &&
+        (Triple.isOSBinFormatELF() || Triple.isOSBinFormatCOFF())) {
       if (A->getOption().matches(options::OPT_fbasic_block_address_map))
         A->render(Args, CmdArgs);
     } else {
@@ -6382,13 +6382,15 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
           << A->getAsString(Args) << /*hasReplacement=*/true
           << "-fbasic-block-address-map";
       CmdArgs.push_back("-fbasic-block-address-map");
-    } else if (Triple.isX86() && Triple.isOSBinFormatELF()) {
+    } else if (Triple.isX86() &&
+               (Triple.isOSBinFormatELF() || Triple.isOSBinFormatCOFF())) {
       if (Val != "all" && Val != "none" && !Val.starts_with("list="))
         D.Diag(diag::err_drv_invalid_value)
             << A->getAsString(Args) << A->getValue();
       else
         A->render(Args, CmdArgs);
-    } else if (Triple.isAArch64() && Triple.isOSBinFormatELF()) {
+    } else if (Triple.isAArch64() &&
+               (Triple.isOSBinFormatELF() || Triple.isOSBinFormatCOFF())) {
       // "all" is not supported on AArch64 since branch relaxation creates new
       // basic blocks for some cross-section branches.
       if (Val != "labels" && Val != "none" && !Val.starts_with("list="))
