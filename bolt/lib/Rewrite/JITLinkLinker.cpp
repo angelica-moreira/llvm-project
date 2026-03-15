@@ -10,8 +10,10 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "llvm/ExecutionEngine/JITLink/COFF_x86_64.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
+#include "llvm/ExecutionEngine/JITLink/x86_64.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorSymbolDef.h"
 #include "llvm/Support/Debug.h"
@@ -108,6 +110,53 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
           jitlink::createRelaxationPass_ELF_riscv());
     }
 
+    // COFF objects use platform-specific edge kinds that must be lowered to
+    // generic x86_64 kinds before the fixup phase.  The default JITLink passes
+    // normally handle this, but BOLT disables them to avoid DWARF conflicts.
+    // We add a minimal lowering pass here that covers the relocations BOLT
+    // actually emits (PCRel32 and Pointer64).
+    if (G.getTargetTriple().isOSBinFormatCOFF()) {
+      Config.PreFixupPasses.push_back([](jitlink::LinkGraph &G) -> Error {
+        using namespace jitlink;
+        // COFF edge kinds start at x86_64::FirstPlatformRelocation.
+        const Edge::Kind COFFPCRel32 = x86_64::FirstPlatformRelocation;
+        const Edge::Kind COFFPointer32NB = x86_64::FirstPlatformRelocation + 1;
+        const Edge::Kind COFFPointer64 = x86_64::FirstPlatformRelocation + 2;
+        const Edge::Kind COFFSectionIdx16 = x86_64::FirstPlatformRelocation + 3;
+        const Edge::Kind COFFSecRel32 = x86_64::FirstPlatformRelocation + 4;
+
+        for (auto *B : G.blocks()) {
+          for (auto &E : B->edges()) {
+            switch (E.getKind()) {
+            case COFFPCRel32:
+              E.setKind(x86_64::PCRel32);
+              break;
+            case COFFPointer64:
+              E.setKind(x86_64::Pointer64);
+              break;
+            case COFFPointer32NB:
+              // Pointer32NB is image-base-relative.  Without an __ImageBase
+              // symbol we cannot lower it properly, but BOLT does not emit
+              // this relocation type so just leave it for now.
+              // TODO: handle Pointer32NB if BOLT ever emits ADDR32NB relocs
+              break;
+            case COFFSectionIdx16:
+              E.setKind(x86_64::Pointer16);
+              break;
+            case COFFSecRel32:
+              // SecRel32 needs section-start subtraction which we do not
+              // have here.  Not emitted by BOLT today.
+              // TODO: handle SecRel32 if needed
+              break;
+            default:
+              break;
+            }
+          }
+        }
+        return Error::success();
+      });
+    }
+
     return Error::success();
   }
 
@@ -157,6 +206,25 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
       }
 
       LLVM_DEBUG(dbgs() << "Resolved to address 0x0\n");
+      // BOLT creates symbols like FUNCat0x<addr> and DATAat0x<addr> for
+      // references into the original binary.  If the symbol was not registered
+      // in BinaryData (e.g. a call target that is not a .pdata function), try
+      // to parse the address from the name as a last resort.
+      uint64_t ParsedAddr = 0;
+      StringRef SN(SymName);
+      // Look for the "0x" hex prefix that encodes the virtual address.
+      size_t HexPos = SN.find("0x");
+      if (HexPos != StringRef::npos &&
+          !SN.substr(HexPos + 2).getAsInteger(16, ParsedAddr) &&
+          ParsedAddr != 0) {
+        LLVM_DEBUG(dbgs() << "BOLT: parsed address 0x"
+                          << Twine::utohexstr(ParsedAddr)
+                          << " from symbol name " << SymName << "\n");
+        AllResults[Symbol.first] = orc::ExecutorSymbolDef(
+            orc::ExecutorAddr(ParsedAddr), JITSymbolFlags());
+        continue;
+      }
+
       AllResults[Symbol.first] =
           orc::ExecutorSymbolDef(orc::ExecutorAddr(0), JITSymbolFlags());
     }

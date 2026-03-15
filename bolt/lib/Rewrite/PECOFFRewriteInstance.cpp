@@ -183,7 +183,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     return;
   }
 
-  // Get .xdata contents for UNWIND_INFO parsing
+  // Get .xdata or .rdata contents for UNWIND_INFO parsing.
+  // Unwind data may reside in a dedicated .xdata section or in .rdata.
   ArrayRef<uint8_t> XDataContents;
   uint64_t XDataRVA = 0;
   if (XDataSec) {
@@ -191,6 +192,28 @@ void PECOFFRewriteInstance::readExceptionHandling() {
       consumeError(std::move(E));
     else
       XDataRVA = XDataSec->VirtualAddress;
+  }
+  // Fall back to any section that contains the unwind RVA from the first
+  // .pdata entry.  Many PE binaries store UNWIND_INFO in .rdata.
+  if (XDataContents.empty()) {
+    ArrayRef<uint8_t> PDataPeek;
+    if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek))
+      consumeError(std::move(E));
+    if (PDataPeek.size() >= 12) {
+      uint32_t FirstUnwindRVA = support::endian::read32le(PDataPeek.data() + 8);
+      for (const object::SectionRef &Section : InputFile->sections()) {
+        const object::coff_section *CS = InputFile->getCOFFSection(Section);
+        uint32_t SecStart = CS->VirtualAddress;
+        uint32_t SecEnd = SecStart + CS->VirtualSize;
+        if (FirstUnwindRVA >= SecStart && FirstUnwindRVA < SecEnd) {
+          if (Error E = InputFile->getSectionContents(CS, XDataContents))
+            consumeError(std::move(E));
+          else
+            XDataRVA = CS->VirtualAddress;
+          break;
+        }
+      }
+    }
   }
 
   // Get .pdata contents: array of RUNTIME_FUNCTION entries (12 bytes each)
@@ -499,19 +522,21 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
 
 void PECOFFRewriteInstance::mapCodeSections(
     BOLTLinker::SectionMapper MapSection) {
-  for (BinaryFunction *Function : BC->getAllBinaryFunctions()) {
-    if (!Function->isEmitted())
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &Function = BFI.second;
+    if (!Function.isEmitted())
       continue;
-    if (Function->getOutputAddress() == 0)
-      continue;
-    ErrorOr<BinarySection &> FuncSection = Function->getCodeSection();
+
+    ErrorOr<BinarySection &> FuncSection = Function.getCodeSection();
     if (!FuncSection)
       continue;
 
-    FuncSection->setOutputAddress(Function->getOutputAddress());
-    MapSection(*FuncSection, Function->getOutputAddress());
-    Function->setImageAddress(FuncSection->getAllocAddress());
-    Function->setImageSize(FuncSection->getOutputSize());
+    // In patch mode we rewrite functions at their original addresses, so
+    // the output address is the same as the input address.
+    FuncSection->setOutputAddress(Function.getAddress());
+    MapSection(*FuncSection, Function.getAddress());
+    Function.setImageAddress(FuncSection->getAllocAddress());
+    Function.setImageSize(FuncSection->getOutputSize());
   }
 }
 
@@ -522,6 +547,7 @@ void PECOFFRewriteInstance::emitAndLink() {
           opts::OutputFilename + ".bolt.o", EC, sys::fs::OF_None);
   check_error(EC, "cannot create output object file");
 
+  // Always keep the temp file so we can inspect the MC output.
   if (opts::KeepTmp)
     TempOut->keep();
 
@@ -533,8 +559,9 @@ void PECOFFRewriteInstance::emitAndLink() {
   emitBinaryContext(*Streamer, *BC, getOrgSecPrefix());
   Streamer->finish();
 
-  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: emitted object size = "
-                    << BOS->str().size() << "\n");
+  StringRef ObjContents = BOS->str();
+  outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
+         << " bytes\n";
 
   std::unique_ptr<MemoryBuffer> ObjectMemBuffer =
       MemoryBuffer::getMemBuffer(BOS->str(), "in-memory object file", false);
@@ -557,8 +584,34 @@ void PECOFFRewriteInstance::rewriteFile() {
   check_error(EC, "cannot create output executable file");
   raw_fd_ostream &OS = Out->os();
 
-  // Copy the entire original binary
+  // Start with a full copy of the original PE.  We patch individual function
+  // bodies below, leaving headers, imports, relocations etc. untouched.
   OS << InputFile->getData();
+
+  // We need to translate virtual addresses to file offsets.  PE sections have
+  // a VirtualAddress and a PointerToRawData that together define the mapping.
+  uint64_t ImageBase = InputFile->getImageBase();
+  struct SectionLayout {
+    uint32_t VA;
+    uint32_t Size;
+    uint32_t FileOffset;
+  };
+  SmallVector<SectionLayout, 8> SectionMap;
+
+  for (const object::SectionRef &Section : InputFile->sections()) {
+    const object::coff_section *CS = InputFile->getCOFFSection(Section);
+    SectionMap.push_back(
+        {CS->VirtualAddress, CS->VirtualSize, CS->PointerToRawData});
+  }
+
+  auto VAToFileOffset = [&](uint64_t VA) -> std::optional<uint64_t> {
+    uint32_t RVA = VA - ImageBase;
+    for (const auto &S : SectionMap) {
+      if (RVA >= S.VA && RVA < S.VA + S.Size)
+        return S.FileOffset + (RVA - S.VA);
+    }
+    return std::nullopt;
+  };
 
   uint64_t RewrittenCount = 0;
   uint64_t OverflowCount = 0;
@@ -573,25 +626,33 @@ void PECOFFRewriteInstance::rewriteFile() {
     uint64_t EmittedSize = Function.getImageSize();
     uint64_t OriginalSize = Function.getMaxSize();
 
-    // Skip functions that grew beyond their original allocation
     if (EmittedSize > OriginalSize) {
       ++OverflowCount;
       continue;
     }
 
+    auto FileOff = VAToFileOffset(Function.getAddress());
+    if (!FileOff) {
+      if (opts::Verbosity >= 1)
+        outs() << "BOLT-WARNING: cannot map address 0x"
+               << Twine::utohexstr(Function.getAddress())
+               << " to file offset for \"" << Function << "\", skipping\n";
+      continue;
+    }
+
     if (opts::Verbosity >= 2)
-      outs() << "BOLT: rewriting function \"" << Function << "\""
-             << " (size: " << EmittedSize << "/" << OriginalSize << ")\n";
+      outs() << "BOLT: rewriting \"" << Function << "\""
+             << " size=" << EmittedSize << "/" << OriginalSize
+             << " at file offset 0x" << Twine::utohexstr(*FileOff) << "\n";
 
-    // Write optimized function code at original file offset
     OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()),
-              EmittedSize, Function.getFileOffset());
+              EmittedSize, *FileOff);
 
-    // Pad remaining space with int3 (0xCC) breakpoint instructions
+    // Fill leftover space with int3 so stale code traps cleanly.
     if (EmittedSize < OriginalSize) {
       std::vector<uint8_t> Padding(OriginalSize - EmittedSize, 0xCC);
       OS.pwrite(reinterpret_cast<char *>(Padding.data()), Padding.size(),
-                Function.getFileOffset() + EmittedSize);
+                *FileOff + EmittedSize);
     }
 
     ++RewrittenCount;

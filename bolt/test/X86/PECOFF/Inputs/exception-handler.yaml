@@ -1,0 +1,103 @@
+## x86-64 PE executable with three functions, one of which has an
+## exception handler.  Used to verify that BOLT skips functions with
+## exception handlers and still processes the rest.
+##
+## .text layout (RVA 0x1000, 48 bytes):
+##   func_a   @ 0x1000 .. 0x100F  (16 bytes) - no handler
+##   func_b   @ 0x1010 .. 0x101F  (16 bytes) - HAS exception handler
+##   func_c   @ 0x1020 .. 0x102F  (16 bytes) - no handler
+##
+## .rdata (RVA 0x2000, 16 bytes) UNWIND_INFO:
+##   offset 0: func_a unwind  (01 00 00 00)  v1, no flags
+##   offset 4: func_b unwind  (09 00 00 00 00 10 00 00)  v1, UNW_FLAG_EHANDLER, handler=0x1000
+##   offset 12: func_c unwind (01 00 00 00)  v1, no flags
+##
+## .pdata (RVA 0x4000, 36 bytes) three RUNTIME_FUNCTION entries:
+##   {0x1000, 0x1010, 0x2000}  func_a -> unwind at rdata+0
+##   {0x1010, 0x1020, 0x2004}  func_b -> unwind at rdata+4
+##   {0x1020, 0x1030, 0x200C}  func_c -> unwind at rdata+12
+
+--- !COFF
+OptionalHeader:
+  AddressOfEntryPoint: 4096
+  ImageBase:       5368709120
+  SectionAlignment: 4096
+  FileAlignment:   512
+  MajorOperatingSystemVersion: 6
+  MinorOperatingSystemVersion: 0
+  MajorImageVersion: 0
+  MinorImageVersion: 0
+  MajorSubsystemVersion: 6
+  MinorSubsystemVersion: 0
+  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_CUI
+  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT ]
+  SizeOfStackReserve: 1048576
+  SizeOfStackCommit: 4096
+  SizeOfHeapReserve: 1048576
+  SizeOfHeapCommit: 4096
+  ExportTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  ImportTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  ResourceTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  ExceptionTable:
+    RelativeVirtualAddress: 16384
+    Size:            36
+  CertificateTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  BaseRelocationTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  Debug:
+    RelativeVirtualAddress: 0
+    Size:            0
+  Architecture:
+    RelativeVirtualAddress: 0
+    Size:            0
+  GlobalPtr:
+    RelativeVirtualAddress: 0
+    Size:            0
+  TlsTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  LoadConfigTable:
+    RelativeVirtualAddress: 0
+    Size:            0
+  BoundImport:
+    RelativeVirtualAddress: 0
+    Size:            0
+  IAT:
+    RelativeVirtualAddress: 0
+    Size:            0
+  DelayImportDescriptor:
+    RelativeVirtualAddress: 0
+    Size:            0
+  ClrRuntimeHeader:
+    RelativeVirtualAddress: 0
+    Size:            0
+header:
+  Machine:         IMAGE_FILE_MACHINE_AMD64
+  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE ]
+sections:
+  - Name:            .text
+    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
+    VirtualAddress:  4096
+    VirtualSize:     48
+    SectionData:     554889E54883C4085DC3909090909090554889E54883C4085DC3909090909090554889E54883C4085DC39090909090900000
+  - Name:            .rdata
+    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
+    VirtualAddress:  8192
+    VirtualSize:     16
+    SectionData:     '01000000090000000010000001000000'
+  - Name:            .pdata
+    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
+    VirtualAddress:  16384
+    VirtualSize:     36
+    SectionData:     '00100000101000000020000010100000201000000420000020100000301000000C200000'
+symbols:         []
+...
