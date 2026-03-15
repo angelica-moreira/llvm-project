@@ -2226,6 +2226,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   config->ltoCSProfileGenerate = args.hasArg(OPT_lto_cs_profile_generate);
   config->ltoCSProfileFile = args.getLastArgValue(OPT_lto_cs_profile_file);
   config->ltoSampleProfileName = args.getLastArgValue(OPT_lto_sample_profile);
+  config->ltoBBAddrMap = args.hasFlag(OPT_lto_basic_block_address_map,
+                                      OPT_lto_basic_block_address_map_no, false);
+  config->ltoBasicBlockSections =
+      args.getLastArgValue(OPT_lto_basic_block_sections);
+  config->ltoUniqueBasicBlockSectionNames =
+      args.hasFlag(OPT_lto_unique_basic_block_section_names,
+                   OPT_lto_unique_basic_block_section_names_no, false);
   // Handle miscellaneous boolean flags.
   config->ltoPGOWarnMismatch = args.hasFlag(OPT_lto_pgo_warn_mismatch,
                                             OPT_lto_pgo_warn_mismatch_no, true);

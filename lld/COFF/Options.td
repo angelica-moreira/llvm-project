@@ -317,6 +317,15 @@ defm lto_pgo_warn_mismatch: B<
      "lto-pgo-warn-mismatch",
      "turn on warnings about profile cfg mismatch (default)>",
      "turn off warnings about profile cfg mismatch">;
+def lto_basic_block_sections : P<"lto-basic-block-sections",
+    "Enable basic block sections for LTO">;
+defm lto_basic_block_address_map : B<"lto-basic-block-address-map",
+    "Emit basic block address map for LTO",
+    "Do not emit basic block address map for LTO (default)">;
+defm lto_unique_basic_block_section_names : B<
+    "lto-unique-basic-block-section-names",
+    "Give unique names to every basic block section for LTO",
+    "Do not give unique names to every basic block section for LTO (default)">;
 def dash_dash_version : Flag<["--"], "version">,
   HelpText<"Display the version number and exit">;
 def threads

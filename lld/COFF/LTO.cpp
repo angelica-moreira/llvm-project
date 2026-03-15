@@ -96,6 +96,28 @@ lto::Config BitcodeCompiler::createConfig() {
   c.TimeTraceEnabled = ctx.config.timeTraceEnabled;
   c.TimeTraceGranularity = ctx.config.timeTraceGranularity;
 
+  if (!ctx.config.ltoBasicBlockSections.empty()) {
+    if (ctx.config.ltoBasicBlockSections == "all") {
+      c.Options.BBSections = BasicBlockSection::All;
+    } else if (ctx.config.ltoBasicBlockSections == "labels") {
+      c.Options.BBAddrMap = true;
+    } else if (ctx.config.ltoBasicBlockSections == "none") {
+      c.Options.BBSections = BasicBlockSection::None;
+    } else {
+      ErrorOr<std::unique_ptr<MemoryBuffer>> MBOrErr =
+          MemoryBuffer::getFile(ctx.config.ltoBasicBlockSections.str());
+      if (!MBOrErr)
+        Fatal(ctx) << "cannot open " << ctx.config.ltoBasicBlockSections
+                   << ": " << MBOrErr.getError().message();
+      else
+        c.Options.BBSectionsFuncListBuf = std::move(*MBOrErr);
+      c.Options.BBSections = BasicBlockSection::List;
+    }
+  }
+  c.Options.BBAddrMap = ctx.config.ltoBBAddrMap;
+  c.Options.UniqueBasicBlockSectionNames =
+      ctx.config.ltoUniqueBasicBlockSectionNames;
+
   if (ctx.config.emit == EmitKind::LLVM) {
     c.PreCodeGenModuleHook = [this](size_t task, const Module &m) {
       if (std::unique_ptr<raw_fd_ostream> os =

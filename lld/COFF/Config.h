@@ -288,6 +288,15 @@ struct Configuration {
   // Used for /lto-sample-profile:
   llvm::StringRef ltoSampleProfileName;
 
+  // Used for /lto-basic-block-address-map:
+  bool ltoBBAddrMap = false;
+
+  // Used for /lto-basic-block-sections:
+  llvm::StringRef ltoBasicBlockSections;
+
+  // Used for /lto-unique-basic-block-section-names:
+  bool ltoUniqueBasicBlockSectionNames = false;
+
   // Used for /call-graph-ordering-file:
   llvm::MapVector<std::pair<const SectionChunk *, const SectionChunk *>,
                   uint64_t>
