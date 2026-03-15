@@ -1,0 +1,108 @@
+//===- bolt/Rewrite/PECOFFRewriteInstance.h - PE/COFF rewriter --*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Interface to control an instance of a PE/COFF binary rewriting process.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
+#define BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
+
+#include "bolt/Core/Linker.h"
+#include "bolt/Utils/NameResolver.h"
+#include "llvm/Support/Error.h"
+#include <memory>
+
+namespace llvm {
+class ToolOutputFile;
+class raw_pwrite_stream;
+namespace object {
+class COFFObjectFile;
+} // namespace object
+
+namespace bolt {
+
+class BinaryContext;
+class ProfileReaderBase;
+
+/// Parsed SEH unwind information for a single function.
+struct SEHUnwindInfo {
+  uint8_t Version = 0;
+  uint8_t Flags = 0;
+  uint8_t PrologSize = 0;
+  uint8_t FrameRegister = 0;
+  uint8_t FrameOffset = 0;
+  std::vector<uint16_t> UnwindCodes;
+  uint32_t ExceptionHandlerRVA = 0;
+  bool HasExceptionHandler = false;
+  bool IsChained = false;
+  uint32_t ChainedBeginRVA = 0;
+  uint32_t ChainedEndRVA = 0;
+  uint32_t ChainedUnwindRVA = 0;
+};
+
+class PECOFFRewriteInstance {
+  object::COFFObjectFile *InputFile;
+  StringRef ToolPath;
+  std::unique_ptr<BinaryContext> BC;
+
+  NameResolver NR;
+
+  std::unique_ptr<BOLTLinker> Linker;
+
+  std::unique_ptr<ToolOutputFile> Out;
+
+  std::unique_ptr<ProfileReaderBase> ProfileReader;
+
+  /// SEH unwind info indexed by function begin RVA.
+  std::map<uint64_t, SEHUnwindInfo> FunctionSEHInfo;
+
+  /// Number of functions skipped due to exception handlers.
+  uint64_t NumFuncsWithHandlers = 0;
+
+  /// Number of functions skipped due to size overflow after optimization.
+  uint64_t NumFuncsOverflow = 0;
+
+  void preprocessProfileData();
+  void processProfileDataPreCFG();
+  void processProfileData();
+
+  void adjustCommandLineOptions();
+  void readSpecialSections();
+  void readExceptionHandling();
+  void discoverFileObjects();
+  void disassembleFunctions();
+  void buildFunctionsCFG();
+  void postProcessFunctions();
+  void runOptimizationPasses();
+  void mapCodeSections(BOLTLinker::SectionMapper MapSection);
+  void emitAndLink();
+  void rewriteFile();
+  void identityRewriteFile();
+
+  static StringRef getNewSecPrefix() { return ".bolt.new"; }
+  static StringRef getOrgSecPrefix() { return ".bolt.org"; }
+
+public:
+  PECOFFRewriteInstance(object::COFFObjectFile *InputFile, StringRef ToolPath,
+                        Error &Err);
+
+  static Expected<std::unique_ptr<PECOFFRewriteInstance>>
+  create(object::COFFObjectFile *InputFile, StringRef ToolPath);
+  ~PECOFFRewriteInstance();
+
+  Error setProfile(StringRef FileName);
+
+  /// Run all the necessary steps to read, optimize and rewrite the binary.
+  void run();
+};
+
+} // namespace bolt
+} // namespace llvm
+
+#endif

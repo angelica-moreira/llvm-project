@@ -21,6 +21,7 @@
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/MachO.h"
+#include "llvm/Object/COFF.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
@@ -159,15 +160,27 @@ public:
         Contents(getContentsOrQuit(Section)), Address(Section.getAddress()),
         Size(Section.getSize()), Alignment(Section.getAlignment().value()),
         OutputName(Name), SectionNumber(++Count) {
-    if (isELF()) {
+    const ObjectFile *Obj = Section.getObject();
+    if (isa<ELFObjectFileBase>(Obj)) {
       ELFType = ELFSectionRef(Section).getType();
       ELFFlags = ELFSectionRef(Section).getFlags();
       InputFileOffset = ELFSectionRef(Section).getOffset();
-    } else if (isMachO()) {
-      auto *O = cast<MachOObjectFile>(Section.getObject());
+    } else if (isa<MachOObjectFile>(Obj)) {
+      auto *O = cast<MachOObjectFile>(Obj);
       InputFileOffset =
           O->is64Bit() ? O->getSection64(Section.getRawDataRefImpl()).offset
                        : O->getSection(Section.getRawDataRefImpl()).offset;
+    } else if (isa<object::COFFObjectFile>(Obj)) {
+      auto *O = cast<object::COFFObjectFile>(Obj);
+      const object::coff_section *COFFSec = O->getCOFFSection(Section);
+      InputFileOffset = COFFSec->PointerToRawData;
+      unsigned Characteristics = COFFSec->Characteristics;
+      ELFType = ELF::SHT_PROGBITS;
+      ELFFlags = ELF::SHF_ALLOC;
+      if (Characteristics & COFF::IMAGE_SCN_MEM_EXECUTE)
+        ELFFlags |= ELF::SHF_EXECINSTR;
+      if (Characteristics & COFF::IMAGE_SCN_MEM_WRITE)
+        ELFFlags |= ELF::SHF_WRITE;
     }
   }
 
@@ -249,6 +262,7 @@ public:
   BinaryContext &getBinaryContext() { return BC; }
   bool isELF() const;
   bool isMachO() const;
+  bool isCOFF() const;
   StringRef getName() const { return Name; }
   uint64_t getAddress() const { return Address; }
   uint64_t getEndAddress() const { return Address + Size; }

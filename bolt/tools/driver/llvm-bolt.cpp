@@ -14,10 +14,12 @@
 
 #include "bolt/Profile/DataAggregator.h"
 #include "bolt/Rewrite/MachORewriteInstance.h"
+#include "bolt/Rewrite/PECOFFRewriteInstance.h"
 #include "bolt/Rewrite/RewriteInstance.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/Binary.h"
+#include "llvm/Object/COFF.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/Error.h"
@@ -259,6 +261,17 @@ int main(int argc, char **argv) {
           report_error(opts::InputDataFilename, std::move(E));
 
       MachORI.run();
+    } else if (auto *C = dyn_cast<object::COFFObjectFile>(&Binary)) {
+      auto COFFRIOrErr = PECOFFRewriteInstance::create(C, ToolPath);
+      if (Error E = COFFRIOrErr.takeError())
+        report_error(opts::InputFilename, std::move(E));
+      PECOFFRewriteInstance &COFFRI = *COFFRIOrErr.get();
+
+      if (!opts::InputDataFilename.empty())
+        if (Error E = COFFRI.setProfile(opts::InputDataFilename))
+          report_error(opts::InputDataFilename, std::move(E));
+
+      COFFRI.run();
     } else {
       report_error(opts::InputFilename, object_error::invalid_file_type);
     }

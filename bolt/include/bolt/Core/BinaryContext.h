@@ -27,12 +27,14 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/MC/MCSectionCOFF.h"
 #include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCPseudoProbe.h"
 #include "llvm/MC/MCSectionELF.h"
@@ -883,6 +885,8 @@ public:
 
   bool isMachO() const { return TheTriple->isOSBinFormatMachO(); }
 
+  bool isCOFF() const { return TheTriple->isOSBinFormatCOFF(); }
+
   bool isAArch64() const {
     return TheTriple->getArch() == llvm::Triple::aarch64;
   }
@@ -1079,6 +1083,11 @@ public:
     if (isELF())
       return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS,
                                 ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+    else if (isCOFF())
+      return Ctx->getCOFFSection(
+          SectionName,
+          COFF::IMAGE_SCN_CNT_CODE | COFF::IMAGE_SCN_MEM_EXECUTE |
+              COFF::IMAGE_SCN_MEM_READ);
     else
       return Ctx->getMachOSection("__TEXT", SectionName,
                                   MachO::S_ATTR_PURE_INSTRUCTIONS,
@@ -1087,6 +1096,10 @@ public:
 
   /// Return data section with a given name.
   MCSection *getDataSection(StringRef SectionName) const {
+    if (isCOFF())
+      return Ctx->getCOFFSection(
+          SectionName,
+          COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_READ);
     return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
   }
 
