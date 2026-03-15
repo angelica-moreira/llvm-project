@@ -17,6 +17,7 @@
 #include "Win64EHDumper.h"
 #include "llvm-readobj.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/COFF.h"
@@ -42,6 +43,7 @@
 #include "llvm/DebugInfo/CodeView/TypeStreamMerger.h"
 #include "llvm/DebugInfo/CodeView/TypeTableCollection.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/ELFTypes.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/WindowsResource.h"
 #include "llvm/Support/BinaryStreamReader.h"
@@ -109,6 +111,7 @@ public:
   void printStackMap() const override;
   void printAddrsig() override;
   void printCGProfile() override;
+  void printBBAddrMaps(bool PrettyPGOAnalysis) override;
   void printStringTable() override;
 
 private:
@@ -2484,6 +2487,44 @@ void COFFDumper::printCGProfile() {
     W.printNumber("From", getSymbolName(FromIndex), FromIndex);
     W.printNumber("To", getSymbolName(ToIndex), ToIndex);
     W.printNumber("Weight", Count);
+  }
+}
+
+void COFFDumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
+  std::vector<PGOAnalysisMap> PGOAnalyses;
+  Expected<std::vector<BBAddrMap>> BBAddrMapOrErr =
+      Obj->readBBAddrMap(&PGOAnalyses);
+  if (!BBAddrMapOrErr) {
+    reportUniqueWarning("failed to read BBAddrMap: " +
+                        toString(BBAddrMapOrErr.takeError()));
+    return;
+  }
+
+  ListScope L(W, "BBAddrMap");
+  for (const auto &[AM, PAM] :
+       zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
+    DictScope D(W, "Function");
+    W.printHex("At", AM.getFunctionAddress());
+    if (PAM.FeatEnable.FuncEntryCount)
+      W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
+
+    for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
+      DictScope BBRD(W);
+      W.printHex("Base Address", BBR.BaseAddress);
+      ListScope BBEL(W, "BB Entries");
+      for (size_t I = 0; I < BBR.BBEntries.size(); ++I) {
+        const BBAddrMap::BBEntry &BBE = BBR.BBEntries[I];
+        DictScope BBED(W);
+        W.printNumber("ID", BBE.ID);
+        W.printHex("Offset", BBE.Offset);
+        W.printHex("Size", BBE.Size);
+        W.printBoolean("HasReturn", BBE.hasReturn());
+        W.printBoolean("HasTailCall", BBE.hasTailCall());
+        W.printBoolean("IsEHPad", BBE.isEHPad());
+        W.printBoolean("CanFallThrough", BBE.canFallThrough());
+        W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
+      }
+    }
   }
 }
 
