@@ -1293,23 +1293,26 @@ MCObjectFileInfo::getBBAddrMapSection(const MCSection &TextSec) const {
         Name, ELF::SHT_LLVM_BB_ADDR_MAP, Flags, 0, GroupName, true,
         ElfSec.getUniqueID(),
         static_cast<const MCSymbolELF *>(TextSec.getBeginSymbol()));
-  } else if (Ctx->getObjectFileType() == MCContext::IsCOFF) {
-    StringRef COMDATSymName;
-    int Selection = 0;
-    unsigned Characteristics = COFF::IMAGE_SCN_CNT_INITIALIZED_DATA |
+  }
+
+  if (Ctx->getObjectFileType() == MCContext::IsCOFF) {
+    const MCSectionCOFF &CoffSec = static_cast<const MCSectionCOFF &>(TextSec);
+    unsigned Characteristics = COFF::IMAGE_SCN_MEM_READ |
                                COFF::IMAGE_SCN_MEM_DISCARDABLE |
-                               COFF::IMAGE_SCN_MEM_READ;
-    const auto &COFFSec = static_cast<const MCSectionCOFF &>(TextSec);
-    if (const MCSymbol *COMDATSym = COFFSec.getCOMDATSymbol()) {
+                               COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+    if (CoffSec.getCOMDATSymbol()) {
       if (!Ctx->getAsmInfo().hasCOFFAssociativeComdats())
         report_fatal_error("BB address map requires associative COMDAT "
                            "support for COMDAT functions");
-      COMDATSymName = COMDATSym->getName();
       Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
-      Selection = COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE;
+      return Ctx->getCOFFSection(
+          Name, Characteristics,
+          CoffSec.getCOMDATSymbol()->getName(),
+          COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE, CoffSec.getUniqueID());
     }
-    return Ctx->getCOFFSection(Name, Characteristics, COMDATSymName, Selection,
-                               COFFSec.getUniqueID());
+    return Ctx->getCOFFSection(Name, Characteristics, "", 0,
+                               CoffSec.isUnique() ? CoffSec.getUniqueID()
+                                                  : MCSection::NonUniqueID);
   }
 
   return nullptr;

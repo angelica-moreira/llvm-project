@@ -43,10 +43,12 @@
 #include "llvm/DebugInfo/CodeView/TypeStreamMerger.h"
 #include "llvm/DebugInfo/CodeView/TypeTableCollection.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/BBAddrMap.h"
 #include "llvm/Object/ELFTypes.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/WindowsResource.h"
 #include "llvm/Support/BinaryStreamReader.h"
+#include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertUTF.h"
@@ -2491,38 +2493,97 @@ void COFFDumper::printCGProfile() {
 }
 
 void COFFDumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
-  std::vector<PGOAnalysisMap> PGOAnalyses;
-  Expected<std::vector<BBAddrMap>> BBAddrMapOrErr =
-      Obj->readBBAddrMap(&PGOAnalyses);
-  if (!BBAddrMapOrErr) {
-    reportUniqueWarning("failed to read BBAddrMap: " +
-                        toString(BBAddrMapOrErr.takeError()));
-    return;
-  }
+  for (const SectionRef &Sec : Obj->sections()) {
+    StringRef Name = unwrapOrError(Obj->getFileName(), Sec.getName());
+    if (Name != ".llvm_bb_addr_map")
+      continue;
 
-  ListScope L(W, "BBAddrMap");
-  for (const auto &[AM, PAM] :
-       zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
-    DictScope D(W, "Function");
-    W.printHex("At", AM.getFunctionAddress());
-    if (PAM.FeatEnable.FuncEntryCount)
-      W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
+    ListScope L(W, "BBAddrMap");
 
-    for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
-      DictScope BBRD(W);
-      W.printHex("Base Address", BBR.BaseAddress);
-      ListScope BBEL(W, "BB Entries");
-      for (size_t I = 0; I < BBR.BBEntries.size(); ++I) {
-        const BBAddrMap::BBEntry &BBE = BBR.BBEntries[I];
-        DictScope BBED(W);
-        W.printNumber("ID", BBE.ID);
-        W.printHex("Offset", BBE.Offset);
-        W.printHex("Size", BBE.Size);
-        W.printBoolean("HasReturn", BBE.hasReturn());
-        W.printBoolean("HasTailCall", BBE.hasTailCall());
-        W.printBoolean("IsEHPad", BBE.isEHPad());
-        W.printBoolean("CanFallThrough", BBE.canFallThrough());
-        W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
+    bool IsRelocatable = Obj->isRelocatableObject();
+
+    // Build relocation translation map. In relocatable objects, function
+    // addresses are zero and resolved via relocations.
+    DenseMap<uint64_t, uint64_t> FunctionOffsetTranslations;
+    SmallVector<std::pair<uint64_t, StringRef>, 4> RelocEntries;
+    for (const RelocationRef &Reloc : Sec.relocations()) {
+      FunctionOffsetTranslations[Reloc.getOffset()] = 0;
+      StringRef SymName;
+      symbol_iterator SymI = Reloc.getSymbol();
+      if (SymI != Obj->symbol_end()) {
+        Expected<StringRef> SymNameOrErr = SymI->getName();
+        if (SymNameOrErr)
+          SymName = *SymNameOrErr;
+      }
+      RelocEntries.push_back({Reloc.getOffset(), SymName});
+    }
+    llvm::sort(RelocEntries,
+               [](const auto &A, const auto &B) { return A.first < B.first; });
+
+    StringRef Contents =
+        unwrapOrError(Obj->getFileName(), Sec.getContents());
+
+    unsigned AddrSize = Obj->getBytesInAddress();
+    DataExtractor Data(Contents, /*IsLittleEndian=*/true, AddrSize);
+    std::vector<PGOAnalysisMap> PGOAnalyses;
+    Expected<std::vector<BBAddrMap>> BBAddrMapOrErr =
+        decodeBBAddrMapSection(Data, FunctionOffsetTranslations,
+                               IsRelocatable, Name, &PGOAnalyses);
+    if (!BBAddrMapOrErr) {
+      reportUniqueWarning("unable to decode .llvm_bb_addr_map section: " +
+                          toString(BBAddrMapOrErr.takeError()));
+      continue;
+    }
+
+    size_t RelocIdx = 0;
+    for (const auto &[AM, PAM] : zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
+      DictScope D(W, "Function");
+      W.printHex("At", AM.getFunctionAddress());
+
+      std::string FuncName = "<?>";
+      if (IsRelocatable) {
+        if (RelocIdx < RelocEntries.size())
+          FuncName = std::string(RelocEntries[RelocIdx].second);
+      } else {
+        uint64_t FuncAddr = AM.getFunctionAddress();
+        for (const SymbolRef &Sym : Obj->symbols()) {
+          Expected<uint64_t> AddrOrErr = Sym.getAddress();
+          if (AddrOrErr && *AddrOrErr == FuncAddr) {
+            Expected<StringRef> NameOrErr = Sym.getName();
+            if (NameOrErr) {
+              FuncName = std::string(*NameOrErr);
+              break;
+            }
+          }
+        }
+      }
+      W.printString("Name", FuncName);
+
+      {
+        ListScope BBRL(W, "BB Ranges");
+        for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
+          DictScope BBRD(W);
+          W.printHex("Base Address", BBR.BaseAddress);
+          ListScope BBEL(W, "BB Entries");
+          for (const BBAddrMap::BBEntry &BBE : BBR.BBEntries) {
+            DictScope BBED(W);
+            W.printNumber("ID", BBE.ID);
+            W.printHex("Offset", BBE.Offset);
+            W.printHex("Size", BBE.Size);
+            W.printBoolean("HasReturn", BBE.hasReturn());
+            W.printBoolean("HasTailCall", BBE.hasTailCall());
+            W.printBoolean("IsEHPad", BBE.isEHPad());
+            W.printBoolean("CanFallThrough", BBE.canFallThrough());
+            W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
+          }
+          ++RelocIdx;
+        }
+      }
+
+      if (PAM.FeatEnable.hasPGOAnalysis()) {
+        DictScope PD(W, "PGO analyses");
+        if (PAM.FeatEnable.FuncEntryCount)
+          W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
       }
     }
   }

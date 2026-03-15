@@ -1864,51 +1864,70 @@ MCSection *TargetLoweringObjectFileCOFF::SelectSectionForGlobal(
   return DataSection;
 }
 
+/// Returns a unique section for the given machine basic block (COFF).
+/// Uses MSVC-style $-suffix naming for lexicographic sort ordering:
+///   Hot BBs:  .text$mn$<func>$<bb_symbol>
+///   Cold BBs: .text$zz$<func>$<bb_symbol>
+///   EH BBs:   .text$eh$<func>$<bb_symbol>
+/// The linker's native lexicographic $ merge produces correct layout.
 MCSection *TargetLoweringObjectFileCOFF::getSectionForMachineBasicBlock(
     const Function &F, const MachineBasicBlock &MBB,
     const TargetMachine &TM) const {
   assert(MBB.isBeginSection() && "Basic block does not start a section!");
 
   SmallString<128> Name;
-  StringRef FunctionSectionName = MBB.getParent()->getSection()->getName();
   StringRef FunctionName = MBB.getParent()->getName();
+
+  if (MBB.getSectionID() == MBBSectionID::ColdSectionID) {
+    Name += ".text$zz$";
+    Name += FunctionName;
+    Name += "$";
+    Name += MBB.getSymbol()->getName();
+  } else if (MBB.getSectionID() == MBBSectionID::ExceptionSectionID) {
+    Name += ".text$eh$";
+    Name += FunctionName;
+    Name += "$";
+    Name += MBB.getSymbol()->getName();
+  } else {
+    Name += ".text$mn$";
+    Name += FunctionName;
+    Name += "$";
+    Name += MBB.getSymbol()->getName();
+  }
 
   unsigned Characteristics = COFF::IMAGE_SCN_CNT_CODE |
                              COFF::IMAGE_SCN_MEM_EXECUTE |
                              COFF::IMAGE_SCN_MEM_READ;
 
-  // Cold and exception BBs get their own named sections per function. Regular
-  // BBs reuse the function section name with a unique ID.
-  if (MBB.getSectionID() == MBBSectionID::ColdSectionID) {
-    Name += BBSectionsColdTextPrefix;
-    Name += FunctionName;
-  } else if (MBB.getSectionID() == MBBSectionID::ExceptionSectionID) {
-    Name += ".text.eh.";
-    Name += FunctionName;
-  } else {
-    Name += FunctionSectionName;
-    if (TM.getUniqueBasicBlockSectionNames()) {
-      if (!Name.ends_with("."))
-        Name += ".";
-      Name += MBB.getSymbol()->getName();
-    }
+  if (F.hasComdat()) {
+    Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
+    MCSymbol *Sym = TM.getSymbol(&F);
+    return getContext().getCOFFSection(Name, Characteristics, Sym->getName(),
+                                       COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
   }
 
-  Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
-  int Selection = COFF::IMAGE_COMDAT_SELECT_NODUPLICATES;
-  StringRef COMDATSymName;
+  return getContext().getCOFFSection(Name, Characteristics);
+}
+
+MCSection *TargetLoweringObjectFileCOFF::getUniqueSectionForFunction(
+    const Function &F, const TargetMachine &TM) const {
+  SmallString<128> Name;
+  Name += ".text$mn$";
+  Name += F.getName();
+
+  unsigned Characteristics = COFF::IMAGE_SCN_CNT_CODE |
+                             COFF::IMAGE_SCN_MEM_EXECUTE |
+                             COFF::IMAGE_SCN_MEM_READ;
 
   if (F.hasComdat()) {
-    const GlobalValue *ComdatGV = getComdatGVForCOFF(&F);
-    if (!ComdatGV->hasPrivateLinkage())
-      COMDATSymName = TM.getSymbol(ComdatGV)->getName();
-    Selection = COFF::IMAGE_COMDAT_SELECT_ANY;
-  } else {
-    COMDATSymName = MBB.getSymbol()->getName();
+    Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
+    MCSymbol *Sym = TM.getSymbol(&F);
+    return getContext().getCOFFSection(Name, Characteristics, Sym->getName(),
+                                       COFF::IMAGE_COMDAT_SELECT_ANY,
+                                       MCSection::NonUniqueID);
   }
 
-  return getContext().getCOFFSection(Name, Characteristics, COMDATSymName,
-                                     Selection, NextUniqueID++);
+  return getContext().getCOFFSection(Name, Characteristics);
 }
 
 void TargetLoweringObjectFileCOFF::getNameWithPrefix(
