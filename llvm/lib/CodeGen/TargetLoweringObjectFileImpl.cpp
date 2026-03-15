@@ -1864,6 +1864,53 @@ MCSection *TargetLoweringObjectFileCOFF::SelectSectionForGlobal(
   return DataSection;
 }
 
+MCSection *TargetLoweringObjectFileCOFF::getSectionForMachineBasicBlock(
+    const Function &F, const MachineBasicBlock &MBB,
+    const TargetMachine &TM) const {
+  assert(MBB.isBeginSection() && "Basic block does not start a section!");
+
+  SmallString<128> Name;
+  StringRef FunctionSectionName = MBB.getParent()->getSection()->getName();
+  StringRef FunctionName = MBB.getParent()->getName();
+
+  unsigned Characteristics = COFF::IMAGE_SCN_CNT_CODE |
+                             COFF::IMAGE_SCN_MEM_EXECUTE |
+                             COFF::IMAGE_SCN_MEM_READ;
+
+  // Cold and exception BBs get their own named sections per function. Regular
+  // BBs reuse the function section name with a unique ID.
+  if (MBB.getSectionID() == MBBSectionID::ColdSectionID) {
+    Name += BBSectionsColdTextPrefix;
+    Name += FunctionName;
+  } else if (MBB.getSectionID() == MBBSectionID::ExceptionSectionID) {
+    Name += ".text.eh.";
+    Name += FunctionName;
+  } else {
+    Name += FunctionSectionName;
+    if (TM.getUniqueBasicBlockSectionNames()) {
+      if (!Name.ends_with("."))
+        Name += ".";
+      Name += MBB.getSymbol()->getName();
+    }
+  }
+
+  Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
+  int Selection = COFF::IMAGE_COMDAT_SELECT_NODUPLICATES;
+  StringRef COMDATSymName;
+
+  if (F.hasComdat()) {
+    const GlobalValue *ComdatGV = getComdatGVForCOFF(&F);
+    if (!ComdatGV->hasPrivateLinkage())
+      COMDATSymName = TM.getSymbol(ComdatGV)->getName();
+    Selection = COFF::IMAGE_COMDAT_SELECT_ANY;
+  } else {
+    COMDATSymName = MBB.getSymbol()->getName();
+  }
+
+  return getContext().getCOFFSection(Name, Characteristics, COMDATSymName,
+                                     Selection, NextUniqueID++);
+}
+
 void TargetLoweringObjectFileCOFF::getNameWithPrefix(
     SmallVectorImpl<char> &OutName, const GlobalValue *GV,
     const TargetMachine &TM) const {

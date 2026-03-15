@@ -219,6 +219,11 @@ public:
                                        std::optional<int64_t> PCRelativeOffset,
                                        const TargetMachine &TM) const override;
 
+  MCSection *
+  getSectionForMachineBasicBlock(const Function &F,
+                                 const MachineBasicBlock &MBB,
+                                 const TargetMachine &TM) const override;
+
   /// Given a mergeable constant with the specified size and relocation
   /// information, return a section that it should be placed in.
   MCSection *getSectionForConstant(const DataLayout &DL, SectionKind Kind,
