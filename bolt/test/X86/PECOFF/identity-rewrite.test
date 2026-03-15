@@ -1,0 +1,12 @@
+## Test that llvm-bolt can produce an identity rewrite of a PE/COFF binary.
+## The output must be byte-identical to the input when no profile or
+## optimization flags are given.
+
+# RUN: yaml2obj %p/Inputs/two-funcs.yaml -o %t.exe
+# RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s
+
+# CHECK: BOLT-INFO: processing PE/COFF binary
+# CHECK: BOLT-INFO: parsed 2 .pdata entries
+# CHECK: BOLT-INFO: 2 functions discovered from .pdata
+# CHECK: BOLT-INFO: disassembled 2 functions
+# CHECK: BOLT-INFO: no profile data, producing identity copy

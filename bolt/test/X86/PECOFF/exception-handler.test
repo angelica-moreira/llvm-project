@@ -1,0 +1,12 @@
+## Test that llvm-bolt correctly skips functions with exception handlers.
+## Functions flagged with UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER have opaque
+## handler data that contains embedded code offsets. Rewriting these functions
+## would corrupt the handler data, so BOLT must skip them.
+
+# RUN: yaml2obj %p/Inputs/exception-handler.yaml -o %t.exe
+# RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s
+
+# CHECK: BOLT-INFO: processing PE/COFF binary
+# CHECK: BOLT-INFO: parsed 3 .pdata entries
+# CHECK: BOLT-INFO: 3 functions discovered from .pdata
+# CHECK: BOLT-INFO: 1 functions with exception handlers (skipped)
