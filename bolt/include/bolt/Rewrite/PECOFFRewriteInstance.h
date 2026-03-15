@@ -15,6 +15,9 @@
 
 #include "bolt/Core/Linker.h"
 #include "bolt/Utils/NameResolver.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include <memory>
 
@@ -23,6 +26,7 @@ class ToolOutputFile;
 class raw_pwrite_stream;
 namespace object {
 class COFFObjectFile;
+class RelocationRef;
 } // namespace object
 
 namespace bolt {
@@ -57,6 +61,14 @@ class PECOFFRewriteInstance {
 
   std::unique_ptr<ToolOutputFile> Out;
 
+  /// Holds the resolved (relocated) bytes for each emitted function.
+  /// Populated by emitAndLink() and read by rewriteFile().
+  std::vector<std::vector<uint8_t>> ResolvedFunctionBytes;
+
+  /// Functions whose basic block layout was changed by optimization passes.
+  /// Only these functions get their bytes replaced in the output binary.
+  DenseSet<uint64_t> ModifiedFunctions;
+
   std::unique_ptr<ProfileReaderBase> ProfileReader;
 
   /// SEH unwind info indexed by function begin RVA.
@@ -84,6 +96,17 @@ class PECOFFRewriteInstance {
   void emitAndLink();
   void rewriteFile();
   void identityRewriteFile();
+
+  /// Look up the virtual address of a symbol referenced by a relocation in
+  /// the emitted COFF object.  Defined symbols resolve through their section
+  /// VA; external symbols fall back to BinaryContext lookups.
+  uint64_t resolveRelocSymbol(const object::COFFObjectFile *Obj,
+                              const object::RelocationRef &Rel,
+                              const StringMap<uint64_t> &SectionNameToVA);
+
+  /// Apply a single COFF x86_64 relocation to a writable section buffer.
+  void applyCOFFRelocation(MutableArrayRef<uint8_t> Data, uint64_t SectionVA,
+                           const object::RelocationRef &Rel, uint64_t SymVA);
 
   static StringRef getNewSecPrefix() { return ".bolt.new"; }
   static StringRef getOrgSecPrefix() { return ".bolt.org"; }

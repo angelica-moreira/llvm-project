@@ -14,12 +14,12 @@
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
-#include "bolt/Rewrite/ExecutableFileMemoryManager.h"
-#include "bolt/Rewrite/JITLinkLinker.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -438,6 +438,11 @@ void PECOFFRewriteInstance::discoverFileObjects() {
 void PECOFFRewriteInstance::disassembleFunctions() {
   uint64_t DisasmCount = 0;
   uint64_t FailCount = 0;
+  uint64_t TotalSimple = 0;
+
+  for (auto &BFI : BC->getBinaryFunctions())
+    if (BFI.second.isSimple())
+      ++TotalSimple;
 
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
@@ -547,7 +552,6 @@ void PECOFFRewriteInstance::emitAndLink() {
           opts::OutputFilename + ".bolt.o", EC, sys::fs::OF_None);
   check_error(EC, "cannot create output object file");
 
-  // Always keep the temp file so we can inspect the MC output.
   if (opts::KeepTmp)
     TempOut->keep();
 
@@ -563,18 +567,209 @@ void PECOFFRewriteInstance::emitAndLink() {
   outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
          << " bytes\n";
 
-  std::unique_ptr<MemoryBuffer> ObjectMemBuffer =
-      MemoryBuffer::getMemBuffer(BOS->str(), "in-memory object file", false);
+  // We resolve relocations ourselves instead of going through JITLink.
+  // JITLink was designed for small JIT objects and has O(n^2) algorithms
+  // that hang when processing a COFF object with thousands of sections
+  // (one per function).  Since PE/COFF rewriting is in-place and all
+  // function addresses are known, we just need the assembled bytes with
+  // relocations applied.
 
-  auto EFMM = std::make_unique<ExecutableFileMemoryManager>(*BC);
-  EFMM->setNewSecPrefix(getNewSecPrefix());
-  EFMM->setOrgSecPrefix(getOrgSecPrefix());
+  std::unique_ptr<MemoryBuffer> ObjBuf =
+      MemoryBuffer::getMemBuffer(ObjContents, "bolt-coff-object", false);
 
-  Linker = std::make_unique<JITLinkLinker>(*BC, std::move(EFMM));
-  Linker->loadObject(ObjectMemBuffer->getMemBufferRef(),
-                     [this](auto MapSection) {
-                       mapCodeSections(MapSection);
-                     });
+  Expected<std::unique_ptr<object::ObjectFile>> ObjOrErr =
+      object::ObjectFile::createObjectFile(ObjBuf->getMemBufferRef());
+  if (!ObjOrErr) {
+    errs() << "BOLT-ERROR: cannot parse emitted object: "
+           << toString(ObjOrErr.takeError()) << "\n";
+    exit(1);
+  }
+
+  auto *Obj = cast<object::COFFObjectFile>(ObjOrErr->get());
+
+  // Map section names to the BinaryFunction they belong to.  The MC emitter
+  // creates one section per function, named like ".l.text.<id>".
+  StringMap<BinaryFunction *> SectionToFunc;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (!BF.isEmitted())
+      continue;
+    SmallString<32> SecName = BF.getCodeSectionName();
+    SectionToFunc[SecName] = &BF;
+  }
+
+  // Map section names to their original virtual addresses.  Defined symbols
+  // in the COFF object reference these sections, so we need the VA to compute
+  // the final symbol address (section_VA + offset_in_section).
+  StringMap<uint64_t> SectionNameToVA;
+  for (const auto &Sec : Obj->sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    auto It = SectionToFunc.find(*NameOrErr);
+    if (It != SectionToFunc.end())
+      SectionNameToVA[*NameOrErr] = It->second->getAddress();
+  }
+
+  // Process each function section: copy its bytes and resolve relocations.
+  uint64_t ResolvedCount = 0;
+  for (const auto &Sec : Obj->sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+
+    auto FuncIt = SectionToFunc.find(*NameOrErr);
+    if (FuncIt == SectionToFunc.end())
+      continue;
+
+    BinaryFunction *BF = FuncIt->second;
+    uint64_t SectionVA = BF->getAddress();
+
+    Expected<StringRef> ContentsOrErr = Sec.getContents();
+    if (!ContentsOrErr) {
+      errs() << "BOLT-WARNING: cannot read section " << *NameOrErr << "\n";
+      consumeError(ContentsOrErr.takeError());
+      continue;
+    }
+
+    // Make a writable copy so we can patch in the resolved relocations.
+    ResolvedFunctionBytes.emplace_back(ContentsOrErr->begin(),
+                                       ContentsOrErr->end());
+    auto &Buffer = ResolvedFunctionBytes.back();
+    MutableArrayRef<uint8_t> Data(Buffer);
+
+    for (const auto &Rel : Sec.relocations()) {
+      uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
+      applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
+    }
+
+    BF->setImageAddress(reinterpret_cast<uint64_t>(Data.data()));
+    BF->setImageSize(Data.size());
+    ++ResolvedCount;
+  }
+
+  outs() << "BOLT-INFO: resolved relocations for " << ResolvedCount
+         << " functions\n";
+}
+
+uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
+    const object::COFFObjectFile *Obj, const object::RelocationRef &Rel,
+    const StringMap<uint64_t> &SectionNameToVA) {
+  object::symbol_iterator SI = Rel.getSymbol();
+  if (SI == Obj->symbol_end())
+    return 0;
+
+  object::SymbolRef Sym = *SI;
+
+  // If the symbol is defined in the emitted object, its address is the
+  // section's original VA plus the symbol's offset within that section.
+  Expected<object::section_iterator> SecOrErr = Sym.getSection();
+  if (SecOrErr && *SecOrErr != Obj->section_end()) {
+    Expected<StringRef> SecName = (*SecOrErr)->getName();
+    if (SecName) {
+      auto It = SectionNameToVA.find(*SecName);
+      if (It != SectionNameToVA.end()) {
+        Expected<uint64_t> ValOrErr = Sym.getValue();
+        uint64_t Offset = ValOrErr ? *ValOrErr : 0;
+        return It->second + Offset;
+      }
+    }
+  }
+
+  // External symbol: look it up by name in BinaryContext.
+  Expected<StringRef> NameOrErr = Sym.getName();
+  if (!NameOrErr) {
+    consumeError(NameOrErr.takeError());
+    return 0;
+  }
+  StringRef Name = *NameOrErr;
+
+  if (const BinaryData *BD = BC->getBinaryDataByName(Name)) {
+    return BD->isMoved() && !BD->isJumpTable() ? BD->getOutputAddress()
+                                                : BD->getAddress();
+  }
+
+  // BOLT creates symbols like FUNCat0x<addr> and DATAat0x<addr> for
+  // references into the original binary.  Try parsing the address from
+  // the name as a last resort.
+  size_t HexPos = Name.find("0x");
+  if (HexPos != StringRef::npos) {
+    uint64_t Addr = 0;
+    if (!Name.substr(HexPos + 2).getAsInteger(16, Addr) && Addr != 0)
+      return Addr;
+  }
+
+  LLVM_DEBUG(dbgs() << "BOLT: unresolved symbol " << Name << "\n");
+  return 0;
+}
+
+void PECOFFRewriteInstance::applyCOFFRelocation(
+    MutableArrayRef<uint8_t> Data, uint64_t SectionVA,
+    const object::RelocationRef &Rel, uint64_t SymVA) {
+  uint64_t Offset = Rel.getOffset();
+
+  switch (Rel.getType()) {
+  case COFF::IMAGE_REL_AMD64_REL32: {
+    if (Offset + 4 > Data.size())
+      return;
+    int32_t Existing = support::endian::read32le(&Data[Offset]);
+    uint64_t RelocVA = SectionVA + Offset;
+    int32_t Value = static_cast<int32_t>(SymVA - RelocVA - 4) + Existing;
+    support::endian::write32le(&Data[Offset], Value);
+    break;
+  }
+  case COFF::IMAGE_REL_AMD64_REL32_1:
+  case COFF::IMAGE_REL_AMD64_REL32_2:
+  case COFF::IMAGE_REL_AMD64_REL32_3:
+  case COFF::IMAGE_REL_AMD64_REL32_4:
+  case COFF::IMAGE_REL_AMD64_REL32_5: {
+    if (Offset + 4 > Data.size())
+      return;
+    unsigned Extra = Rel.getType() - COFF::IMAGE_REL_AMD64_REL32;
+    int32_t Existing = support::endian::read32le(&Data[Offset]);
+    uint64_t RelocVA = SectionVA + Offset;
+    int32_t Value =
+        static_cast<int32_t>(SymVA - RelocVA - 4 - Extra) + Existing;
+    support::endian::write32le(&Data[Offset], Value);
+    break;
+  }
+  case COFF::IMAGE_REL_AMD64_ADDR64: {
+    if (Offset + 8 > Data.size())
+      return;
+    int64_t Existing = support::endian::read64le(&Data[Offset]);
+    support::endian::write64le(&Data[Offset], SymVA + Existing);
+    break;
+  }
+  case COFF::IMAGE_REL_AMD64_ADDR32NB: {
+    if (Offset + 4 > Data.size())
+      return;
+    int32_t Existing = support::endian::read32le(&Data[Offset]);
+    uint64_t ImageBase = InputFile->getImageBase();
+    int32_t Value = static_cast<int32_t>(SymVA - ImageBase) + Existing;
+    support::endian::write32le(&Data[Offset], Value);
+    break;
+  }
+  case COFF::IMAGE_REL_AMD64_ADDR32: {
+    if (Offset + 4 > Data.size())
+      return;
+    int32_t Existing = support::endian::read32le(&Data[Offset]);
+    int32_t Value = static_cast<int32_t>(SymVA) + Existing;
+    support::endian::write32le(&Data[Offset], Value);
+    break;
+  }
+  case COFF::IMAGE_REL_AMD64_SECTION:
+  case COFF::IMAGE_REL_AMD64_SECREL:
+    // Used for debug info, not code.  Safe to skip.
+    break;
+  default:
+    LLVM_DEBUG(dbgs() << "BOLT: unhandled COFF relocation type "
+                      << Rel.getType() << " at offset " << Offset << "\n");
+    break;
+  }
 }
 
 void PECOFFRewriteInstance::rewriteFile() {
@@ -640,6 +835,16 @@ void PECOFFRewriteInstance::rewriteFile() {
       continue;
     }
 
+    // Compare emitted bytes with the original.  The MC assembler often
+    // produces different encodings (e.g. dropping redundant REX prefixes)
+    // even when the optimization passes did not change the layout.  Writing
+    // those re-encoded bytes back would corrupt the UNWIND_INFO byte offsets
+    // in .xdata and the base relocation entries in .reloc, so we only patch
+    // functions whose layout was actually modified by the passes.
+    if (!ModifiedFunctions.count(Function.getAddress())) {
+      continue;
+    }
+
     if (opts::Verbosity >= 2)
       outs() << "BOLT: rewriting \"" << Function << "\""
              << " size=" << EmittedSize << "/" << OriginalSize
@@ -687,21 +892,15 @@ void PECOFFRewriteInstance::run() {
   adjustCommandLineOptions();
 
   readSpecialSections();
-
   readExceptionHandling();
-
   discoverFileObjects();
 
   preprocessProfileData();
 
   disassembleFunctions();
-
   processProfileDataPreCFG();
-
   buildFunctionsCFG();
-
   processProfileData();
-
   postProcessFunctions();
 
   if (!ProfileReader) {
@@ -710,10 +909,56 @@ void PECOFFRewriteInstance::run() {
     return;
   }
 
+  // Save the basic block layout of every function before optimization.
+  // After the passes we compare against this snapshot to find which
+  // functions actually had their layout modified.  Only those get their
+  // bytes replaced in the output — writing re-encoded bytes for unmodified
+  // functions would break the UNWIND_INFO byte offsets and base relocations.
+  DenseMap<uint64_t, std::vector<const BinaryBasicBlock *>> OrigLayouts;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (!BF.hasCFG())
+      continue;
+    auto &Layout = BF.getLayout();
+    std::vector<const BinaryBasicBlock *> Order;
+    for (const BinaryBasicBlock *BB : Layout.blocks())
+      Order.push_back(BB);
+    OrigLayouts[BF.getAddress()] = std::move(Order);
+  }
+
   runOptimizationPasses();
 
-  emitAndLink();
+  // Find functions whose layout was actually changed by the passes.
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    auto It = OrigLayouts.find(BF.getAddress());
+    if (It == OrigLayouts.end())
+      continue;
 
+    const auto &OldOrder = It->second;
+    auto &Layout = BF.getLayout();
+    auto NewBlocks = Layout.blocks();
+
+    auto OldIt = OldOrder.begin();
+    bool Changed = false;
+    for (const BinaryBasicBlock *BB : NewBlocks) {
+      if (OldIt == OldOrder.end() || BB != *OldIt) {
+        Changed = true;
+        break;
+      }
+      ++OldIt;
+    }
+    if (!Changed && OldIt != OldOrder.end())
+      Changed = true;
+
+    if (Changed)
+      ModifiedFunctions.insert(BF.getAddress());
+  }
+
+  outs() << "BOLT-INFO: " << ModifiedFunctions.size()
+         << " functions had layout modified\n";
+
+  emitAndLink();
   rewriteFile();
 }
 

@@ -10,6 +10,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryData.h"
 #include "bolt/Core/BinarySection.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ExecutionEngine/JITLink/COFF_x86_64.h"
 #include "llvm/ExecutionEngine/JITLink/ELF_riscv.h"
 #include "llvm/ExecutionEngine/JITLink/JITLink.h"
@@ -25,27 +26,27 @@ namespace bolt {
 
 namespace {
 
-bool hasSymbols(const jitlink::Block &B) {
-  return llvm::any_of(B.getSection().symbols(),
-                      [&B](const auto &S) { return &S->getBlock() == &B; });
-}
-
 /// Liveness in JITLink is based on symbols so sections that do not contain
 /// any symbols will always be pruned. This pass adds anonymous symbols to
 /// needed sections to prevent pruning.
 Error markSectionsLive(jitlink::LinkGraph &G) {
+  // Collect all blocks that already own at least one symbol.  Without this
+  // pre-pass we would call any_of(Section.symbols()) for every block, which
+  // is O(blocks * symbols-per-section) and blows up on large COFF objects
+  // where BOLT creates one section per function.
+  DenseSet<const jitlink::Block *> HasSymbol;
+  for (auto *Sym : G.defined_symbols())
+    HasSymbol.insert(&Sym->getBlock());
+
   for (auto &Section : G.sections()) {
-    // We only need allocatable sections.
     if (Section.getMemLifetime() == orc::MemLifetime::NoAlloc)
       continue;
 
-    // Skip empty sections.
     if (JITLinkLinker::sectionSize(Section) == 0)
       continue;
 
     for (auto *Block : Section.blocks()) {
-      // No need to add symbols if it already has some.
-      if (hasSymbols(*Block))
+      if (HasSymbol.contains(Block))
         continue;
 
       G.addAnonymousSymbol(*Block, /*Offset=*/0, /*Size=*/0,
