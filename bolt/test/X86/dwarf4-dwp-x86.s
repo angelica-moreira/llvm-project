@@ -1,4 +1,5 @@
 ## This test checks updating debuginfo via dwarf4 dwp file
+# REQUIRES: system-linux
 # RUN: rm -rf %t && mkdir -p %t && cd %t
 # RUN: split-file %s %t
 # RUN: %clangxx %cxxflags -g -gdwarf-4 -gsplit-dwarf %t/main.s %t/callee.s -o main.exe

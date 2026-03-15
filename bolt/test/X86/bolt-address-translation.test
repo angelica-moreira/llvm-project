@@ -4,6 +4,7 @@
 ## in a production environment that only runs bolted binaries. As BOLT only
 ## takes no-bolt binaries as inputs, this translation is necessary to cover
 ## this scenario.
+# REQUIRES: system-linux
 #
 # RUN: yaml2obj %p/Inputs/blarge.yaml &> %t.exe
 # RUN: llvm-bolt %t.exe -o %t.out --data %p/Inputs/blarge.fdata \

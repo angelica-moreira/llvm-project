@@ -1,4 +1,5 @@
 ## Check new BAT format containing hashes for YAML profile.
+# REQUIRES: system-linux
 
 RUN: yaml2obj %p/Inputs/blarge_new.yaml &> %t.exe
 RUN: llvm-bolt %t.exe -o %t.out --pa -p %p/Inputs/blarge_new.preagg.txt \

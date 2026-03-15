@@ -1,4 +1,5 @@
 ## Test heatmap with pre-aggregated profile
+# REQUIRES: system-linux
 
 RUN: yaml2obj %p/Inputs/blarge_new.yaml &> %t.exe
 ## Non-BOLTed input binary

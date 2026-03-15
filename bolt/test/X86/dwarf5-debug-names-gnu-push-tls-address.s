@@ -1,3 +1,4 @@
+# REQUIRES: system-linux
 # RUN: llvm-mc -dwarf-version=5 -filetype=obj -triple x86_64-unknown-linux %s   -o %tmain.o
 # RUN: %clang %cflags -gdwarf-5 %tmain.o -o %tmain.exe
 # RUN: llvm-bolt %tmain.exe -o %tmain.exe.bolt --update-debug-sections

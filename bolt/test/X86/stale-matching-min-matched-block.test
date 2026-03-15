@@ -1,6 +1,6 @@
 ## This script checks the stale-matching-min-matched-block flag.
 
-REQUIRES: asserts
+REQUIRES: system-linux, asserts
 RUN: yaml2obj %p/Inputs/blarge.yaml &> %t.exe
 
 ## Testing "usqrt"

@@ -1,6 +1,7 @@
 ## Tests whether llvm-bolt is able to redirect logs when processing a simple
 ## input. If this test fails on your changes, please use BinaryContext::outs()
 ## to print BOLT logging instead of llvm::outs().
+# REQUIRES: system-linux
 
 RUN: yaml2obj %p/Inputs/blarge.yaml &> %t.exe
 RUN: llvm-bolt %t.exe -o %t.null --data %p/Inputs/blarge.fdata -v=2 \

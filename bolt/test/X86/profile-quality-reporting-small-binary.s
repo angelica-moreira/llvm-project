@@ -1,5 +1,6 @@
 ## Test that BOLT-INFO is correctly formatted after profile quality reporting for
 ## a small binary.
+# REQUIRES: system-linux
 
 # RUN: llvm-mc --filetype=obj --triple x86_64-unknown-unknown %s -o %t.o
 # RUN: link_fdata %s %t.o %t.fdata
