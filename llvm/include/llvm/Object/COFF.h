@@ -38,11 +38,13 @@ namespace object {
 
 class Arm64XRelocRef;
 class BaseRelocRef;
+struct BBAddrMap;
 class DelayImportDirectoryEntryRef;
 class DynamicRelocRef;
 class ExportDirectoryEntryRef;
 class ImportDirectoryEntryRef;
 class ImportedSymbolRef;
+struct PGOAnalysisMap;
 class ResourceSectionRef;
 
 using import_directory_iterator = content_iterator<ImportDirectoryEntryRef>;
@@ -1223,6 +1225,10 @@ public:
   bool is64() const { return PE32PlusHeader; }
 
   StringRef mapDebugSectionName(StringRef Name) const override;
+
+  /// Returns a vector of all BB address maps in the object file.
+  Expected<std::vector<BBAddrMap>>
+  readBBAddrMap(std::vector<PGOAnalysisMap> *PGOAnalyses = nullptr) const;
 
   static bool classof(const Binary *v) { return v->isCOFF(); }
 };

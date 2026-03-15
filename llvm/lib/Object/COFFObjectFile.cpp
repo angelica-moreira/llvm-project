@@ -14,12 +14,14 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/Object/BBAddrMap.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/Error.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/WindowsMachineFlag.h"
 #include "llvm/Support/BinaryStreamReader.h"
+#include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -2200,7 +2202,63 @@ Error Arm64XRelocRef::validate(const COFFObjectFile *Obj) const {
   return Error::success();
 }
 
-#define RETURN_IF_ERROR(Expr)                                                  \
+Expected<std::vector<BBAddrMap>>
+COFFObjectFile::readBBAddrMap(
+    std::vector<PGOAnalysisMap> *PGOAnalyses) const {
+  std::vector<BBAddrMap> BBAddrMaps;
+  if (PGOAnalyses)
+    PGOAnalyses->clear();
+
+  bool IsObj = !PE32Header && !PE32PlusHeader;
+  bool IsLittleEndian = true;
+  uint8_t AddrSize = is64() ? 8 : 4;
+
+  for (const SectionRef &Sec : sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr)
+      return NameOrErr.takeError();
+    if (*NameOrErr != ".llvm_bb_addr_map")
+      continue;
+
+    Expected<StringRef> ContentsOrErr = Sec.getContents();
+    if (!ContentsOrErr)
+      return ContentsOrErr.takeError();
+    StringRef Contents = *ContentsOrErr;
+
+    // For relocatable COFF objects, build the relocation translation map from
+    // COFF relocations. Each relocation points at a function address slot.
+    DenseMap<uint64_t, uint64_t> FunctionOffsetTranslations;
+    if (IsObj) {
+      for (const RelocationRef &Reloc : Sec.relocations()) {
+        symbol_iterator SymI = Reloc.getSymbol();
+        if (SymI == symbol_end())
+          continue;
+        Expected<uint64_t> AddrOrErr = SymI->getAddress();
+        if (!AddrOrErr)
+          return AddrOrErr.takeError();
+        FunctionOffsetTranslations[Reloc.getOffset()] = *AddrOrErr;
+      }
+    }
+
+    DataExtractor Data(Contents, IsLittleEndian, AddrSize);
+    auto BBAddrMapOrErr = decodeBBAddrMapSection(
+        Data, FunctionOffsetTranslations, IsObj, *NameOrErr, PGOAnalyses);
+    if (!BBAddrMapOrErr) {
+      if (PGOAnalyses)
+        PGOAnalyses->clear();
+      return BBAddrMapOrErr.takeError();
+    }
+    std::move(BBAddrMapOrErr->begin(), BBAddrMapOrErr->end(),
+              std::back_inserter(BBAddrMaps));
+  }
+
+  if (PGOAnalyses)
+    assert(PGOAnalyses->size() == BBAddrMaps.size() &&
+           "Mismatched BBAddrMap and PGOAnalysisMap counts");
+  return BBAddrMaps;
+}
+
+#define RETURN_IF_ERROR(Expr)\
   do {                                                                         \
     Error E = (Expr);                                                          \
     if (E)                                                                     \
