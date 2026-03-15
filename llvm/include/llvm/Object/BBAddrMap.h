@@ -14,7 +14,9 @@
 #ifndef LLVM_OBJECT_BBADDRMAP_H
 #define LLVM_OBJECT_BBADDRMAP_H
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/BlockFrequency.h"
 #include "llvm/Support/BranchProbability.h"
 #include "llvm/Support/DataExtractor.h"
@@ -282,6 +284,17 @@ public:
 Expected<std::vector<BBAddrMap>>
 decodeBBAddrMapPayload(AddressExtractor &Extractor,
                        std::vector<PGOAnalysisMap> *PGOAnalyses = nullptr);
+
+/// Format-neutral convenience wrapper for COFF (and similar) consumers.
+///
+/// Creates a COFF-specific AddressExtractor that resolves relocations via
+/// \p FunctionOffsetTranslations, then delegates to decodeBBAddrMapPayload.
+/// Falls back to the raw address when no relocation entry is found.
+Expected<std::vector<BBAddrMap>> decodeBBAddrMapSection(
+    DataExtractor Data,
+    const DenseMap<uint64_t, uint64_t> &FunctionOffsetTranslations,
+    bool IsRelocatable, StringRef SectionDesc,
+    std::vector<PGOAnalysisMap> *PGOAnalyses = nullptr);
 
 } // end namespace object.
 } // end namespace llvm.
