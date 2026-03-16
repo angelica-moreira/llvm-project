@@ -12,6 +12,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -147,6 +148,71 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
   return true;
 }
 
+void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
+  // First pass: scan for ImageLoad events to find the actual load address
+  // of the target binary.  xperf ImageLoad lines look like:
+  //   ImageLoad, <timestamp>, <process>(PID), 0x7ff6a2f90000, 0x100000, C:\path\to\binary.exe
+  //
+  // MSVC does the same thing: queries IProcessInfoSource::QueryImages() to
+  // get images[j]->Base, then computes RVA = SampleIP - Base.
+  //
+  // We compute ASLROffset = ActualBase - PreferredImageBase, then subtract
+  // it from all sample IPs so they match BinaryContext's address space.
+
+  // PE ImageBase is always at least 64KB aligned.  FirstAllocAddress is
+  // the lowest loaded address (ImageBase + first section RVA, typically
+  // 0x1000).  Rounding down to 64KB gives us the ImageBase.
+  uint64_t PreferredBase = BC->FirstAllocAddress & ~0xFFFFULL;
+
+  // Get just the filename of the target binary for matching.
+  StringRef ExeName = llvm::sys::path::filename(ETLFilename);
+  // The ETL filename is the trace, not the exe. Get the exe name from BC.
+  StringRef BinaryPath = BC->getFilename();
+  StringRef BinaryName = llvm::sys::path::filename(BinaryPath);
+
+  SmallVector<StringRef, 0> Lines;
+  Dump.split(Lines, '\n');
+
+  for (const StringRef &RawLine : Lines) {
+    StringRef Line = RawLine.trim();
+    if (!Line.contains_insensitive("ImageLoad"))
+      continue;
+
+    // Check if this line references our target binary.
+    if (!Line.contains_insensitive(BinaryName))
+      continue;
+
+    // Extract the base address (first large hex value after "ImageLoad").
+    SmallVector<StringRef, 16> Parts;
+    Line.split(Parts, ',');
+
+    for (const StringRef &Part : Parts) {
+      StringRef P = Part.trim();
+      uint64_t Val = 0;
+      StringRef Hex = P;
+      if (Hex.consume_front("0x") || Hex.consume_front("0X")) {
+        if (!Hex.getAsInteger(16, Val) && Val > 0x10000) {
+          // This is the actual load address.
+          ASLROffset = static_cast<int64_t>(Val) -
+                       static_cast<int64_t>(PreferredBase);
+          LLVM_DEBUG(dbgs() << "ETW2BOLT: detected ASLR load at 0x"
+                            << Twine::utohexstr(Val)
+                            << ", preferred base 0x"
+                            << Twine::utohexstr(PreferredBase)
+                            << ", offset " << ASLROffset << "\n");
+          if (ASLROffset != 0)
+            outs() << "ETW2BOLT: ASLR detected, load offset "
+                   << (ASLROffset > 0 ? "+" : "") << ASLROffset << "\n";
+          return;
+        }
+      }
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "ETW2BOLT: no ImageLoad event found for "
+                    << BinaryName << ", assuming no ASLR\n");
+}
+
 Error ETWDataAggregator::parseXperfOutput() {
   ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
       MemoryBuffer::getFile(DumpFilePath);
@@ -158,6 +224,11 @@ Error ETWDataAggregator::parseXperfOutput() {
          << ((*BufOrErr)->getBufferSize() / 1024) << " KB)...\n";
 
   StringRef Dump = (*BufOrErr)->getBuffer();
+
+  // First pass: find the actual load address from ImageLoad events.
+  parseImageLoadEvents(Dump);
+
+  // Second pass: parse SampledProfile events.
   SmallVector<StringRef, 0> Lines;
   Dump.split(Lines, '\n');
 
@@ -200,6 +271,12 @@ Error ETWDataAggregator::parseXperfOutput() {
 
     if (IP == 0)
       continue;
+
+    // Apply ASLR adjustment: convert runtime address to preferred address.
+    // Same concept as DataAggregator::adjustAddress() for Linux, and
+    // MSVC's (SampleIP - ActualBase) RVA conversion.
+    if (ASLROffset != 0)
+      IP = static_cast<uint64_t>(static_cast<int64_t>(IP) - ASLROffset);
 
     if (!BC->containsAddress(IP))
       continue;

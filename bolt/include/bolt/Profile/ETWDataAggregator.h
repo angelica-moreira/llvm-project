@@ -75,7 +75,14 @@ private:
   /// DataAggregator shells out to `perf script`.
   Error launchXperf();
 
-  /// Parse the xperf dump text and aggregate into NamesToBranches.
+  /// First pass: scan for ImageLoad events to detect the actual load
+  /// address of the target binary.  With ASLR the runtime address differs
+  /// from the preferred ImageBase in the PE header.  This mirrors how
+  /// DataAggregator uses mmap events for ASLR on Linux.
+  void parseImageLoadEvents(StringRef Dump);
+
+  /// Second pass: parse SampledProfile events, adjust IPs for ASLR, and
+  /// aggregate into NamesToBranches.
   Error parseXperfOutput();
 
   /// Record a branch from absolute address From to To with the given counts.
@@ -92,6 +99,12 @@ private:
   /// Per-thread last instruction pointer, used to infer branches from
   /// consecutive samples (basic mode, same as perf2bolt without LBR).
   std::map<uint64_t, uint64_t> LastIPPerThread;
+
+  /// ASLR offset: ActualLoadAddress - PreferredImageBase.
+  /// Added to zero when ASLR is not detected, subtracted from sample IPs
+  /// to convert runtime addresses to preferred addresses that match
+  /// BinaryContext's function map.
+  int64_t ASLROffset{0};
 
   uint64_t TotalEvents{0};
   uint64_t MatchedSamples{0};
