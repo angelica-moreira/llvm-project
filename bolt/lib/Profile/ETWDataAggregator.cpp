@@ -74,30 +74,45 @@ Error ETWDataAggregator::launchXperf() {
         "cannot find xperf.exe; install Windows Performance Toolkit or use "
         "-xperf-path=<path>, or run xperf manually and use -etw-dump=<file>");
 
-  SmallString<256> TempFile;
-  if (std::error_code EC =
-          sys::fs::createTemporaryFile("etw2bolt", "txt", TempFile))
-    return createStringError(EC, "cannot create temp file for xperf output");
-
-  DumpFilePath = std::string(TempFile);
+  // Place the dump file next to the ETL file rather than in %TEMP%.
+  // Antivirus software may block writes to temp directories.
+  DumpFilePath = ETLFilename + ".dump.txt";
 
   // Shell out to xperf, just like DataAggregator shells to perf script.
-  StringRef Args[] = {XperfPath,   "-i", ETLFilename,
-                      "-o",        DumpFilePath, "-a",
-                      "dumper"};
-  SmallVector<StringRef, 8> Argv(std::begin(Args), std::end(Args));
+  // Use stdout redirect instead of -o flag — some xperf versions have
+  // issues writing to certain paths with -o.
+  SmallString<512> CmdLine;
+  raw_svector_ostream CmdStream(CmdLine);
+  CmdStream << "\"" << XperfPath << "\" -i \"" << ETLFilename
+            << "\" -a dumper > \"" << DumpFilePath << "\" 2>&1";
+
+  StringRef CmdArgs[] = {"cmd.exe", "/c", CmdLine};
+  SmallVector<StringRef, 4> Argv(std::begin(CmdArgs), std::end(CmdArgs));
 
   outs() << "ETW2BOLT: running xperf to dump trace data...\n";
-  LLVM_DEBUG(dbgs() << "ETW2BOLT: " << XperfPath << " -i " << ETLFilename
-                    << " -a dumper\n");
+  LLVM_DEBUG(dbgs() << "ETW2BOLT: " << CmdLine << "\n");
 
   std::string ErrMsg;
-  int RC = sys::ExecuteAndWait(XperfPath, Argv, /*Env=*/std::nullopt,
+  int RC = sys::ExecuteAndWait("cmd.exe", Argv, /*Env=*/std::nullopt,
                                /*Redirects=*/{}, /*SecondsToWait=*/600,
                                /*MemoryLimit=*/0, &ErrMsg);
-  if (RC != 0)
+
+  // xperf returns non-zero when events were lost during tracing, which is
+  // common and harmless.  Only fail if the output file is missing or empty.
+  uint64_t FileSize = 0;
+  sys::fs::file_size(DumpFilePath, FileSize);
+  if (FileSize == 0) {
     return createStringError(errc::executable_format_error,
-                             "xperf failed (exit %d): %s", RC, ErrMsg.c_str());
+                             "xperf produced no output (exit %d). "
+                             "Try running as Administrator, or dump manually:\n"
+                             "  xperf -i %s -a dumper > dump.txt\n"
+                             "  etw2bolt ... -etw-dump=dump.txt",
+                             RC, ETLFilename.c_str());
+  }
+
+  if (RC != 0)
+    outs() << "ETW2BOLT: xperf reported warnings (exit " << RC
+           << "), proceeding with " << (FileSize / 1024) << " KB of data\n";
 
   return Error::success();
 }
