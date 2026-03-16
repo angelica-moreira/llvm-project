@@ -1,6 +1,6 @@
 ## Test that llvm-bolt can optimize a PE/COFF binary with profile data.
 ## This exercises the full pipeline: disassembly, CFG, profile loading,
-## optimization passes, JITLink emission, and in-place rewriting.
+## optimization passes, direct relocation resolution, and in-place rewriting.
 
 # RUN: yaml2obj %p/Inputs/two-funcs.yaml -o %t.exe
 # RUN: printf "1 func_0x140001030 1b 1 func_0x140001000 0 0 100\n" > %t.fdata
@@ -10,5 +10,6 @@
 # CHECK: BOLT-INFO: processing PE/COFF binary
 # CHECK: BOLT-INFO: parsed 2 .pdata entries
 # CHECK: BOLT-INFO: 2 functions discovered from .pdata
-# CHECK-NOT: JITLink failed
+# CHECK: BOLT-INFO: emitted object size = {{[0-9]+}} bytes
+# CHECK: BOLT-INFO: resolved relocations for 2 functions
 # CHECK: BOLT-INFO: {{[0-9]+}} functions rewritten

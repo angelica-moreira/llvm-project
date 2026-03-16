@@ -525,26 +525,6 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   BC->logBOLTErrorsAndQuitOnFatal(Manager.runPasses());
 }
 
-void PECOFFRewriteInstance::mapCodeSections(
-    BOLTLinker::SectionMapper MapSection) {
-  for (auto &BFI : BC->getBinaryFunctions()) {
-    BinaryFunction &Function = BFI.second;
-    if (!Function.isEmitted())
-      continue;
-
-    ErrorOr<BinarySection &> FuncSection = Function.getCodeSection();
-    if (!FuncSection)
-      continue;
-
-    // In patch mode we rewrite functions at their original addresses, so
-    // the output address is the same as the input address.
-    FuncSection->setOutputAddress(Function.getAddress());
-    MapSection(*FuncSection, Function.getAddress());
-    Function.setImageAddress(FuncSection->getAllocAddress());
-    Function.setImageSize(FuncSection->getOutputSize());
-  }
-}
-
 void PECOFFRewriteInstance::emitAndLink() {
   std::error_code EC;
   std::unique_ptr<::llvm::ToolOutputFile> TempOut =
@@ -660,13 +640,16 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
     const object::COFFObjectFile *Obj, const object::RelocationRef &Rel,
     const StringMap<uint64_t> &SectionNameToVA) {
   object::symbol_iterator SI = Rel.getSymbol();
-  if (SI == Obj->symbol_end())
+  if (SI == Obj->symbol_end()) {
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: relocation at offset " << Rel.getOffset()
+                      << " has no symbol\n");
     return 0;
+  }
 
   object::SymbolRef Sym = *SI;
 
-  // If the symbol is defined in the emitted object, its address is the
-  // section's original VA plus the symbol's offset within that section.
+  // Defined symbol in the emitted object — its address is the section's
+  // original VA plus the symbol's offset within that section.
   Expected<object::section_iterator> SecOrErr = Sym.getSection();
   if (SecOrErr && *SecOrErr != Obj->section_end()) {
     Expected<StringRef> SecName = (*SecOrErr)->getName();
@@ -675,12 +658,17 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
       if (It != SectionNameToVA.end()) {
         Expected<uint64_t> ValOrErr = Sym.getValue();
         uint64_t Offset = ValOrErr ? *ValOrErr : 0;
+        LLVM_DEBUG({
+          dbgs() << "BOLT-DEBUG: resolved defined symbol in section "
+                 << *SecName << " at VA 0x"
+                 << Twine::utohexstr(It->second + Offset) << "\n";
+        });
         return It->second + Offset;
       }
     }
   }
 
-  // External symbol: look it up by name in BinaryContext.
+  // External symbol — look it up by name in BinaryContext.
   Expected<StringRef> NameOrErr = Sym.getName();
   if (!NameOrErr) {
     consumeError(NameOrErr.takeError());
@@ -689,21 +677,27 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
   StringRef Name = *NameOrErr;
 
   if (const BinaryData *BD = BC->getBinaryDataByName(Name)) {
-    return BD->isMoved() && !BD->isJumpTable() ? BD->getOutputAddress()
-                                                : BD->getAddress();
+    uint64_t Addr = BD->isMoved() && !BD->isJumpTable()
+                        ? BD->getOutputAddress()
+                        : BD->getAddress();
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Name << " via BinaryData"
+                      << " at 0x" << Twine::utohexstr(Addr) << "\n");
+    return Addr;
   }
 
   // BOLT creates symbols like FUNCat0x<addr> and DATAat0x<addr> for
-  // references into the original binary.  Try parsing the address from
-  // the name as a last resort.
+  // references into the original binary.  Parse the embedded address.
   size_t HexPos = Name.find("0x");
   if (HexPos != StringRef::npos) {
     uint64_t Addr = 0;
-    if (!Name.substr(HexPos + 2).getAsInteger(16, Addr) && Addr != 0)
+    if (!Name.substr(HexPos + 2).getAsInteger(16, Addr) && Addr != 0) {
+      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: parsed address 0x"
+                        << Twine::utohexstr(Addr) << " from " << Name << "\n");
       return Addr;
+    }
   }
 
-  LLVM_DEBUG(dbgs() << "BOLT: unresolved symbol " << Name << "\n");
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: unresolved symbol " << Name << "\n");
   return 0;
 }
 
@@ -714,8 +708,12 @@ void PECOFFRewriteInstance::applyCOFFRelocation(
 
   switch (Rel.getType()) {
   case COFF::IMAGE_REL_AMD64_REL32: {
-    if (Offset + 4 > Data.size())
+    if (Offset + 4 > Data.size()) {
+      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: REL32 at offset " << Offset
+                        << " overflows section of size " << Data.size()
+                        << "\n");
       return;
+    }
     int32_t Existing = support::endian::read32le(&Data[Offset]);
     uint64_t RelocVA = SectionVA + Offset;
     int32_t Value = static_cast<int32_t>(SymVA - RelocVA - 4) + Existing;
@@ -729,6 +727,7 @@ void PECOFFRewriteInstance::applyCOFFRelocation(
   case COFF::IMAGE_REL_AMD64_REL32_5: {
     if (Offset + 4 > Data.size())
       return;
+    // REL32_N subtracts an extra N bytes from the displacement.
     unsigned Extra = Rel.getType() - COFF::IMAGE_REL_AMD64_REL32;
     int32_t Existing = support::endian::read32le(&Data[Offset]);
     uint64_t RelocVA = SectionVA + Offset;
@@ -745,6 +744,7 @@ void PECOFFRewriteInstance::applyCOFFRelocation(
     break;
   }
   case COFF::IMAGE_REL_AMD64_ADDR32NB: {
+    // Image-base-relative 32-bit address.
     if (Offset + 4 > Data.size())
       return;
     int32_t Existing = support::endian::read32le(&Data[Offset]);
@@ -763,10 +763,10 @@ void PECOFFRewriteInstance::applyCOFFRelocation(
   }
   case COFF::IMAGE_REL_AMD64_SECTION:
   case COFF::IMAGE_REL_AMD64_SECREL:
-    // Used for debug info, not code.  Safe to skip.
+    // Debug info relocations — not relevant for code patching.
     break;
   default:
-    LLVM_DEBUG(dbgs() << "BOLT: unhandled COFF relocation type "
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: unhandled COFF relocation type "
                       << Rel.getType() << " at offset " << Offset << "\n");
     break;
   }

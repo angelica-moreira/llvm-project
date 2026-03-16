@@ -13,7 +13,6 @@
 #ifndef BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
 #define BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
 
-#include "bolt/Core/Linker.h"
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
@@ -57,8 +56,6 @@ class PECOFFRewriteInstance {
 
   NameResolver NR;
 
-  std::unique_ptr<BOLTLinker> Linker;
-
   std::unique_ptr<ToolOutputFile> Out;
 
   /// Holds the resolved (relocated) bytes for each emitted function.
@@ -92,7 +89,6 @@ class PECOFFRewriteInstance {
   void buildFunctionsCFG();
   void postProcessFunctions();
   void runOptimizationPasses();
-  void mapCodeSections(BOLTLinker::SectionMapper MapSection);
   void emitAndLink();
   void rewriteFile();
   void identityRewriteFile();
