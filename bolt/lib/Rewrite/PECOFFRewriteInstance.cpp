@@ -32,6 +32,7 @@ namespace opts {
 
 using namespace llvm;
 extern cl::opt<unsigned> AlignText;
+extern cl::opt<bool> AggregateOnly;
 extern cl::opt<bool> ForcePatch;
 extern cl::opt<bool> KeepTmp;
 extern cl::opt<bool> NeverPrint;
@@ -910,6 +911,11 @@ void PECOFFRewriteInstance::run() {
   buildFunctionsCFG();
   processProfileData();
   postProcessFunctions();
+
+  // In aggregate-only mode (etw2bolt), just write the profile and exit.
+  // This mirrors how perf2bolt uses AggregateOnly to skip optimization.
+  if (opts::AggregateOnly)
+    return;
 
   if (!ProfileReader) {
     outs() << "BOLT-INFO: no profile data, producing identity copy\n";

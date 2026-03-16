@@ -164,68 +164,61 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
 }
 
 void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
-  // First pass: scan for ImageLoad events to find the actual load address
-  // of the target binary.  xperf ImageLoad lines look like:
-  //   ImageLoad, <timestamp>, <process>(PID), 0x7ff6a2f90000, 0x100000, C:\path\to\binary.exe
-  //
-  // MSVC does the same thing: queries IProcessInfoSource::QueryImages() to
-  // get images[j]->Base, then computes RVA = SampleIP - Base.
-  //
-  // We compute ASLROffset = ActualBase - PreferredImageBase, then subtract
-  // it from all sample IPs so they match BinaryContext's address space.
+  // Scan for I-Start events (image load) to find the actual load address.
+  // Real xperf format:
+  //   I-Start, <ts>, z3.exe (PID), 0x00007ff697580000, 0x00007ff6984c0000, ...
+  // The 4th field is BaseAddr.
 
-  // PE ImageBase is always at least 64KB aligned.  FirstAllocAddress is
-  // the lowest loaded address (ImageBase + first section RVA, typically
-  // 0x1000).  Rounding down to 64KB gives us the ImageBase.
-  uint64_t PreferredBase = BC->FirstAllocAddress & ~0xFFFFULL;
+  // Get the preferred ImageBase.  For PE/COFF, function addresses are
+  // ImageBase + RVA.  The first function is typically at ImageBase + 0x1000,
+  // so we can derive ImageBase from any function address.  PE ImageBase is
+  // always at least 64KB aligned.
+  uint64_t PreferredBase = 0;
+  if (!BC->getBinaryFunctions().empty())
+    PreferredBase = BC->getBinaryFunctions().begin()->second.getAddress() &
+                    ~0xFFFFULL;
 
-  // Get just the filename of the target binary for matching.
-  StringRef ExeName = llvm::sys::path::filename(ETLFilename);
-  // The ETL filename is the trace, not the exe. Get the exe name from BC.
   StringRef BinaryPath = BC->getFilename();
   StringRef BinaryName = llvm::sys::path::filename(BinaryPath);
 
-  SmallVector<StringRef, 0> Lines;
-  Dump.split(Lines, '\n');
+  while (!Dump.empty()) {
+    auto [Line, Rest] = Dump.split('\n');
+    Dump = Rest;
 
-  for (const StringRef &RawLine : Lines) {
-    StringRef Line = RawLine.trim();
-    if (!Line.contains_insensitive("ImageLoad"))
+    StringRef Trimmed = Line.ltrim();
+    if (!Trimmed.starts_with("I-Start"))
       continue;
-
-    // Check if this line references our target binary.
     if (!Line.contains_insensitive(BinaryName))
       continue;
 
-    // Extract the base address (first large hex value after "ImageLoad").
+    // Parse: I-Start, <ts>, z3.exe (PID), 0x<BaseAddr>, ...
     SmallVector<StringRef, 16> Parts;
     Line.split(Parts, ',');
+    if (Parts.size() < 4)
+      continue;
 
-    for (const StringRef &Part : Parts) {
-      StringRef P = Part.trim();
-      uint64_t Val = 0;
-      StringRef Hex = P;
-      if (Hex.consume_front("0x") || Hex.consume_front("0X")) {
-        if (!Hex.getAsInteger(16, Val) && Val > 0x10000) {
-          // This is the actual load address.
-          ASLROffset = static_cast<int64_t>(Val) -
-                       static_cast<int64_t>(PreferredBase);
-          LLVM_DEBUG(dbgs() << "ETW2BOLT: detected ASLR load at 0x"
-                            << Twine::utohexstr(Val)
-                            << ", preferred base 0x"
-                            << Twine::utohexstr(PreferredBase)
-                            << ", offset " << ASLROffset << "\n");
-          if (ASLROffset != 0)
-            outs() << "ETW2BOLT: ASLR detected, load offset "
-                   << (ASLROffset > 0 ? "+" : "") << ASLROffset << "\n";
-          return;
-        }
-      }
-    }
+    StringRef BaseField = Parts[3].trim();
+    uint64_t ActualBase = 0;
+    if (BaseField.consume_front("0x") || BaseField.consume_front("0X"))
+      BaseField.getAsInteger(16, ActualBase);
+
+    if (ActualBase == 0)
+      continue;
+
+    ASLROffset =
+        static_cast<int64_t>(ActualBase) - static_cast<int64_t>(PreferredBase);
+
+    outs() << "ETW2BOLT: " << BinaryName << " loaded at 0x"
+           << Twine::utohexstr(ActualBase) << " (preferred 0x"
+           << Twine::utohexstr(PreferredBase) << ")\n";
+    if (ASLROffset != 0)
+      outs() << "ETW2BOLT: ASLR offset: "
+             << (ASLROffset > 0 ? "+" : "") << ASLROffset << "\n";
+    return;
   }
 
-  LLVM_DEBUG(dbgs() << "ETW2BOLT: no ImageLoad event found for "
-                    << BinaryName << ", assuming no ASLR\n");
+  outs() << "ETW2BOLT: no I-Start event found for " << BinaryName
+         << ", assuming no ASLR\n";
 }
 
 Error ETWDataAggregator::parseXperfOutput() {
@@ -235,71 +228,69 @@ Error ETWDataAggregator::parseXperfOutput() {
     return createStringError(BufOrErr.getError(), "cannot read xperf dump %s",
                              DumpFilePath.c_str());
 
-  outs() << "ETW2BOLT: parsing xperf dump ("
-         << ((*BufOrErr)->getBufferSize() / 1024) << " KB)...\n";
+  uint64_t BufSize = (*BufOrErr)->getBufferSize();
+  outs() << "ETW2BOLT: parsing xperf dump (" << (BufSize / 1024) << " KB)...\n";
 
   StringRef Dump = (*BufOrErr)->getBuffer();
 
-  // First pass: find the actual load address from ImageLoad events.
+  // First pass: find the actual load address from I-Start events.
   parseImageLoadEvents(Dump);
 
-  // Second pass: parse SampledProfile events.
-  SmallVector<StringRef, 0> Lines;
-  Dump.split(Lines, '\n');
+  // Second pass: parse SampledProfile events.  Real xperf format:
+  //   SampledProfile, <ts>, z3.exe (PID), <tid>, <PrgrmCtr>, <cpu>, ...
+  // PrgrmCtr (field 4) is the actual sampled instruction pointer.
 
-  for (const StringRef &RawLine : Lines) {
-    StringRef Line = RawLine.trim();
-    if (Line.empty() || Line.starts_with("#"))
-      continue;
+  StringRef Remaining = Dump;
+  uint64_t LinesProcessed = 0;
 
-    // Parse xperf SampledProfile events.
-    // Format: SampledProfile, TimeStamp, ..., <hex IP>, ...
-    if (!Line.contains_insensitive("SampledProfile") &&
-        !Line.contains_insensitive("PerfInfo"))
+  while (!Remaining.empty()) {
+    auto [Line, Rest] = Remaining.split('\n');
+    Remaining = Rest;
+    ++LinesProcessed;
+
+    if ((LinesProcessed & 0xFFFFF) == 0)
+      outs() << "ETW2BOLT: processed " << (LinesProcessed / 1000000)
+             << "M lines, " << MatchedSamples << " samples matched\r";
+
+    StringRef Trimmed = Line.ltrim();
+    if (!Trimmed.starts_with("SampledProfile"))
       continue;
 
     ++TotalEvents;
 
-    // Extract instruction pointer and thread ID from the comma-separated
-    // fields.  The IP is typically the largest hex value on the line.
-    uint64_t IP = 0;
-    uint64_t ThreadID = 0;
-    SmallVector<StringRef, 16> Parts;
+    // Extract the sampled instruction pointer from the PrgrmCtr field
+    // (field index 4, 0-based) and ThreadID (field index 3).
+    // Format: SampledProfile, <ts>, z3.exe (PID), <tid>, <PrgrmCtr>, <cpu>, ...
+    SmallVector<StringRef, 12> Parts;
     Line.split(Parts, ',');
+    if (Parts.size() < 6)
+      continue;
 
-    for (const StringRef &Part : Parts) {
-      StringRef P = Part.trim();
+    uint64_t ThreadID = 0;
+    Parts[3].trim().getAsInteger(0, ThreadID);
 
-      uint64_t Val = 0;
-      StringRef Hex = P;
-      if (Hex.consume_front("0x") || Hex.consume_front("0X")) {
-        if (!Hex.getAsInteger(16, Val) && Val > 0x10000)
-          IP = Val;
-      }
-
-      if (P.contains_insensitive("ThreadId") ||
-          P.contains_insensitive("TID")) {
-        StringRef After = P.substr(P.find_last_of("=: ") + 1).trim();
-        After.getAsInteger(0, ThreadID);
-      }
-    }
+    // PrgrmCtr is the actual sampled instruction pointer.
+    uint64_t IP = 0;
+    StringRef IPField = Parts[4].trim();
+    if (IPField.consume_front("0x") || IPField.consume_front("0X"))
+      IPField.getAsInteger(16, IP);
 
     if (IP == 0)
       continue;
 
     // Apply ASLR adjustment: convert runtime address to preferred address.
-    // Same concept as DataAggregator::adjustAddress() for Linux, and
-    // MSVC's (SampleIP - ActualBase) RVA conversion.
     if (ASLROffset != 0)
       IP = static_cast<uint64_t>(static_cast<int64_t>(IP) - ASLROffset);
 
-    if (!BC->containsAddress(IP))
+    // Check if this IP belongs to a known function.  We use the function
+    // lookup directly because BinaryContext::containsAddress() depends on
+    // FirstAllocAddress which is not set for PE/COFF.
+    if (!BC->getBinaryFunctionContainingAddress(IP, false, true))
       continue;
 
     ++MatchedSamples;
 
-    // Infer edges from consecutive samples in the same thread.  This is
-    // the same technique DataAggregator uses in basic (non-LBR) mode.
+    // Infer edges from consecutive samples in the same thread.
     if (ThreadID != 0) {
       auto &LastIP = LastIPPerThread[ThreadID];
       if (LastIP != 0 && LastIP != IP) {
@@ -309,6 +300,7 @@ Error ETWDataAggregator::parseXperfOutput() {
     }
   }
 
+  outs() << "\n";
   return Error::success();
 }
 
