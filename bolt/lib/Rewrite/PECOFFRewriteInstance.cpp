@@ -13,6 +13,7 @@
 #include "bolt/Core/MCPlusBuilder.h"
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Profile/DataReader.h"
+#include "bolt/Profile/ETWDataAggregator.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
@@ -109,7 +110,14 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
             " and " + Filename,
         inconvertibleErrorCode());
   }
-  ProfileReader = std::make_unique<DataReader>(Filename);
+
+  // Choose the right reader based on the file type, same pattern as
+  // RewriteInstance::setProfile() for ELF.
+  if (ETWDataAggregator::checkETLMagic(Filename))
+    ProfileReader = std::make_unique<ETWDataAggregator>(Filename);
+  else
+    ProfileReader = std::make_unique<DataReader>(Filename);
+
   return Error::success();
 }
 
