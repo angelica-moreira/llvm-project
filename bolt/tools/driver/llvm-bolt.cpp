@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Profile/DataAggregator.h"
+#include "bolt/Profile/ETWDataAggregator.h"
 #include "bolt/Rewrite/MachORewriteInstance.h"
 #include "bolt/Rewrite/PECOFFRewriteInstance.h"
 #include "bolt/Rewrite/RewriteInstance.h"
@@ -46,6 +47,9 @@ static cl::OptionCategory *BoltCategories[] = {&BoltCategory,
 static cl::OptionCategory *BoltDiffCategories[] = {&BoltDiffCategory};
 
 static cl::OptionCategory *Perf2BoltCategories[] = {&AggregatorCategory,
+                                                    &BoltOutputCategory};
+
+static cl::OptionCategory *ETW2BoltCategories[] = {&AggregatorCategory,
                                                     &BoltOutputCategory};
 
 static cl::opt<std::string> InputFilename(cl::Positional,
@@ -123,6 +127,30 @@ void perf2boltMode(int argc, char **argv) {
   opts::ShowDensity = true;
 }
 
+void etw2boltMode(int argc, char **argv) {
+  cl::HideUnrelatedOptions(ArrayRef(opts::ETW2BoltCategories));
+  cl::AddExtraVersionPrinter(printBoltRevision);
+  cl::ParseCommandLineOptions(
+      argc, argv,
+      "etw2bolt - BOLT ETW data aggregator\n"
+      "\nEXAMPLE: etw2bolt -e=trace.etl executable -o data.fdata\n");
+  if (opts::ETWData.empty()) {
+    errs() << ToolName << ": expected -etwdata=<filename> option.\n";
+    exit(1);
+  }
+  if (!opts::InputDataFilename.empty()) {
+    errs() << ToolName << ": unknown -data option.\n";
+    exit(1);
+  }
+  if (!sys::fs::exists(opts::ETWData))
+    report_error(opts::ETWData, errc::no_such_file_or_directory);
+  if (opts::OutputFilename.empty()) {
+    errs() << ToolName << ": expected -o=<output file> option.\n";
+    exit(1);
+  }
+  opts::AggregateOnly = true;
+}
+
 void boltDiffMode(int argc, char **argv) {
   cl::HideUnrelatedOptions(ArrayRef(opts::BoltDiffCategories));
   cl::AddExtraVersionPrinter(printBoltRevision);
@@ -188,6 +216,8 @@ int main(int argc, char **argv) {
 
   if (llvm::sys::path::filename(ToolName).starts_with("perf2bolt"))
     perf2boltMode(argc, argv);
+  else if (llvm::sys::path::filename(ToolName).starts_with("etw2bolt"))
+    etw2boltMode(argc, argv);
   else if (llvm::sys::path::filename(ToolName).starts_with("llvm-boltdiff"))
     boltDiffMode(argc, argv);
   else
@@ -267,9 +297,14 @@ int main(int argc, char **argv) {
         report_error(opts::InputFilename, std::move(E));
       PECOFFRewriteInstance &COFFRI = *COFFRIOrErr.get();
 
-      if (!opts::InputDataFilename.empty())
+      if (!opts::ETWData.empty()) {
+        if (Error E = COFFRI.setProfile(opts::ETWData))
+          report_error(opts::ETWData, std::move(E));
+      }
+      if (!opts::InputDataFilename.empty()) {
         if (Error E = COFFRI.setProfile(opts::InputDataFilename))
           report_error(opts::InputDataFilename, std::move(E));
+      }
 
       COFFRI.run();
     } else {

@@ -28,6 +28,7 @@ target_link_libraries(llvm-bolt
   )
 
 add_bolt_tool_symlink(perf2bolt llvm-bolt)
+add_bolt_tool_symlink(etw2bolt llvm-bolt)
 add_bolt_tool_symlink(llvm-boltdiff llvm-bolt)
 
 add_dependencies(bolt llvm-bolt)

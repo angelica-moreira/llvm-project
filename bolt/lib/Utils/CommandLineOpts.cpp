@@ -252,6 +252,14 @@ static cl::alias PerfDataA("p", cl::CommaSeparated,
                            cl::desc("alias for -perfdata"),
                            cl::aliasopt(PerfData), cl::cat(AggregatorCategory));
 
+cl::opt<std::string> ETWData("etwdata", cl::desc("<ETL trace file>"),
+                             cl::Optional, cl::cat(AggregatorCategory),
+                             cl::sub(cl::SubCommand::getAll()));
+
+static cl::alias ETWDataA("e", cl::desc("alias for -etwdata"),
+                           cl::aliasopt(ETWData),
+                           cl::cat(AggregatorCategory));
+
 cl::opt<bool> PrintCacheMetrics(
     "print-cache-metrics",
     cl::desc("calculate and print various metrics for instruction cache"),
