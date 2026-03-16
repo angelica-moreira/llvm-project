@@ -106,42 +106,28 @@ Check "identity output is byte-identical" ($origHash -eq $idHash)
 $idResult = & "$WorkDir\bubble_sort_id.exe" 2>&1 | Out-String
 Check "identity copy runs correctly" ($idResult -match "sorted 30000 elements")
 
-# ====================================================================
-Step "4. Create synthetic branch profile (simulating ETW trace data)"
-# ====================================================================
-
-# First, discover actual function addresses from the BOLT output
+# Discover function addresses from the BOLT output for profile creation.
 $boltOut = & $Bolt "$WorkDir\bubble_sort.exe" -o "$WorkDir\tmp.exe" 2>&1 | Out-String
 $funcAddrs = [regex]::Matches($boltOut, "func_0x([0-9a-f]+)") | ForEach-Object { $_.Value } | Sort-Object -Unique | Select-Object -First 10
 Write-Host "  Found functions: $($funcAddrs -join ', ')" -ForegroundColor DarkGray
 
-# Build a branch CSV using two real function addresses
-if ($funcAddrs.Count -ge 2) {
-    $f1 = $funcAddrs[0] -replace "func_", ""
-    $f2 = $funcAddrs[1] -replace "func_", ""
-    $csv = "# Synthetic ETW branch records`n"
-    for ($i = 0; $i -lt 100; $i++) { $csv += "$f1,$f2,0`n" }
-    for ($i = 0; $i -lt 50; $i++) { $csv += "$f2,$f1,0`n" }
-    [IO.File]::WriteAllText("$WorkDir\branches.csv", $csv, [Text.UTF8Encoding]::new($false))
-    Manual "Created branches.csv with 150 branch records between $($funcAddrs[0]) and $($funcAddrs[1])"
-    Check "branch CSV created" (Test-Path "$WorkDir\branches.csv")
-} else {
-    Write-Host "  SKIP: not enough functions found" -ForegroundColor Yellow
-}
-
 # ====================================================================
-Step "5. Convert branches to fdata format"
+Step "4. Create profile data (fdata format, same as perf2bolt output)"
 # ====================================================================
 
-# Write fdata directly from the branch data.  In production you would use
-# etw2bolt with a real ETL trace, but for manual testing we write fdata
-# that llvm-bolt can consume directly.
+# In production you would capture an ETW trace and run etw2bolt:
+#   xperf -on PROC_THREAD+LOADER+PROFILE
+#   bubble_sort.exe
+#   xperf -d trace.etl
+#   etw2bolt bubble_sort.exe -e trace.etl -o profile.fdata
+#
+# For this test we write fdata directly using function addresses that
+# BOLT discovered from .pdata.
+
 if ($funcAddrs.Count -ge 2) {
     $f1Name = $funcAddrs[0]
     $f2Name = $funcAddrs[1]
-    $fdataContent = ""
-    # 100 branches from f1 to f2, 50 from f2 to f1
-    $fdataContent += "1 $f1Name 0 1 $f2Name 0 0 100`n"
+    $fdataContent = "1 $f1Name 0 1 $f2Name 0 0 100`n"
     $fdataContent += "1 $f2Name 0 1 $f1Name 0 0 50`n"
     [IO.File]::WriteAllText("$WorkDir\profile.fdata", $fdataContent, [Text.UTF8Encoding]::new($false))
     Manual "Created profile.fdata with branch edges between $f1Name and $f2Name"
@@ -153,7 +139,7 @@ if ($funcAddrs.Count -ge 2) {
 }
 
 # ====================================================================
-Step "6. Run llvm-bolt with profile data"
+Step "5. Run llvm-bolt with profile data"
 # ====================================================================
 
 Manual "llvm-bolt bubble_sort.exe -o bubble_sort_opt.exe -data=profile.fdata -reorder-blocks=ext-tsp"
@@ -166,7 +152,7 @@ $boltOpt -split "`n" | Where-Object { $_ -match "^BOLT-INFO:" } | ForEach-Object
 }
 
 # ====================================================================
-Step "7. Verify optimized binary runs correctly"
+Step "6. Verify optimized binary runs correctly"
 # ====================================================================
 
 if (Test-Path "$WorkDir\bubble_sort_opt.exe") {
@@ -178,7 +164,7 @@ if (Test-Path "$WorkDir\bubble_sort_opt.exe") {
 }
 
 # ====================================================================
-Step "8. Repeat with matrix_mul"
+Step "7. Repeat with matrix_mul"
 # ====================================================================
 
 & $Bolt "$WorkDir\matrix_mul.exe" -o "$WorkDir\matrix_mul_id.exe" 2>&1 | Out-Null
