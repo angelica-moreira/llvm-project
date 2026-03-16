@@ -1,0 +1,13 @@
+## Test the full etw2bolt pipeline: compile test program, run identity
+## rewrite through llvm-bolt, and verify the output is byte-identical.
+
+# REQUIRES: system-windows
+
+# RUN: %clang_cl /O2 %S/TestPrograms/bubble_sort.c -o %t.exe 2>&1
+# RUN: llvm-bolt %t.exe -o %t.id.exe 2>&1 | FileCheck --check-prefix=CHECK-ID %s
+# RUN: diff %t.exe %t.id.exe
+
+# CHECK-ID: BOLT-INFO: processing PE/COFF binary
+# CHECK-ID: BOLT-INFO: {{[0-9]+}} functions discovered from .pdata
+# CHECK-ID: BOLT-INFO: disassembled {{[0-9]+}} functions
+# CHECK-ID: BOLT-INFO: no profile data, producing identity copy
