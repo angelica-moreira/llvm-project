@@ -904,6 +904,43 @@ void PECOFFRewriteInstance::run() {
 
   adjustCommandLineOptions();
 
+  // Detect binary characteristics that affect rewriting correctness.
+  {
+    // Incrementally linked binaries contain ILT padding and fixup data
+    // that BOLT cannot handle. Check for IMAGE_DEBUG_TYPE_FIXUP entries
+    // and the .textbss section (MSVC incremental link marker).
+    bool IsIncremental = false;
+    for (const auto &Entry : InputFile->debug_directories()) {
+      if (Entry.Type == COFF::IMAGE_DEBUG_TYPE_FIXUP) {
+        IsIncremental = true;
+        break;
+      }
+    }
+    for (const auto &Section : InputFile->sections()) {
+      Expected<StringRef> NameOrErr = Section.getName();
+      if (NameOrErr && *NameOrErr == ".textbss") {
+        IsIncremental = true;
+        break;
+      }
+    }
+    if (IsIncremental)
+      errs() << "BOLT-WARNING: binary appears to be incrementally linked "
+                "(/INCREMENTAL). Results may be incorrect. Re-link with "
+                "/INCREMENTAL:NO for best results.\n";
+
+    // Control Flow Guard maintains a bitmap of valid indirect call targets
+    // at specific RVAs. After block reordering those RVAs are wrong and the
+    // OS will terminate the process on any indirect call.
+    // TODO: rewrite the CFG bitmap after reordering so that /GUARD:CF
+    // binaries can be optimized safely.
+    const object::pe32plus_header *PE = InputFile->getPE32PlusHeader();
+    if (PE &&
+        (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF))
+      errs() << "BOLT-WARNING: binary has Control Flow Guard enabled "
+                "(/GUARD:CF). CFG tables will not be updated and the "
+                "rewritten binary may crash on indirect calls.\n";
+  }
+
   readSpecialSections();
   readExceptionHandling();
   discoverFileObjects();
