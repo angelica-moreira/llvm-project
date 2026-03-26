@@ -16,12 +16,12 @@
 #include "llvm/DebugInfo/CodeView/Line.h"
 #include "llvm/DebugInfo/CodeView/SymbolDeserializer.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+#include "llvm/DebugInfo/MSF/MappedBlockStream.h"
 #include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptor.h"
 #include "llvm/DebugInfo/PDB/Native/DbiStream.h"
 #include "llvm/DebugInfo/PDB/Native/InfoStream.h"
 #include "llvm/DebugInfo/PDB/Native/ModuleDebugStream.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFile.h"
-#include "llvm/DebugInfo/MSF/MappedBlockStream.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/BinaryByteStream.h"
@@ -70,10 +70,8 @@ std::string findPDBPath(StringRef ExePath) {
     // Format: 'RSDS' signature (4) + GUID (16) + age (4) + path (null-term)
     if (Entry.SizeOfData < 25) // at least 24 header + 1 byte path
       continue;
-    if (Data[0] == 'R' && Data[1] == 'S' && Data[2] == 'D' &&
-        Data[3] == 'S') {
-      const char *PDBPath =
-          reinterpret_cast<const char *>(Data + 4 + 16 + 4);
+    if (Data[0] == 'R' && Data[1] == 'S' && Data[2] == 'D' && Data[3] == 'S') {
+      const char *PDBPath = reinterpret_cast<const char *>(Data + 4 + 16 + 4);
       size_t MaxPathLen = Entry.SizeOfData - 24;
       return std::string(PDBPath, strnlen(PDBPath, MaxPathLen));
     }
@@ -84,9 +82,9 @@ std::string findPDBPath(StringRef ExePath) {
 } // namespace
 
 void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
-                              const BinaryContext &BC, uint64_t ImageBase,
-                              const DenseSet<uint64_t> &ModifiedFunctions,
-                              const DenseMap<uint64_t, OffsetMap> &OffsetMaps) {
+                             const BinaryContext &BC, uint64_t ImageBase,
+                             const DenseSet<uint64_t> &ModifiedFunctions,
+                             const DenseMap<uint64_t, OffsetMap> &OffsetMaps) {
 
   // Find the PDB file.
   std::string PDBPath = findPDBPath(InputExe);
@@ -107,8 +105,8 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   ErrorOr<std::unique_ptr<MemoryBuffer>> PDBBuf =
       MemoryBuffer::getFile(PDBPath);
   if (!PDBBuf) {
-    errs() << "BOLT-WARNING: cannot open PDB: "
-           << PDBBuf.getError().message() << "\n";
+    errs() << "BOLT-WARNING: cannot open PDB: " << PDBBuf.getError().message()
+           << "\n";
     return;
   }
 
@@ -206,6 +204,10 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
       if (!BF)
         continue;
 
+      // Note: For in-place PE/COFF rewriting, we do NOT patch CodeSize.
+      // The function still occupies the same memory footprint; only the
+      // internal block order changed.  The original CodeSize remains valid.
+
       LLVM_DEBUG(dbgs() << "BOLT-DEBUG: PDB function " << ProcOrErr->Name
                         << " at VA 0x" << Twine::utohexstr(FuncVA)
                         << " was rewritten\n");
@@ -232,7 +234,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
 
     ArrayRef<uint8_t> C13Bytes;
     if (auto EC = C13Ref.StreamData.readBytes(0, C13Ref.StreamData.getLength(),
-                                               C13Bytes))
+                                              C13Bytes))
       continue;
 
     uint64_t Pos = 0;
@@ -251,10 +253,15 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
       }
 
       // Line fragment header at DataStart:
-      // {uint32 RelocOffset, uint16 RelocSegment, uint16 Flags, uint32 CodeSize}
-      if (Length < 12) { Pos = alignTo(DataEnd, 4); continue; }
+      // {uint32 RelocOffset, uint16 RelocSegment, uint16 Flags, uint32
+      // CodeSize}
+      if (Length < 12) {
+        Pos = alignTo(DataEnd, 4);
+        continue;
+      }
       uint32_t RelocOffset = support::endian::read32le(&C13Bytes[DataStart]);
-      uint16_t RelocSegment = support::endian::read16le(&C13Bytes[DataStart + 4]);
+      uint16_t RelocSegment =
+          support::endian::read16le(&C13Bytes[DataStart + 4]);
       uint64_t FuncVA = computeVA(RelocSegment, RelocOffset);
 
       auto MapIt = OffsetMaps.find(FuncVA);
@@ -282,10 +289,8 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
           if (EntryPos + 8 > DataEnd)
             break;
 
-          uint32_t OldOffset =
-              support::endian::read32le(&C13Bytes[EntryPos]);
-          uint32_t Flags =
-              support::endian::read32le(&C13Bytes[EntryPos + 4]);
+          uint32_t OldOffset = support::endian::read32le(&C13Bytes[EntryPos]);
+          uint32_t Flags = support::endian::read32le(&C13Bytes[EntryPos + 4]);
           LineInfo LI(Flags);
 
           // Remap through BB offset map.
@@ -293,9 +298,8 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
           for (size_t J = 0; J < BBMap.size(); ++J) {
             uint32_t BBOldStart = BBMap[J].first;
             uint32_t BBNewStart = BBMap[J].second;
-            uint32_t BBOldEnd = (J + 1 < BBMap.size())
-                                    ? BBMap[J + 1].first
-                                    : UINT32_MAX;
+            uint32_t BBOldEnd =
+                (J + 1 < BBMap.size()) ? BBMap[J + 1].first : UINT32_MAX;
             if (OldOffset >= BBOldStart && OldOffset < BBOldEnd) {
               NewOffset = BBNewStart + (OldOffset - BBOldStart);
               break;
@@ -349,25 +353,40 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
       uint32_t BS = PDBFile.getBlockSize();
       uint32_t Done = 0;
 
+      // Write a 32-bit value at a stream offset, handling the case where
+      // the write straddles an MSF block boundary.  MSF streams are stored
+      // as a sequence of fixed-size blocks that may not be physically
+      // contiguous, so a naive 4-byte write at a block edge would corrupt
+      // adjacent data.
+      auto writeMSF32 = [&](ArrayRef<support::ulittle32_t> BL,
+                            uint64_t StreamOff, uint32_t Value) -> bool {
+        uint8_t Bytes[4];
+        support::endian::write32le(Bytes, Value);
+        for (unsigned I = 0; I < 4; ++I) {
+          uint32_t Off = StreamOff + I;
+          uint32_t BI = Off / BS;
+          uint32_t OB = Off % BS;
+          if (BI >= BL.size())
+            return false;
+          uint64_t FO = (uint64_t)BL[BI] * BS + OB;
+          if (FO >= Data.size())
+            return false;
+          Data[FO] = static_cast<char>(Bytes[I]);
+        }
+        return true;
+      };
+
       for (const auto &P : AllPatches) {
         auto BL = PDBFile.getStreamBlockList(P.StreamIndex);
-        uint32_t BI = P.StreamOffset / BS;
-        uint32_t OB = P.StreamOffset % BS;
-        if (BI >= BL.size()) continue;
-        // Skip patches that straddle an MSF block boundary.  A 4-byte
-        // write at the end of a block would corrupt the next physical
-        // block instead of following the stream's block map.
-        if (OB + 4 > BS) continue;
-        uint64_t FO = (uint64_t)BL[BI] * BS + OB;
-        if (FO + 4 > Data.size()) continue;
-        support::endian::write32le(&Data[FO], P.NewValue);
-        ++Done;
+        if (writeMSF32(BL, P.StreamOffset, P.NewValue))
+          ++Done;
       }
 
       if (Done > 0) {
         std::error_code WE;
         raw_fd_ostream Out(OutputPDB, WE, sys::fs::OF_None);
-        if (!WE) Out.write(Data.data(), Data.size());
+        if (!WE)
+          Out.write(Data.data(), Data.size());
       }
     }
   }

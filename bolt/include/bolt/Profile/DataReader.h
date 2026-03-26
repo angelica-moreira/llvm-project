@@ -410,6 +410,10 @@ protected:
   using FuncsToMemDataMapTy =
       std::unordered_map<const BinaryFunction *, FuncMemData *>;
 
+  /// Write branch profile data in fdata format.  Shared by DataAggregator
+  /// and ETWDataAggregator to avoid duplicating the serialization logic.
+  std::error_code writeBranchProfile(StringRef OutputFilename) const;
+
   /// Dumps the entire data structures parsed. Used for debugging.
   void dump() const;
 

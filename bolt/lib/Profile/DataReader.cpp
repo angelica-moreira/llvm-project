@@ -1348,6 +1348,43 @@ bool DataReader::hasLocalsWithFileName() const {
   return false;
 }
 
+std::error_code
+DataReader::writeBranchProfile(StringRef OutputFilename) const {
+  std::error_code EC;
+  raw_fd_ostream OutFile(OutputFilename, EC, sys::fs::OF_None);
+  if (EC)
+    return EC;
+
+  auto writeLocation = [&OutFile](const Location &Loc) {
+    OutFile << (Loc.IsSymbol ? "1 " : "0 ")
+            << (Loc.Name.empty() ? "[unknown]" : Loc.Name) << " "
+            << Twine::utohexstr(Loc.Offset) << " ";
+  };
+
+  uint64_t BranchValues = 0;
+  for (const auto &KV : NamesToBranches) {
+    const FuncBranchData &FBD = KV.second;
+    for (const BranchInfo &BI : FBD.Data) {
+      writeLocation(BI.From);
+      writeLocation(BI.To);
+      OutFile << BI.Mispreds << " " << BI.Branches << "\n";
+      ++BranchValues;
+    }
+    for (const BranchInfo &BI : FBD.EntryData) {
+      if (BI.From.IsSymbol)
+        continue;
+      writeLocation(BI.From);
+      writeLocation(BI.To);
+      OutFile << BI.Mispreds << " " << BI.Branches << "\n";
+      ++BranchValues;
+    }
+  }
+
+  outs() << "BOLT-INFO: wrote " << BranchValues << " objects to "
+         << OutputFilename << "\n";
+  return std::error_code();
+}
+
 void DataReader::dump() const {
   for (const auto &KV : NamesToBranches) {
     const StringRef Name = KV.first;

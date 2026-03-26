@@ -15,6 +15,7 @@
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Profile/ETWDataAggregator.h"
+#include "bolt/Profile/YAMLProfileReader.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Utils/CommandLineOpts.h"
@@ -128,6 +129,8 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
   // RewriteInstance::setProfile() for ELF.
   if (ETWDataAggregator::checkETLMagic(Filename))
     ProfileReader = std::make_unique<ETWDataAggregator>(Filename);
+  else if (YAMLProfileReader::isYAML(Filename))
+    ProfileReader = std::make_unique<YAMLProfileReader>(Filename);
   else
     ProfileReader = std::make_unique<DataReader>(Filename);
 
@@ -966,8 +969,8 @@ void PECOFFRewriteInstance::rewriteFile() {
     auto FileOff = VAToFileOffset(JTD.VA);
     if (!FileOff)
       continue;
-    OS.pwrite(reinterpret_cast<const char *>(JTD.Data.data()),
-              JTD.Data.size(), *FileOff);
+    OS.pwrite(reinterpret_cast<const char *>(JTD.Data.data()), JTD.Data.size(),
+              *FileOff);
     LLVM_DEBUG(dbgs() << "BOLT-DEBUG: wrote " << JTD.Data.size()
                       << " bytes of JT data at file offset 0x"
                       << Twine::utohexstr(*FileOff) << "\n");
@@ -1020,22 +1023,25 @@ void PECOFFRewriteInstance::run() {
         break;
       }
     }
-    if (IsIncremental)
-      errs() << "BOLT-WARNING: binary appears to be incrementally linked "
-                "(/INCREMENTAL). Results may be incorrect. Re-link with "
-                "/INCREMENTAL:NO for best results.\n";
+    if (IsIncremental) {
+      errs() << "BOLT-ERROR: binary appears to be incrementally linked "
+                "(/INCREMENTAL). Incremental link tables contain padding "
+                "and fixup data that would be corrupted by rewriting. "
+                "Re-link with /INCREMENTAL:NO.\n";
+      exit(1);
+    }
 
     // Control Flow Guard maintains a bitmap of valid indirect call targets
     // at specific RVAs. After block reordering those RVAs are wrong and the
     // OS will terminate the process on any indirect call.
-    // TODO: rewrite the CFG bitmap after reordering so that /GUARD:CF
-    // binaries can be optimized safely.
     const object::pe32plus_header *PE = InputFile->getPE32PlusHeader();
     if (PE &&
-        (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF))
+        (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
       errs() << "BOLT-WARNING: binary has Control Flow Guard enabled "
-                "(/GUARD:CF). CFG tables will not be updated and the "
-                "rewritten binary may crash on indirect calls.\n";
+                "(/GUARD:CF). After block reordering, CFG target RVAs "
+                "become invalid and the OS may terminate the process. "
+                "Recompile without /GUARD:CF for full safety.\n";
+    }
   }
 
   readSpecialSections();
@@ -1058,9 +1064,9 @@ void PECOFFRewriteInstance::run() {
   if (!ProfileReader) {
     outs() << "BOLT-INFO: no profile data, producing identity copy\n";
     identityRewriteFile();
-    PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                            *BC, InputFile->getImageBase(),
-                            ModifiedFunctions, FunctionOffsetMaps);
+    PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
+                            InputFile->getImageBase(), ModifiedFunctions,
+                            FunctionOffsetMaps);
     return;
   }
 
@@ -1132,8 +1138,8 @@ void PECOFFRewriteInstance::run() {
     for (const BinaryBasicBlock *BB : BF.getLayout().blocks()) {
       uint32_t OldOffset = BB->getOffset();
       Map.push_back({OldOffset, NewOffset});
-      NewOffset += BB->getOutputSize() ? BB->getOutputSize()
-                                       : BB->estimateSize();
+      NewOffset +=
+          BB->getOutputSize() ? BB->getOutputSize() : BB->estimateSize();
     }
   }
 
@@ -1141,9 +1147,9 @@ void PECOFFRewriteInstance::run() {
   rewriteFile();
 
   // Update PDB debug info to match the new binary layout.
-  PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                          *BC, InputFile->getImageBase(),
-                          ModifiedFunctions, FunctionOffsetMaps);
+  PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
+                          InputFile->getImageBase(), ModifiedFunctions,
+                          FunctionOffsetMaps);
 }
 
 } // namespace bolt

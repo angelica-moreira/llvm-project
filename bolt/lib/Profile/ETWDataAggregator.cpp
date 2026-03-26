@@ -311,43 +311,7 @@ Error ETWDataAggregator::parseXperfOutput() {
 
 std::error_code
 ETWDataAggregator::writeAggregatedFile(StringRef OutputFilename) const {
-  // Same output format as DataAggregator::writeAggregatedFile().
-  std::error_code EC;
-  raw_fd_ostream OutFile(OutputFilename, EC, sys::fs::OF_None);
-  if (EC)
-    return EC;
-
-  uint64_t BranchValues = 0;
-
-  for (const auto &KV : NamesToBranches) {
-    const FuncBranchData &FBD = KV.second;
-    for (const BranchInfo &BI : FBD.Data) {
-      OutFile << (BI.From.IsSymbol ? "1 " : "0 ")
-              << (BI.From.Name.empty() ? "[unknown]" : BI.From.Name) << " "
-              << Twine::utohexstr(BI.From.Offset) << " "
-              << (BI.To.IsSymbol ? "1 " : "0 ")
-              << (BI.To.Name.empty() ? "[unknown]" : BI.To.Name) << " "
-              << Twine::utohexstr(BI.To.Offset) << " " << BI.Mispreds << " "
-              << BI.Branches << "\n";
-      ++BranchValues;
-    }
-    for (const BranchInfo &BI : FBD.EntryData) {
-      if (BI.From.IsSymbol)
-        continue;
-      OutFile << (BI.From.IsSymbol ? "1 " : "0 ")
-              << (BI.From.Name.empty() ? "[unknown]" : BI.From.Name) << " "
-              << Twine::utohexstr(BI.From.Offset) << " "
-              << (BI.To.IsSymbol ? "1 " : "0 ")
-              << (BI.To.Name.empty() ? "[unknown]" : BI.To.Name) << " "
-              << Twine::utohexstr(BI.To.Offset) << " " << BI.Mispreds << " "
-              << BI.Branches << "\n";
-      ++BranchValues;
-    }
-  }
-
-  outs() << "ETW2BOLT: wrote " << BranchValues << " objects to "
-         << OutputFilename << "\n";
-  return std::error_code();
+  return writeBranchProfile(OutputFilename);
 }
 
 Error ETWDataAggregator::preprocessProfile(BinaryContext &BC) {

@@ -34,7 +34,8 @@ class PDBRewriter {
 public:
   /// Rewrite the PDB associated with the input binary.
   /// \p InputExe is the original PE binary path (to find the PDB reference).
-  /// \p OutputExe is the optimized binary path (PDB will be written next to it).
+  /// \p OutputExe is the optimized binary path (PDB will be written next to
+  /// it).
   /// \p BC provides the address translation for rewritten functions.
   /// \p ModifiedFunctions contains VAs of functions whose layout changed.
   /// \p OffsetMaps maps function VA to old_offset->new_offset pairs for
