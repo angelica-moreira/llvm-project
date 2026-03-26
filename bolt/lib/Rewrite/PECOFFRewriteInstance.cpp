@@ -336,9 +336,12 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
   // Second pass: resolve chains to root parents and extend parent ranges
   for (auto &[ChainedRVA, ParentRVA] : ChainToParent) {
-    // Walk chain to find root parent
+    // Walk chain to find root parent.  Use a visited set to break cycles
+    // in case the unwind data is corrupted.
     uint32_t Root = ParentRVA;
-    while (ChainToParent.count(Root))
+    DenseSet<uint32_t> Visited;
+    Visited.insert(ChainedRVA);
+    while (ChainToParent.count(Root) && Visited.insert(Root).second)
       Root = ChainToParent[Root];
     ChainToParent[ChainedRVA] = Root;
   }
@@ -620,36 +623,6 @@ void PECOFFRewriteInstance::emitAndLink() {
       SectionNameToVA[*NameOrErr] = It->second->getAddress();
   }
 
-  // Also map jump table data sections.  With JTS_MOVE the emitter writes
-  // JT entries into .rdata with symbol references that need resolution.
-  // Find .rdata sections in the emitted object and map them to the original
-  // JT address so relocations resolve correctly.
-  for (const auto &Sec : Obj->sections()) {
-    Expected<StringRef> NameOrErr = Sec.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-    if (*NameOrErr != ".rdata")
-      continue;
-    // Find the first JT symbol defined in this section to get the VA.
-    object::section_iterator SecIt(Sec);
-    for (const auto &Sym : Obj->symbols()) {
-      Expected<object::section_iterator> SymSec = Sym.getSection();
-      if (!SymSec || *SymSec == Obj->section_end() || **SymSec != *SecIt)
-        continue;
-      Expected<StringRef> SymName = Sym.getName();
-      if (!SymName)
-        continue;
-      if (const BinaryData *BD = BC->getBinaryDataByName(*SymName)) {
-        Expected<uint64_t> SymVal = Sym.getValue();
-        uint64_t Offset = SymVal ? *SymVal : 0;
-        SectionNameToVA[*NameOrErr] = BD->getAddress() - Offset;
-        break;
-      }
-    }
-  }
-
   // Process each function section: copy its bytes and resolve relocations.
   // Reserve space to prevent reallocation which would invalidate pointers
   // stored via setImageAddress.
@@ -696,6 +669,9 @@ void PECOFFRewriteInstance::emitAndLink() {
   // writes JT entries with relocations pointing to BB symbols.  We resolve
   // them the same way as code relocations and store the result so
   // rewriteFile() can pwrite them back.
+  // Compute the VA for each .rdata section independently by finding
+  // a symbol defined in it, to avoid collisions if multiple .rdata
+  // sections exist.
   for (const auto &Sec : Obj->sections()) {
     Expected<StringRef> NameOrErr = Sec.getName();
     if (!NameOrErr) {
@@ -704,8 +680,32 @@ void PECOFFRewriteInstance::emitAndLink() {
     }
     if (*NameOrErr != ".rdata")
       continue;
-    auto VAIt = SectionNameToVA.find(*NameOrErr);
-    if (VAIt == SectionNameToVA.end())
+
+    if (Sec.relocations().empty())
+      continue;
+
+    // Find this section's base VA from the first known symbol in it.
+    uint64_t SectionVA = 0;
+    object::section_iterator SecIt(Sec);
+    for (const auto &Sym : Obj->symbols()) {
+      Expected<object::section_iterator> SymSec = Sym.getSection();
+      if (!SymSec || *SymSec == Obj->section_end() || **SymSec != *SecIt)
+        continue;
+      Expected<StringRef> SymName = Sym.getName();
+      if (!SymName)
+        continue;
+      if (const BinaryData *BD = BC->getBinaryDataByName(*SymName)) {
+        Expected<uint64_t> SymVal = Sym.getValue();
+        uint64_t Offset = SymVal ? *SymVal : 0;
+        SectionVA = BD->getAddress() - Offset;
+        // Also register in the shared map so resolveRelocSymbol can
+        // resolve symbols defined in this section.
+        SectionNameToVA[*NameOrErr] = SectionVA;
+        break;
+      }
+    }
+
+    if (SectionVA == 0)
       continue;
 
     Expected<StringRef> ContentsOrErr = Sec.getContents();
@@ -714,10 +714,6 @@ void PECOFFRewriteInstance::emitAndLink() {
       continue;
     }
 
-    if (Sec.relocations().empty())
-      continue;
-
-    uint64_t SectionVA = VAIt->second;
     ResolvedFunctionBytes.emplace_back(ContentsOrErr->begin(),
                                        ContentsOrErr->end());
     auto &Buffer = ResolvedFunctionBytes.back();
@@ -728,12 +724,7 @@ void PECOFFRewriteInstance::emitAndLink() {
       applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
     }
 
-    // Store resolved JT data for rewriteFile() to pwrite back.
-    // Use vector copy to own the data instead of a dangling pointer.
     ResolvedJTData.push_back({SectionVA, std::vector<uint8_t>(Buffer)});
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Sec.relocations().end() - Sec.relocations().begin()
-                      << " JT relocations in .rdata at VA 0x"
-                      << Twine::utohexstr(SectionVA) << "\n");
   }
 
   outs() << "BOLT-INFO: resolved relocations for " << ResolvedCount

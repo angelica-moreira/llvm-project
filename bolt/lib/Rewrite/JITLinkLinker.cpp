@@ -279,7 +279,7 @@ void JITLinkLinker::loadObject(MemoryBufferRef Obj,
 
 std::optional<JITLinkLinker::SymbolInfo>
 JITLinkLinker::lookupSymbolInfo(StringRef Name) const {
-  auto It = Symtab.find(Name.data());
+  auto It = Symtab.find(Name);
   if (It == Symtab.end())
     return std::nullopt;
 

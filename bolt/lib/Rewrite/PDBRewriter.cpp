@@ -338,6 +338,10 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
         uint32_t BI = P.StreamOffset / BS;
         uint32_t OB = P.StreamOffset % BS;
         if (BI >= BL.size()) continue;
+        // Skip patches that straddle an MSF block boundary.  A 4-byte
+        // write at the end of a block would corrupt the next physical
+        // block instead of following the stream's block map.
+        if (OB + 4 > BS) continue;
         uint64_t FO = (uint64_t)BL[BI] * BS + OB;
         if (FO + 4 > Data.size()) continue;
         support::endian::write32le(&Data[FO], P.NewValue);
