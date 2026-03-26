@@ -10,6 +10,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryEmitter.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Core/JumpTable.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Profile/DataReader.h"
@@ -34,6 +35,7 @@ using namespace llvm;
 extern cl::opt<unsigned> AlignText;
 extern cl::opt<bool> AggregateOnly;
 extern cl::opt<bool> ForcePatch;
+extern cl::opt<bolt::JumpTableSupportLevel> JumpTables;
 extern cl::opt<bool> KeepTmp;
 extern cl::opt<bool> NeverPrint;
 extern cl::opt<std::string> OutputFilename;
@@ -146,6 +148,10 @@ void PECOFFRewriteInstance::processProfileData() {
 
 void PECOFFRewriteInstance::adjustCommandLineOptions() {
   opts::ForcePatch = true;
+
+  // Move jump tables into the emitted object so they get re-emitted with
+  // correct entries after block reordering.  Same as MachO.
+  opts::JumpTables = JTS_MOVE;
 
   // PE section alignment is typically 4KB (0x1000).
   BC->PageAlign = 0x1000;
@@ -607,6 +613,36 @@ void PECOFFRewriteInstance::emitAndLink() {
       SectionNameToVA[*NameOrErr] = It->second->getAddress();
   }
 
+  // Also map jump table data sections.  With JTS_MOVE the emitter writes
+  // JT entries into .rdata with symbol references that need resolution.
+  // Find .rdata sections in the emitted object and map them to the original
+  // JT address so relocations resolve correctly.
+  for (const auto &Sec : Obj->sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    if (*NameOrErr != ".rdata")
+      continue;
+    // Find the first JT symbol defined in this section to get the VA.
+    object::section_iterator SecIt(Sec);
+    for (const auto &Sym : Obj->symbols()) {
+      Expected<object::section_iterator> SymSec = Sym.getSection();
+      if (!SymSec || *SymSec == Obj->section_end() || **SymSec != *SecIt)
+        continue;
+      Expected<StringRef> SymName = Sym.getName();
+      if (!SymName)
+        continue;
+      if (const BinaryData *BD = BC->getBinaryDataByName(*SymName)) {
+        Expected<uint64_t> SymVal = Sym.getValue();
+        uint64_t Offset = SymVal ? *SymVal : 0;
+        SectionNameToVA[*NameOrErr] = BD->getAddress() - Offset;
+        break;
+      }
+    }
+  }
+
   // Process each function section: copy its bytes and resolve relocations.
   uint64_t ResolvedCount = 0;
   for (const auto &Sec : Obj->sections()) {
@@ -644,6 +680,49 @@ void PECOFFRewriteInstance::emitAndLink() {
     BF->setImageAddress(reinterpret_cast<uint64_t>(Data.data()));
     BF->setImageSize(Data.size());
     ++ResolvedCount;
+  }
+
+  // Process jump table data sections (.rdata).  With JTS_MOVE the emitter
+  // writes JT entries with relocations pointing to BB symbols.  We resolve
+  // them the same way as code relocations and store the result so
+  // rewriteFile() can pwrite them back.
+  for (const auto &Sec : Obj->sections()) {
+    Expected<StringRef> NameOrErr = Sec.getName();
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    if (*NameOrErr != ".rdata")
+      continue;
+    auto VAIt = SectionNameToVA.find(*NameOrErr);
+    if (VAIt == SectionNameToVA.end())
+      continue;
+
+    Expected<StringRef> ContentsOrErr = Sec.getContents();
+    if (!ContentsOrErr) {
+      consumeError(ContentsOrErr.takeError());
+      continue;
+    }
+
+    if (Sec.relocations().empty())
+      continue;
+
+    uint64_t SectionVA = VAIt->second;
+    ResolvedFunctionBytes.emplace_back(ContentsOrErr->begin(),
+                                       ContentsOrErr->end());
+    auto &Buffer = ResolvedFunctionBytes.back();
+    MutableArrayRef<uint8_t> Data(Buffer);
+
+    for (const auto &Rel : Sec.relocations()) {
+      uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
+      applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
+    }
+
+    // Store resolved JT data for rewriteFile() to pwrite back.
+    ResolvedJTData.push_back({SectionVA, Data.data(), Data.size()});
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Sec.relocations().end() - Sec.relocations().begin()
+                      << " JT relocations in .rdata at VA 0x"
+                      << Twine::utohexstr(SectionVA) << "\n");
   }
 
   outs() << "BOLT-INFO: resolved relocations for " << ResolvedCount
@@ -874,6 +953,17 @@ void PECOFFRewriteInstance::rewriteFile() {
     }
 
     ++RewrittenCount;
+  }
+
+  // Write resolved jump table data back to their original .rdata offsets.
+  for (const auto &JTD : ResolvedJTData) {
+    auto FileOff = VAToFileOffset(JTD.VA);
+    if (!FileOff)
+      continue;
+    OS.pwrite(reinterpret_cast<const char *>(JTD.Data), JTD.Size, *FileOff);
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: wrote " << JTD.Size
+                      << " bytes of JT data at file offset 0x"
+                      << Twine::utohexstr(*FileOff) << "\n");
   }
 
   NumFuncsOverflow = OverflowCount;

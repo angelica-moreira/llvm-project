@@ -62,6 +62,14 @@ class PECOFFRewriteInstance {
   /// Populated by emitAndLink() and read by rewriteFile().
   std::vector<std::vector<uint8_t>> ResolvedFunctionBytes;
 
+  /// Resolved jump table data sections.  Each entry is {VA, data, size}.
+  struct JTDataEntry {
+    uint64_t VA;
+    const uint8_t *Data;
+    size_t Size;
+  };
+  std::vector<JTDataEntry> ResolvedJTData;
+
   /// Functions whose basic block layout was changed by optimization passes.
   /// Only these functions get their bytes replaced in the output binary.
   DenseSet<uint64_t> ModifiedFunctions;
