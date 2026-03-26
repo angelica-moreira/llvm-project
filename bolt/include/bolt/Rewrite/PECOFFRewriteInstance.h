@@ -62,11 +62,10 @@ class PECOFFRewriteInstance {
   /// Populated by emitAndLink() and read by rewriteFile().
   std::vector<std::vector<uint8_t>> ResolvedFunctionBytes;
 
-  /// Resolved jump table data sections.  Each entry is {VA, data, size}.
+  /// Resolved jump table data sections.  Each entry owns its data.
   struct JTDataEntry {
     uint64_t VA;
-    const uint8_t *Data;
-    size_t Size;
+    std::vector<uint8_t> Data;
   };
   std::vector<JTDataEntry> ResolvedJTData;
 

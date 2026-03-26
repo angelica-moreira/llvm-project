@@ -651,6 +651,9 @@ void PECOFFRewriteInstance::emitAndLink() {
   }
 
   // Process each function section: copy its bytes and resolve relocations.
+  // Reserve space to prevent reallocation which would invalidate pointers
+  // stored via setImageAddress.
+  ResolvedFunctionBytes.reserve(SectionToFunc.size());
   uint64_t ResolvedCount = 0;
   for (const auto &Sec : Obj->sections()) {
     Expected<StringRef> NameOrErr = Sec.getName();
@@ -726,7 +729,8 @@ void PECOFFRewriteInstance::emitAndLink() {
     }
 
     // Store resolved JT data for rewriteFile() to pwrite back.
-    ResolvedJTData.push_back({SectionVA, Data.data(), Data.size()});
+    // Use vector copy to own the data instead of a dangling pointer.
+    ResolvedJTData.push_back({SectionVA, std::vector<uint8_t>(Buffer)});
     LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Sec.relocations().end() - Sec.relocations().begin()
                       << " JT relocations in .rdata at VA 0x"
                       << Twine::utohexstr(SectionVA) << "\n");
@@ -967,8 +971,9 @@ void PECOFFRewriteInstance::rewriteFile() {
     auto FileOff = VAToFileOffset(JTD.VA);
     if (!FileOff)
       continue;
-    OS.pwrite(reinterpret_cast<const char *>(JTD.Data), JTD.Size, *FileOff);
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: wrote " << JTD.Size
+    OS.pwrite(reinterpret_cast<const char *>(JTD.Data.data()),
+              JTD.Data.size(), *FileOff);
+    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: wrote " << JTD.Data.size()
                       << " bytes of JT data at file offset 0x"
                       << Twine::utohexstr(*FileOff) << "\n");
   }

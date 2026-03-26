@@ -65,6 +65,8 @@ std::string findPDBPath(StringRef ExePath) {
     if (COFF->getRvaPtr(Entry.AddressOfRawData, (uintptr_t &)Data))
       continue;
     // Format: 'RSDS' signature (4) + GUID (16) + age (4) + path (null-term)
+    if (Entry.SizeOfData < 25) // at least 24 header + 1 byte path
+      continue;
     if (Data[0] == 'R' && Data[1] == 'S' && Data[2] == 'D' &&
         Data[3] == 'S') {
       const char *PDBPath =
