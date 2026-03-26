@@ -41,7 +41,7 @@ public:
   ///    remapping line tables.
   using OffsetMap = std::vector<std::pair<uint32_t, uint32_t>>;
   static void rewritePDB(StringRef InputExe, StringRef OutputExe,
-                         const BinaryContext &BC,
+                         const BinaryContext &BC, uint64_t ImageBase,
                          const DenseSet<uint64_t> &ModifiedFunctions,
                          const DenseMap<uint64_t, OffsetMap> &OffsetMaps);
 };

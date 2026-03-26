@@ -120,6 +120,12 @@ struct JITLinkLinker::Context : jitlink::JITLinkContext {
       Config.PreFixupPasses.push_back([](jitlink::LinkGraph &G) -> Error {
         using namespace jitlink;
         // COFF edge kinds start at x86_64::FirstPlatformRelocation.
+        // These correspond to EdgeKind_coff_x86_64 in COFF_x86_64.cpp:
+        //   PCRel32     = FirstPlatformRelocation + 0
+        //   Pointer32NB = FirstPlatformRelocation + 1
+        //   Pointer64   = FirstPlatformRelocation + 2
+        //   SectionIdx16= FirstPlatformRelocation + 3
+        //   SecRel32    = FirstPlatformRelocation + 4
         const Edge::Kind COFFPCRel32 = x86_64::FirstPlatformRelocation;
         const Edge::Kind COFFPointer32NB = x86_64::FirstPlatformRelocation + 1;
         const Edge::Kind COFFPointer64 = x86_64::FirstPlatformRelocation + 2;

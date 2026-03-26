@@ -61,6 +61,13 @@ extern MCPlusBuilder *createMCPlusBuilder(const Triple::ArchType Arch,
                                           const MCRegisterInfo *RegInfo,
                                           const MCSubtargetInfo *STI);
 
+// x86-64 RUNTIME_FUNCTION entry from .pdata.
+struct RuntimeFunction {
+  support::ulittle32_t BeginAddress;
+  support::ulittle32_t EndAddress;
+  support::ulittle32_t UnwindInfoAddress;
+};
+
 Expected<std::unique_ptr<PECOFFRewriteInstance>>
 PECOFFRewriteInstance::create(object::COFFObjectFile *InputFile,
                               StringRef ToolPath) {
@@ -254,12 +261,6 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     return;
   }
 
-  struct RuntimeFunction {
-    support::ulittle32_t BeginAddress;
-    support::ulittle32_t EndAddress;
-    support::ulittle32_t UnwindInfoAddress;
-  };
-
   size_t NumEntries = PDataContents.size() / sizeof(RuntimeFunction);
   auto *Entries =
       reinterpret_cast<const RuntimeFunction *>(PDataContents.data());
@@ -397,12 +398,6 @@ void PECOFFRewriteInstance::discoverFileObjects() {
     consumeError(std::move(E));
     return;
   }
-
-  struct RuntimeFunction {
-    support::ulittle32_t BeginAddress;
-    support::ulittle32_t EndAddress;
-    support::ulittle32_t UnwindInfoAddress;
-  };
 
   size_t NumEntries = PDataContents.size() / sizeof(RuntimeFunction);
   auto *Entries =
@@ -689,14 +684,23 @@ void PECOFFRewriteInstance::emitAndLink() {
     object::section_iterator SecIt(Sec);
     for (const auto &Sym : Obj->symbols()) {
       Expected<object::section_iterator> SymSec = Sym.getSection();
-      if (!SymSec || *SymSec == Obj->section_end() || **SymSec != *SecIt)
+      if (!SymSec) {
+        consumeError(SymSec.takeError());
+        continue;
+      }
+      if (*SymSec == Obj->section_end() || **SymSec != *SecIt)
         continue;
       Expected<StringRef> SymName = Sym.getName();
-      if (!SymName)
+      if (!SymName) {
+        consumeError(SymName.takeError());
         continue;
+      }
       if (const BinaryData *BD = BC->getBinaryDataByName(*SymName)) {
-        Expected<uint64_t> SymVal = Sym.getValue();
-        uint64_t Offset = SymVal ? *SymVal : 0;
+        uint64_t Offset = 0;
+        if (Expected<uint64_t> SymVal = Sym.getValue())
+          Offset = *SymVal;
+        else
+          consumeError(SymVal.takeError());
         SectionVA = BD->getAddress() - Offset;
         // Also register in the shared map so resolveRelocSymbol can
         // resolve symbols defined in this section.
@@ -1055,7 +1059,8 @@ void PECOFFRewriteInstance::run() {
     outs() << "BOLT-INFO: no profile data, producing identity copy\n";
     identityRewriteFile();
     PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                            *BC, ModifiedFunctions, FunctionOffsetMaps);
+                            *BC, InputFile->getImageBase(),
+                            ModifiedFunctions, FunctionOffsetMaps);
     return;
   }
 
@@ -1137,7 +1142,8 @@ void PECOFFRewriteInstance::run() {
 
   // Update PDB debug info to match the new binary layout.
   PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                          *BC, ModifiedFunctions, FunctionOffsetMaps);
+                          *BC, InputFile->getImageBase(),
+                          ModifiedFunctions, FunctionOffsetMaps);
 }
 
 } // namespace bolt

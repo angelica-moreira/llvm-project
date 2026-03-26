@@ -10,6 +10,8 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Utils/CommandLineOpts.h"
+#include "llvm/Object/COFF.h"
+#include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -163,12 +165,23 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
   //   I-Start, <ts>, z3.exe (PID), 0x00007ff697580000, 0x00007ff6984c0000, ...
   // The 4th field is BaseAddr.
 
-  // Get the preferred ImageBase.  For PE/COFF, function addresses are
-  // ImageBase + RVA.  The first function is typically at ImageBase + 0x1000,
-  // so we can derive ImageBase from any function address.  PE ImageBase is
-  // always at least 64KB aligned.
+  // Get the preferred ImageBase from the PE header.
   uint64_t PreferredBase = 0;
-  if (!BC->getBinaryFunctions().empty())
+  {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> FileBuf =
+        MemoryBuffer::getFile(BC->getFilename());
+    if (FileBuf) {
+      Expected<std::unique_ptr<object::ObjectFile>> ObjOrErr =
+          object::ObjectFile::createObjectFile((*FileBuf)->getMemBufferRef());
+      if (ObjOrErr) {
+        if (auto *COFF = dyn_cast<object::COFFObjectFile>(ObjOrErr->get()))
+          PreferredBase = COFF->getImageBase();
+      } else {
+        consumeError(ObjOrErr.takeError());
+      }
+    }
+  }
+  if (PreferredBase == 0 && !BC->getBinaryFunctions().empty())
     PreferredBase =
         BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFULL;
 

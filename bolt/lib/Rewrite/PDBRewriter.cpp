@@ -61,9 +61,12 @@ std::string findPDBPath(StringRef ExePath) {
     if (Entry.Type != COFF::IMAGE_DEBUG_TYPE_CODEVIEW)
       continue;
     // CodeView info contains the PDB path after the signature.
-    const uint8_t *Data = nullptr;
-    if (COFF->getRvaPtr(Entry.AddressOfRawData, (uintptr_t &)Data))
+    uintptr_t DataAddr = 0;
+    if (Error E = COFF->getRvaPtr(Entry.AddressOfRawData, DataAddr)) {
+      consumeError(std::move(E));
       continue;
+    }
+    const uint8_t *Data = reinterpret_cast<const uint8_t *>(DataAddr);
     // Format: 'RSDS' signature (4) + GUID (16) + age (4) + path (null-term)
     if (Entry.SizeOfData < 25) // at least 24 header + 1 byte path
       continue;
@@ -71,7 +74,8 @@ std::string findPDBPath(StringRef ExePath) {
         Data[3] == 'S') {
       const char *PDBPath =
           reinterpret_cast<const char *>(Data + 4 + 16 + 4);
-      return std::string(PDBPath);
+      size_t MaxPathLen = Entry.SizeOfData - 24;
+      return std::string(PDBPath, strnlen(PDBPath, MaxPathLen));
     }
   }
   return {};
@@ -80,7 +84,7 @@ std::string findPDBPath(StringRef ExePath) {
 } // namespace
 
 void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
-                              const BinaryContext &BC,
+                              const BinaryContext &BC, uint64_t ImageBase,
                               const DenseSet<uint64_t> &ModifiedFunctions,
                               const DenseMap<uint64_t, OffsetMap> &OffsetMaps) {
 
@@ -137,10 +141,20 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   }
   pdb::DbiStream &Dbi = *DbiOrErr;
 
-  uint64_t ImageBase = 0;
-  if (!BC.getBinaryFunctions().empty())
-    ImageBase = BC.getBinaryFunctions().begin()->second.getAddress() &
-                ~0xFFFFULL;
+  // Build section RVA table from DBI section headers. PDB symbols use
+  // 1-based section indices with section-relative offsets. We need each
+  // section's VirtualAddress to compute the full VA.
+  auto SectionHeaders = Dbi.getSectionHeaders();
+  SmallVector<uint32_t, 16> SectionRVAs;
+  for (const auto &Hdr : SectionHeaders)
+    SectionRVAs.push_back(Hdr.VirtualAddress);
+
+  // Compute VA from a PDB section:offset pair.
+  auto computeVA = [&](uint16_t Segment, uint32_t Offset) -> uint64_t {
+    if (Segment == 0 || Segment > SectionRVAs.size())
+      return 0;
+    return ImageBase + SectionRVAs[Segment - 1] + Offset;
+  };
 
   // Collect all patches: {stream_index, stream_offset, new_value}.
   struct PDBPatch {
@@ -183,7 +197,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
         continue;
       }
 
-      uint64_t FuncVA = ImageBase + ProcOrErr->CodeOffset;
+      uint64_t FuncVA = computeVA(ProcOrErr->Segment, ProcOrErr->CodeOffset);
 
       if (!ModifiedFunctions.count(FuncVA))
         continue;
@@ -236,10 +250,12 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
         continue;
       }
 
-      // Line fragment header at DataStart.
+      // Line fragment header at DataStart:
+      // {uint32 RelocOffset, uint16 RelocSegment, uint16 Flags, uint32 CodeSize}
       if (Length < 12) { Pos = alignTo(DataEnd, 4); continue; }
       uint32_t RelocOffset = support::endian::read32le(&C13Bytes[DataStart]);
-      uint64_t FuncVA = ImageBase + RelocOffset;
+      uint16_t RelocSegment = support::endian::read16le(&C13Bytes[DataStart + 4]);
+      uint64_t FuncVA = computeVA(RelocSegment, RelocOffset);
 
       auto MapIt = OffsetMaps.find(FuncVA);
       if (MapIt == OffsetMaps.end()) {
