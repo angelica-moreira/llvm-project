@@ -37,7 +37,6 @@ static cl::opt<std::string>
 } // namespace opts
 
 ETWDataAggregator::~ETWDataAggregator() {
-  // Clean up the temp dump file if we created it.
   if (!DumpFilePath.empty() && opts::ETWDumpFile.empty())
     sys::fs::remove(DumpFilePath);
 }
@@ -79,7 +78,7 @@ Error ETWDataAggregator::launchXperf() {
   DumpFilePath = ETLFilename + ".dump.txt";
 
   // Shell out to xperf, just like DataAggregator shells to perf script.
-  // Use stdout redirect instead of -o flag — some xperf versions have
+  // Use stdout redirect instead of -o flag -- some xperf versions have
   // issues writing to certain paths with -o.
   SmallString<512> CmdLine;
   raw_svector_ostream CmdStream(CmdLine);
@@ -128,12 +127,8 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
 
   if (!FromFunc && !ToFunc)
     return false;
-
-  // Convert to function-relative offsets.
   uint64_t FromOffset = FromFunc ? From - FromFunc->getAddress() : 0;
   uint64_t ToOffset = ToFunc ? To - ToFunc->getAddress() : 0;
-
-  // Intra-function branch.
   if (FromFunc && ToFunc && FromFunc == ToFunc) {
     StringRef Name = FromFunc->getOneName();
     FuncBranchData &FBD = NamesToBranches[Name];
@@ -141,13 +136,12 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
     FBD.bumpBranchCount(FromOffset, ToOffset, Count, Mispreds);
     return true;
   }
-
-  // Inter-function branch (call or tail call).
   if (FromFunc) {
     StringRef FromName = FromFunc->getOneName();
     FuncBranchData &FromFBD = NamesToBranches[FromName];
     FromFBD.Name = FromName;
-    Location ToLoc(ToFunc != nullptr, ToFunc ? ToFunc->getOneName() : "", ToOffset);
+    Location ToLoc(ToFunc != nullptr, ToFunc ? ToFunc->getOneName() : "",
+                   ToOffset);
     FromFBD.bumpCallCount(FromOffset, ToLoc, Count, Mispreds);
   }
 
@@ -155,8 +149,8 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
     StringRef ToName = ToFunc->getOneName();
     FuncBranchData &ToFBD = NamesToBranches[ToName];
     ToFBD.Name = ToName;
-    Location FromLoc(FromFunc != nullptr, FromFunc ? FromFunc->getOneName() : "",
-                     FromOffset);
+    Location FromLoc(FromFunc != nullptr,
+                     FromFunc ? FromFunc->getOneName() : "", FromOffset);
     ToFBD.bumpEntryCount(FromLoc, ToOffset, Count, Mispreds);
   }
 
@@ -175,8 +169,8 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
   // always at least 64KB aligned.
   uint64_t PreferredBase = 0;
   if (!BC->getBinaryFunctions().empty())
-    PreferredBase = BC->getBinaryFunctions().begin()->second.getAddress() &
-                    ~0xFFFFULL;
+    PreferredBase =
+        BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFULL;
 
   StringRef BinaryPath = BC->getFilename();
   StringRef BinaryName = llvm::sys::path::filename(BinaryPath);
@@ -212,8 +206,8 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
            << Twine::utohexstr(ActualBase) << " (preferred 0x"
            << Twine::utohexstr(PreferredBase) << ")\n";
     if (ASLROffset != 0)
-      outs() << "ETW2BOLT: ASLR offset: "
-             << (ASLROffset > 0 ? "+" : "") << ASLROffset << "\n";
+      outs() << "ETW2BOLT: ASLR offset: " << (ASLROffset > 0 ? "+" : "")
+             << ASLROffset << "\n";
     return;
   }
 
@@ -268,8 +262,6 @@ Error ETWDataAggregator::parseXperfOutput() {
 
     uint64_t ThreadID = 0;
     Parts[3].trim().getAsInteger(0, ThreadID);
-
-    // PrgrmCtr is the actual sampled instruction pointer.
     uint64_t IP = 0;
     StringRef IPField = Parts[4].trim();
     if (IPField.consume_front("0x") || IPField.consume_front("0X"))
@@ -348,7 +340,7 @@ ETWDataAggregator::writeAggregatedFile(StringRef OutputFilename) const {
 Error ETWDataAggregator::preprocessProfile(BinaryContext &BC) {
   this->BC = &BC;
 
-  // Get the dump text — either from a user-provided file or by running xperf.
+  // Get the dump text -- either from a user-provided file or by running xperf.
   if (!opts::ETWDumpFile.empty()) {
     DumpFilePath = opts::ETWDumpFile;
   } else {

@@ -38,11 +38,9 @@ using namespace bolt;
 
 namespace opts {
 
-static cl::OptionCategory *BoltCategories[] = {&BoltCategory,
-                                               &BoltOptCategory,
-                                               &BoltRelocCategory,
-                                               &BoltInstrCategory,
-                                               &BoltOutputCategory};
+static cl::OptionCategory *BoltCategories[] = {
+    &BoltCategory, &BoltOptCategory, &BoltRelocCategory, &BoltInstrCategory,
+    &BoltOutputCategory};
 
 static cl::OptionCategory *BoltDiffCategories[] = {&BoltDiffCategory};
 
@@ -50,42 +48,34 @@ static cl::OptionCategory *Perf2BoltCategories[] = {&AggregatorCategory,
                                                     &BoltOutputCategory};
 
 static cl::OptionCategory *ETW2BoltCategories[] = {&AggregatorCategory,
-                                                    &BoltOutputCategory};
+                                                   &BoltOutputCategory};
 
 static cl::opt<std::string> InputFilename(cl::Positional,
                                           cl::desc("<executable>"),
                                           cl::Required, cl::cat(BoltCategory),
                                           cl::sub(cl::SubCommand::getAll()));
 
-static cl::opt<std::string>
-InputDataFilename("data",
-  cl::desc("<data file>"),
-  cl::Optional,
-  cl::cat(BoltCategory));
+static cl::opt<std::string> InputDataFilename("data", cl::desc("<data file>"),
+                                              cl::Optional,
+                                              cl::cat(BoltCategory));
 
-static cl::alias
-BoltProfile("b",
-  cl::desc("alias for -data"),
-  cl::aliasopt(InputDataFilename),
-  cl::cat(BoltCategory));
+static cl::alias BoltProfile("b", cl::desc("alias for -data"),
+                             cl::aliasopt(InputDataFilename),
+                             cl::cat(BoltCategory));
 
 static cl::opt<std::string>
     LogFile("log-file",
             cl::desc("redirect journaling to a file instead of stdout/stderr"),
             cl::Hidden, cl::cat(BoltCategory));
 
-static cl::opt<std::string>
-InputDataFilename2("data2",
-  cl::desc("<data file>"),
-  cl::Optional,
-  cl::cat(BoltCategory));
+static cl::opt<std::string> InputDataFilename2("data2", cl::desc("<data file>"),
+                                               cl::Optional,
+                                               cl::cat(BoltCategory));
 
-static cl::opt<std::string>
-InputFilename2(
-  cl::Positional,
-  cl::desc("<executable>"),
-  cl::Optional,
-  cl::cat(BoltDiffCategory));
+static cl::opt<std::string> InputFilename2(cl::Positional,
+                                           cl::desc("<executable>"),
+                                           cl::Optional,
+                                           cl::cat(BoltDiffCategory));
 
 } // namespace opts
 

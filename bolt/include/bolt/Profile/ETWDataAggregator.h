@@ -12,7 +12,8 @@
 //
 // Architecture mirrors perf2bolt:
 //   perf2bolt:  perf.data  -> `perf script` subprocess -> parse text -> fdata
-//   etw2bolt:   trace.etl  -> `xperf -a dumper` subprocess -> parse text -> fdata
+//   etw2bolt:   trace.etl  -> `xperf -a dumper` subprocess -> parse text ->
+//   fdata
 //
 // Inherits DataReader to reuse the NamesToBranches data structures,
 // FuncBranchData, BranchInfo, Location types, and the profile matching
@@ -87,7 +88,7 @@ private:
 
   /// Record a branch from absolute address From to To with the given counts.
   /// Resolves addresses to BinaryFunctions via BinaryContext, converts to
-  /// function-relative offsets, and updates NamesToBranches — same logic as
+  /// function-relative offsets, and updates NamesToBranches -- same logic as
   /// DataAggregator::doBranch().
   bool recordBranchEvent(uint64_t From, uint64_t To, uint64_t Count,
                          uint64_t Mispreds);
