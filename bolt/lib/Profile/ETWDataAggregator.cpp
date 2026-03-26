@@ -181,9 +181,19 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
       }
     }
   }
-  if (PreferredBase == 0 && !BC->getBinaryFunctions().empty())
+  if (PreferredBase == 0 && !BC->getBinaryFunctions().empty()) {
+    // Fallback: derive from first function address.  PE ImageBase is
+    // always 64KB-aligned, but .text can start at RVA >= 0x10000 for
+    // binaries with large headers or /MERGE sections.  Use a wider mask
+    // (1MB) to be safe, then warn that ASLR may be inaccurate.
     PreferredBase =
-        BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFULL;
+        BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFFULL;
+    errs() << "ETW2BOLT: warning: could not read PE ImageBase from file; "
+              "derived 0x"
+           << Twine::utohexstr(PreferredBase)
+           << " from function addresses. ASLR adjustment may be "
+              "inaccurate.\n";
+  }
 
   StringRef BinaryPath = BC->getFilename();
   StringRef BinaryName = llvm::sys::path::filename(BinaryPath);
@@ -195,14 +205,25 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
     StringRef Trimmed = Line.ltrim();
     if (!Trimmed.starts_with("I-Start"))
       continue;
-    if (!Line.contains_insensitive(BinaryName))
-      continue;
 
     // Parse: I-Start, <ts>, z3.exe (PID), 0x<BaseAddr>, ...
     SmallVector<StringRef, 16> Parts;
     Line.split(Parts, ',');
     if (Parts.size() < 4)
       continue;
+
+    // Field 2 is "processname.exe (PID)".  Match the binary name as a
+    // delimited token, not as a substring of the entire line.  This
+    // prevents "z3.exe" from matching "libz3.exe" or "z3.exe_helper".
+    StringRef ProcField = Parts[2].trim();
+    if (!ProcField.starts_with_insensitive(BinaryName))
+      continue;
+    // Ensure the match ends at a delimiter (space, '(' for PID, etc.)
+    if (ProcField.size() > BinaryName.size()) {
+      char After = ProcField[BinaryName.size()];
+      if (After != ' ' && After != '(' && After != '\t')
+        continue;
+    }
 
     StringRef BaseField = Parts[3].trim();
     uint64_t ActualBase = 0;

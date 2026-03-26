@@ -65,6 +65,7 @@ class PECOFFRewriteInstance {
   /// Resolved jump table data sections.  Each entry owns its data.
   struct JTDataEntry {
     uint64_t VA;
+    uint64_t OwnerVA; ///< VA of the function that owns this jump table.
     std::vector<uint8_t> Data;
   };
   std::vector<JTDataEntry> ResolvedJTData;

@@ -233,9 +233,11 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     uint64_t C13StreamBase = C13Ref.Offset; // offset of C13 data in stream
 
     ArrayRef<uint8_t> C13Bytes;
-    if (auto EC = C13Ref.StreamData.readBytes(0, C13Ref.StreamData.getLength(),
-                                              C13Bytes))
+    if (Error E = C13Ref.StreamData.readBytes(0, C13Ref.StreamData.getLength(),
+                                              C13Bytes)) {
+      consumeError(std::move(E));
       continue;
+    }
 
     uint64_t Pos = 0;
     while (Pos + 8 <= C13Bytes.size()) {
@@ -281,6 +283,11 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
             support::endian::read32le(&C13Bytes[FileBlockPos + 4]);
         uint32_t BlockSize =
             support::endian::read32le(&C13Bytes[FileBlockPos + 8]);
+
+        // BlockSize includes the 12-byte header.  A value less than 12
+        // indicates a corrupt PDB and would cause an infinite loop.
+        if (BlockSize < 12)
+          break;
 
         uint64_t LineStart = FileBlockPos + 12;
 

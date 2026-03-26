@@ -207,8 +207,10 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
   for (const object::SectionRef &Section : InputFile->sections()) {
     Expected<StringRef> NameOrErr = Section.getName();
-    if (!NameOrErr)
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
       continue;
+    }
     if (*NameOrErr == ".pdata")
       PDataSec = InputFile->getCOFFSection(Section);
     else if (*NameOrErr == ".xdata")
@@ -384,7 +386,11 @@ void PECOFFRewriteInstance::discoverFileObjects() {
   const object::coff_section *PDataSec = nullptr;
   for (const object::SectionRef &Section : InputFile->sections()) {
     Expected<StringRef> NameOrErr = Section.getName();
-    if (NameOrErr && *NameOrErr == ".pdata")
+    if (!NameOrErr) {
+      consumeError(NameOrErr.takeError());
+      continue;
+    }
+    if (*NameOrErr == ".pdata")
       PDataSec = InputFile->getCOFFSection(Section);
   }
 
@@ -621,7 +627,21 @@ void PECOFFRewriteInstance::emitAndLink() {
   // Process each function section: copy its bytes and resolve relocations.
   // Reserve space to prevent reallocation which would invalidate pointers
   // stored via setImageAddress.
-  ResolvedFunctionBytes.reserve(SectionToFunc.size());
+  // Reserve for both function sections and .rdata JT sections to prevent
+  // reallocation that would invalidate pointers set via setImageAddress.
+  {
+    size_t RdataCount = 0;
+    for (const auto &S : Obj->sections()) {
+      Expected<StringRef> N = S.getName();
+      if (!N) {
+        consumeError(N.takeError());
+        continue;
+      }
+      if (*N == ".rdata" && !S.relocations().empty())
+        ++RdataCount;
+    }
+    ResolvedFunctionBytes.reserve(SectionToFunc.size() + RdataCount);
+  }
   uint64_t ResolvedCount = 0;
   for (const auto &Sec : Obj->sections()) {
     Expected<StringRef> NameOrErr = Sec.getName();
@@ -650,10 +670,19 @@ void PECOFFRewriteInstance::emitAndLink() {
     auto &Buffer = ResolvedFunctionBytes.back();
     MutableArrayRef<uint8_t> Data(Buffer);
 
+    bool HasUnresolved = false;
     for (const auto &Rel : Sec.relocations()) {
       uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
+      if (SymVA == 0) {
+        errs() << "BOLT-WARNING: unresolved relocation in \""
+               << BF->getPrintName() << "\" at offset " << Rel.getOffset()
+               << ", skipping function\n";
+        HasUnresolved = true;
+      }
       applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
     }
+    if (HasUnresolved)
+      BF->setSimple(false);
 
     BF->setImageAddress(reinterpret_cast<uint64_t>(Data.data()));
     BF->setImageSize(Data.size());
@@ -725,10 +754,26 @@ void PECOFFRewriteInstance::emitAndLink() {
 
     for (const auto &Rel : Sec.relocations()) {
       uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
+      if (SymVA == 0)
+        errs() << "BOLT-WARNING: unresolved JT relocation at offset "
+               << Rel.getOffset() << " in .rdata section\n";
       applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
     }
 
-    ResolvedJTData.push_back({SectionVA, std::vector<uint8_t>(Buffer)});
+    // Find the owning function by scanning for a jump table at this VA.
+    uint64_t OwnerVA = 0;
+    for (const auto &BFI : BC->getBinaryFunctions()) {
+      for (const auto &JTKV : BFI.second.jumpTables()) {
+        if (JTKV.second->getAddress() == SectionVA) {
+          OwnerVA = BFI.second.getAddress();
+          break;
+        }
+      }
+      if (OwnerVA != 0)
+        break;
+    }
+    ResolvedJTData.push_back(
+        {SectionVA, OwnerVA, std::vector<uint8_t>(Buffer)});
   }
 
   outs() << "BOLT-INFO: resolved relocations for " << ResolvedCount
@@ -750,13 +795,20 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
   // Defined symbol in the emitted object -- its address is the section's
   // original VA plus the symbol's offset within that section.
   Expected<object::section_iterator> SecOrErr = Sym.getSection();
-  if (SecOrErr && *SecOrErr != Obj->section_end()) {
+  if (!SecOrErr) {
+    consumeError(SecOrErr.takeError());
+  } else if (*SecOrErr != Obj->section_end()) {
     Expected<StringRef> SecName = (*SecOrErr)->getName();
-    if (SecName) {
+    if (!SecName) {
+      consumeError(SecName.takeError());
+    } else {
       auto It = SectionNameToVA.find(*SecName);
       if (It != SectionNameToVA.end()) {
-        Expected<uint64_t> ValOrErr = Sym.getValue();
-        uint64_t Offset = ValOrErr ? *ValOrErr : 0;
+        uint64_t Offset = 0;
+        if (Expected<uint64_t> ValOrErr = Sym.getValue())
+          Offset = *ValOrErr;
+        else
+          consumeError(ValOrErr.takeError());
         LLVM_DEBUG({
           dbgs() << "BOLT-DEBUG: resolved defined symbol in section "
                  << *SecName << " at VA 0x"
@@ -962,7 +1014,12 @@ void PECOFFRewriteInstance::rewriteFile() {
   }
 
   // Write resolved jump table data back to their original .rdata offsets.
+  // Only write JT data for functions that were actually rewritten above.
+  // If a function was skipped (size overflow or not modified), its jump
+  // table must keep the original entries to match the original code.
   for (const auto &JTD : ResolvedJTData) {
+    if (JTD.OwnerVA != 0 && !ModifiedFunctions.count(JTD.OwnerVA))
+      continue;
     auto FileOff = VAToFileOffset(JTD.VA);
     if (!FileOff)
       continue;
@@ -1025,7 +1082,11 @@ void PECOFFRewriteInstance::run() {
     }
     for (const auto &Section : InputFile->sections()) {
       Expected<StringRef> NameOrErr = Section.getName();
-      if (NameOrErr && *NameOrErr == ".textbss") {
+      if (!NameOrErr) {
+        consumeError(NameOrErr.takeError());
+        continue;
+      }
+      if (*NameOrErr == ".textbss") {
         IsIncremental = true;
         break;
       }
