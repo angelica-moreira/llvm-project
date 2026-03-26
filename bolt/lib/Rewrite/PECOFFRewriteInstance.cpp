@@ -51,14 +51,15 @@ extern cl::opt<unsigned> Verbosity;
 namespace llvm {
 namespace bolt {
 
-extern MCPlusBuilder *
-createMCPlusBuilder(const Triple::ArchType Arch, const MCInstrAnalysis *Analysis,
-                    const MCInstrInfo *Info, const MCRegisterInfo *RegInfo,
-                    const MCSubtargetInfo *STI);
+extern MCPlusBuilder *createMCPlusBuilder(const Triple::ArchType Arch,
+                                          const MCInstrAnalysis *Analysis,
+                                          const MCInstrInfo *Info,
+                                          const MCRegisterInfo *RegInfo,
+                                          const MCSubtargetInfo *STI);
 
 Expected<std::unique_ptr<PECOFFRewriteInstance>>
 PECOFFRewriteInstance::create(object::COFFObjectFile *InputFile,
-                               StringRef ToolPath) {
+                              StringRef ToolPath) {
   Error Err = Error::success();
   auto Instance =
       std::make_unique<PECOFFRewriteInstance>(InputFile, ToolPath, Err);
@@ -68,7 +69,7 @@ PECOFFRewriteInstance::create(object::COFFObjectFile *InputFile,
 }
 
 PECOFFRewriteInstance::PECOFFRewriteInstance(object::COFFObjectFile *InputFile,
-                                              StringRef ToolPath, Error &Err)
+                                             StringRef ToolPath, Error &Err)
     : InputFile(InputFile), ToolPath(ToolPath) {
   ErrorAsOutParameter EAO(&Err);
 
@@ -106,10 +107,10 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
     return errorCodeToError(make_error_code(errc::no_such_file_or_directory));
 
   if (ProfileReader) {
-    return make_error<StringError>(
-        Twine("multiple profiles specified: ") + ProfileReader->getFilename() +
-            " and " + Filename,
-        inconvertibleErrorCode());
+    return make_error<StringError>(Twine("multiple profiles specified: ") +
+                                       ProfileReader->getFilename() + " and " +
+                                       Filename,
+                                   inconvertibleErrorCode());
   }
 
   // Choose the right reader based on the file type, same pattern as
@@ -152,6 +153,13 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
   if (!opts::AlignText.getNumOccurrences())
     opts::AlignText = BC->PageAlign;
 }
+
+// PE/COFF uses its own pass pipeline (not BinaryPassManager) to avoid
+// passes that change instruction sizes.  ShortenInstructions and RemoveNops
+// must NOT be registered here because they alter byte offsets within
+// functions, invalidating UNWIND_INFO prolog sizes and unwind code offsets
+// in .xdata.  Unlike ELF where DWARF CFI is regenerated, Windows unwind
+// data is preserved byte-for-byte.
 
 void PECOFFRewriteInstance::readSpecialSections() {
   for (const object::SectionRef &Section : InputFile->sections()) {
@@ -244,7 +252,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
       reinterpret_cast<const RuntimeFunction *>(PDataContents.data());
 
   // First pass: parse UNWIND_INFO and detect chained entries
-  std::map<uint32_t, uint32_t> ChainToParent; // chained begin RVA -> parent begin RVA
+  std::map<uint32_t, uint32_t>
+      ChainToParent; // chained begin RVA -> parent begin RVA
 
   for (size_t I = 0; I < NumEntries; ++I) {
     uint32_t BeginRVA = Entries[I].BeginAddress;
@@ -270,8 +279,10 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
         // Read unwind codes
         uint32_t CodesOffset = Offset + 4;
-        for (uint8_t C = 0; C < CountOfCodes && CodesOffset + 2 <= XDataContents.size(); ++C) {
-          uint16_t Code = support::endian::read16le(XDataContents.data() + CodesOffset);
+        for (uint8_t C = 0;
+             C < CountOfCodes && CodesOffset + 2 <= XDataContents.size(); ++C) {
+          uint16_t Code =
+              support::endian::read16le(XDataContents.data() + CodesOffset);
           Info.UnwindCodes.push_back(Code);
           CodesOffset += 2;
         }
@@ -300,8 +311,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
         } else if (Info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) {
           Info.HasExceptionHandler = true;
           if (HandlerDataOffset + 4 <= XDataContents.size()) {
-            Info.ExceptionHandlerRVA =
-                support::endian::read32le(XDataContents.data() + HandlerDataOffset);
+            Info.ExceptionHandlerRVA = support::endian::read32le(
+                XDataContents.data() + HandlerDataOffset);
           }
         }
       }
@@ -514,15 +525,9 @@ void PECOFFRewriteInstance::postProcessFunctions() {
 
 void PECOFFRewriteInstance::runOptimizationPasses() {
   BinaryFunctionPassManager Manager(*BC);
-
-  // NormalizeCFG must run before reordering
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
-
-  // Block reordering is the primary optimization
   Manager.registerPass(
       std::make_unique<ReorderBasicBlocks>(opts::PrintReordered));
-
-  // Fix up branches after reordering
   Manager.registerPass(
       std::make_unique<FixupBranches>(opts::PrintAfterBranchFixup));
 
@@ -537,8 +542,8 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
 void PECOFFRewriteInstance::emitAndLink() {
   std::error_code EC;
   std::unique_ptr<::llvm::ToolOutputFile> TempOut =
-      std::make_unique<::llvm::ToolOutputFile>(
-          opts::OutputFilename + ".bolt.o", EC, sys::fs::OF_None);
+      std::make_unique<::llvm::ToolOutputFile>(opts::OutputFilename + ".bolt.o",
+                                               EC, sys::fs::OF_None);
   check_error(EC, "cannot create output object file");
 
   if (opts::KeepTmp)
@@ -657,7 +662,7 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
 
   object::SymbolRef Sym = *SI;
 
-  // Defined symbol in the emitted object — its address is the section's
+  // Defined symbol in the emitted object -- its address is the section's
   // original VA plus the symbol's offset within that section.
   Expected<object::section_iterator> SecOrErr = Sym.getSection();
   if (SecOrErr && *SecOrErr != Obj->section_end()) {
@@ -677,7 +682,7 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
     }
   }
 
-  // External symbol — look it up by name in BinaryContext.
+  // External symbol -- look it up by name in BinaryContext.
   Expected<StringRef> NameOrErr = Sym.getName();
   if (!NameOrErr) {
     consumeError(NameOrErr.takeError());
@@ -686,9 +691,8 @@ uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
   StringRef Name = *NameOrErr;
 
   if (const BinaryData *BD = BC->getBinaryDataByName(Name)) {
-    uint64_t Addr = BD->isMoved() && !BD->isJumpTable()
-                        ? BD->getOutputAddress()
-                        : BD->getAddress();
+    uint64_t Addr = BD->isMoved() && !BD->isJumpTable() ? BD->getOutputAddress()
+                                                        : BD->getAddress();
     LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Name << " via BinaryData"
                       << " at 0x" << Twine::utohexstr(Addr) << "\n");
     return Addr;
@@ -772,7 +776,7 @@ void PECOFFRewriteInstance::applyCOFFRelocation(
   }
   case COFF::IMAGE_REL_AMD64_SECTION:
   case COFF::IMAGE_REL_AMD64_SECREL:
-    // Debug info relocations — not relevant for code patching.
+    // Debug info relocations -- not relevant for code patching.
     break;
   default:
     LLVM_DEBUG(dbgs() << "BOLT-DEBUG: unhandled COFF relocation type "
@@ -859,8 +863,8 @@ void PECOFFRewriteInstance::rewriteFile() {
              << " size=" << EmittedSize << "/" << OriginalSize
              << " at file offset 0x" << Twine::utohexstr(*FileOff) << "\n";
 
-    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()),
-              EmittedSize, *FileOff);
+    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()), EmittedSize,
+              *FileOff);
 
     // Fill leftover space with int3 so stale code traps cleanly.
     if (EmittedSize < OriginalSize) {
@@ -926,7 +930,7 @@ void PECOFFRewriteInstance::run() {
   // Save the basic block layout of every function before optimization.
   // After the passes we compare against this snapshot to find which
   // functions actually had their layout modified.  Only those get their
-  // bytes replaced in the output — writing re-encoded bytes for unmodified
+  // bytes replaced in the output -- writing re-encoded bytes for unmodified
   // functions would break the UNWIND_INFO byte offsets and base relocations.
   DenseMap<uint64_t, std::vector<const BinaryBasicBlock *>> OrigLayouts;
   for (auto &BFI : BC->getBinaryFunctions()) {
