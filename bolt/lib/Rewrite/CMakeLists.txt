@@ -2,6 +2,8 @@ set(LLVM_LINK_COMPONENTS
   Core
   DebugInfoDWARF
   DebugInfoDWARFLowLevel
+  DebugInfoPDB
+  DebugInfoCodeView
   JITLink
   MC
   Object
@@ -21,6 +23,7 @@ add_llvm_library(LLVMBOLTRewrite
   LinuxKernelRewriter.cpp
   MachORewriteInstance.cpp
   PECOFFRewriteInstance.cpp
+  PDBRewriter.cpp
   MetadataManager.cpp
   BuildIDRewriter.cpp
   PseudoProbeRewriter.cpp

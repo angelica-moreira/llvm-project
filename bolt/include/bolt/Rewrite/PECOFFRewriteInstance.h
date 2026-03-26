@@ -74,6 +74,13 @@ class PECOFFRewriteInstance {
   /// Only these functions get their bytes replaced in the output binary.
   DenseSet<uint64_t> ModifiedFunctions;
 
+  /// Address translation for rewritten functions: maps old instruction
+  /// offsets (within the function) to new offsets after BB reordering.
+  /// Captured before CFG is released so PDB line tables can be remapped.
+  /// Key: function VA.  Value: vector of {old_offset, new_offset} pairs.
+  using OffsetMap = std::vector<std::pair<uint32_t, uint32_t>>;
+  DenseMap<uint64_t, OffsetMap> FunctionOffsetMaps;
+
   std::unique_ptr<ProfileReaderBase> ProfileReader;
 
   /// SEH unwind info indexed by function begin RVA.

@@ -16,6 +16,7 @@
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Profile/ETWDataAggregator.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
+#include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/BinaryFormat/COFF.h"
@@ -1051,6 +1052,8 @@ void PECOFFRewriteInstance::run() {
   if (!ProfileReader) {
     outs() << "BOLT-INFO: no profile data, producing identity copy\n";
     identityRewriteFile();
+    PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
+                            *BC, ModifiedFunctions, FunctionOffsetMaps);
     return;
   }
 
@@ -1103,8 +1106,36 @@ void PECOFFRewriteInstance::run() {
   outs() << "BOLT-INFO: " << ModifiedFunctions.size()
          << " functions had layout modified\n";
 
+  // Capture BB address translation before emit releases the CFG.
+  // For each rewritten function, record how each BB moved so the PDB
+  // rewriter can remap line tables.  We store pairs of
+  // {original_BB_offset, new_position_in_layout} since absolute output
+  // addresses are not available until after emission.
+  for (uint64_t FuncVA : ModifiedFunctions) {
+    auto It = BC->getBinaryFunctions().find(FuncVA);
+    if (It == BC->getBinaryFunctions().end())
+      continue;
+    const BinaryFunction &BF = It->second;
+    if (!BF.hasCFG())
+      continue;
+
+    OffsetMap &Map = FunctionOffsetMaps[FuncVA];
+    // Walk the new layout order.  Accumulate byte offsets based on BB sizes.
+    uint32_t NewOffset = 0;
+    for (const BinaryBasicBlock *BB : BF.getLayout().blocks()) {
+      uint32_t OldOffset = BB->getOffset();
+      Map.push_back({OldOffset, NewOffset});
+      NewOffset += BB->getOutputSize() ? BB->getOutputSize()
+                                       : BB->estimateSize();
+    }
+  }
+
   emitAndLink();
   rewriteFile();
+
+  // Update PDB debug info to match the new binary layout.
+  PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
+                          *BC, ModifiedFunctions, FunctionOffsetMaps);
 }
 
 } // namespace bolt
