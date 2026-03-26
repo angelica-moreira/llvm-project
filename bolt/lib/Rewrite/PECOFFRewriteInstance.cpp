@@ -15,7 +15,6 @@
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Profile/ETWDataAggregator.h"
-#include "bolt/Profile/YAMLProfileReader.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Utils/CommandLineOpts.h"
@@ -125,12 +124,10 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
                                    inconvertibleErrorCode());
   }
 
-  // Choose the right reader based on the file type, same pattern as
-  // RewriteInstance::setProfile() for ELF.
+  // Choose the right reader based on the file type.
+  // PE/COFF supports ETW traces (.etl) and fdata text profiles.
   if (ETWDataAggregator::checkETLMagic(Filename))
     ProfileReader = std::make_unique<ETWDataAggregator>(Filename);
-  else if (YAMLProfileReader::isYAML(Filename))
-    ProfileReader = std::make_unique<YAMLProfileReader>(Filename);
   else
     ProfileReader = std::make_unique<DataReader>(Filename);
 
