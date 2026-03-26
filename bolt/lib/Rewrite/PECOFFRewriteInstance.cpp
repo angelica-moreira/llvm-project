@@ -1002,10 +1002,20 @@ void PECOFFRewriteInstance::run() {
   adjustCommandLineOptions();
 
   // Detect binary characteristics that affect rewriting correctness.
+  // BOLT's PE/COFF mode uses strict in-place patching: function bodies are
+  // overwritten at their original file offsets, no addresses change, no
+  // sections are added, and PE headers are untouched.  This means base
+  // relocations (.reloc) and ASLR (DYNAMIC_BASE) are safe — all RVAs in
+  // the relocation table remain valid.  However, several other features
+  // are incompatible with code rewriting.
   {
-    // Incrementally linked binaries contain ILT padding and fixup data
-    // that BOLT cannot handle. Check for IMAGE_DEBUG_TYPE_FIXUP entries
-    // and the .textbss section (MSVC incremental link marker).
+    const object::pe32plus_header *PE = InputFile->getPE32PlusHeader();
+
+    // --- Hard errors: binary MUST NOT be processed ---
+
+    // Incrementally linked binaries contain ILT padding (5-byte jmp
+    // thunks), fixup data, and .textbss BSS sections.  BOLT cannot
+    // distinguish thunks from real code and would corrupt the padding.
     bool IsIncremental = false;
     for (const auto &Entry : InputFile->debug_directories()) {
       if (Entry.Type == COFF::IMAGE_DEBUG_TYPE_FIXUP) {
@@ -1028,16 +1038,77 @@ void PECOFFRewriteInstance::run() {
       exit(1);
     }
 
-    // Control Flow Guard maintains a bitmap of valid indirect call targets
-    // at specific RVAs. After block reordering those RVAs are wrong and the
-    // OS will terminate the process on any indirect call.
-    const object::pe32plus_header *PE = InputFile->getPE32PlusHeader();
+    // Control Flow Guard maintains a bitmap of valid indirect call
+    // targets at specific RVAs.  After block reordering, internal branch
+    // targets within a function may move to different offsets.  While
+    // function entry points (the primary CFG targets) remain at their
+    // original RVAs, any CFG-protected indirect call whose target was a
+    // non-entry BB will fail validation and the OS will terminate the
+    // process.  This is a hard error because the failure is silent and
+    // intermittent — it depends on which indirect calls the rewritten
+    // code exercises at runtime.
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
-      errs() << "BOLT-WARNING: binary has Control Flow Guard enabled "
-                "(/GUARD:CF). After block reordering, CFG target RVAs "
-                "become invalid and the OS may terminate the process. "
-                "Recompile without /GUARD:CF for full safety.\n";
+      errs() << "BOLT-ERROR: binary has Control Flow Guard enabled "
+                "(/GUARD:CF). Block reordering invalidates CFG target "
+                "RVAs for non-entry indirect call targets, causing the "
+                "OS to terminate the process. Recompile and link without "
+                "/GUARD:CF, or use 'link /GUARD:NO'.\n";
+      exit(1);
+    }
+
+    // Code integrity enforcement (IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)
+    // means the OS validates the binary's Authenticode signature at load
+    // time.  Any byte change — even a single NOP — invalidates the
+    // signature and the loader refuses to start the process.
+    if (PE && (PE->DLLCharacteristics &
+               COFF::IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)) {
+      errs() << "BOLT-ERROR: binary has code integrity enforcement enabled "
+                "(/INTEGRITYCHECK). Rewriting any bytes invalidates the "
+                "Authenticode signature and the OS will refuse to load "
+                "the binary. Remove /INTEGRITYCHECK from the linker flags.\n";
+      exit(1);
+    }
+
+    // --- Warnings: binary CAN be processed but results need care ---
+
+    // Authenticode signature without FORCE_INTEGRITY.  The binary is
+    // signed but the OS does not enforce the signature at load time
+    // (typical for user-mode EXEs).  Rewriting will invalidate the
+    // signature, which may cause warnings from antivirus or SmartScreen
+    // but will not prevent execution.
+    if (PE) {
+      const object::data_directory *SecDir =
+          InputFile->getDataDirectory(COFF::CERTIFICATE_TABLE);
+      if (SecDir && SecDir->RelativeVirtualAddress != 0 && SecDir->Size != 0) {
+        errs() << "BOLT-WARNING: binary has an Authenticode signature. "
+                  "Rewriting will invalidate it. The binary will still run "
+                  "but may trigger antivirus or SmartScreen warnings. "
+                  "Re-sign after optimization if needed.\n";
+      }
+    }
+
+    // LTCG (Link-Time Code Generation) uses COMDAT folding to merge
+    // identical functions.  With in-place patching this is usually safe
+    // since function addresses do not change, but COMDAT-folded aliases
+    // may share code that BOLT optimizes differently based on profile
+    // data for one alias.
+    {
+      bool HasCOMDAT = false;
+      for (const auto &Section : InputFile->sections()) {
+        const object::coff_section *COFFSec =
+            InputFile->getCOFFSection(Section);
+        if (COFFSec &&
+            (COFFSec->Characteristics & COFF::IMAGE_SCN_LNK_COMDAT)) {
+          HasCOMDAT = true;
+          break;
+        }
+      }
+      if (HasCOMDAT && opts::Verbosity >= 1)
+        outs() << "BOLT-INFO: binary has COMDAT sections (likely /LTCG). "
+                  "COMDAT-folded functions share code; profile-guided "
+                  "optimization will use the profile of whichever alias "
+                  "was profiled.\n";
     }
   }
 
