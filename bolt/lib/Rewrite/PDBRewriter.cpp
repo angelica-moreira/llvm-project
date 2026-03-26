@@ -140,6 +140,14 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     ImageBase = BC.getBinaryFunctions().begin()->second.getAddress() &
                 ~0xFFFFULL;
 
+  // Collect all patches: {stream_index, stream_offset, new_value}.
+  struct PDBPatch {
+    uint16_t StreamIndex;
+    uint64_t StreamOffset;
+    uint32_t NewValue;
+  };
+  SmallVector<PDBPatch, 16> AllPatches;
+
   uint32_t UpdatedSymbols = 0;
   uint32_t RemappedLines = 0;
   const auto &Modules = Dbi.modules();
@@ -192,44 +200,77 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     }
 
     // Scan C13 line info subsections for rewritten functions.
-    // Track patches: {stream_byte_offset, new_uint32_value} for each
-    // line entry that needs its Offset field updated.
+    // Track byte positions of Offset fields that need patching.
     struct LinePatch {
-      uint64_t StreamOffset; // offset within the module stream
+      uint64_t StreamOffset; // byte offset within the module stream
       uint32_t NewValue;     // new line offset value
     };
     SmallVector<LinePatch, 8> Patches;
 
-    // The C13 subsection data starts after symbols + 4 bytes signature.
-    // ModStream provides the C13 lines substream with its offset.
-    BinarySubstreamRef C13Data = ModStream.getC13LinesSubstream();
-    (void)C13Data; // Used for computing stream offsets in future patches.
+    // Walk the raw C13 bytes to track exact positions.
+    // Layout: each subsection has {uint32 Kind, uint32 Length, [data]}.
+    // Line fragment data: {uint32 RelocOffset, uint16 Segment,
+    //   uint16 Flags, uint32 CodeSize}, then file blocks with line entries.
+    BinarySubstreamRef C13Ref = ModStream.getC13LinesSubstream();
+    uint64_t C13StreamBase = C13Ref.Offset; // offset of C13 data in stream
 
-    for (const auto &SS : ModStream.subsections()) {
-      if (SS.kind() != DebugSubsectionKind::Lines)
-        continue;
+    ArrayRef<uint8_t> C13Bytes;
+    if (auto EC = C13Ref.StreamData.readBytes(0, C13Ref.StreamData.getLength(),
+                                               C13Bytes))
+      continue;
 
-      DebugLinesSubsectionRef Lines;
-      BinaryStreamReader Reader(SS.getRecordData());
-      if (Error E = Lines.initialize(Reader)) {
-        consumeError(std::move(E));
+    uint64_t Pos = 0;
+    while (Pos + 8 <= C13Bytes.size()) {
+      uint32_t Kind = support::endian::read32le(&C13Bytes[Pos]);
+      uint32_t Length = support::endian::read32le(&C13Bytes[Pos + 4]);
+      uint64_t DataStart = Pos + 8;
+      uint64_t DataEnd = DataStart + Length;
+
+      if (DataEnd > C13Bytes.size())
+        break;
+
+      if (Kind != uint32_t(DebugSubsectionKind::Lines)) {
+        Pos = alignTo(DataEnd, 4);
         continue;
       }
 
-      uint32_t FuncOffset = Lines.header()->RelocOffset;
-      uint64_t FuncVA = ImageBase + FuncOffset;
+      // Line fragment header at DataStart.
+      if (Length < 12) { Pos = alignTo(DataEnd, 4); continue; }
+      uint32_t RelocOffset = support::endian::read32le(&C13Bytes[DataStart]);
+      uint64_t FuncVA = ImageBase + RelocOffset;
 
       auto MapIt = OffsetMaps.find(FuncVA);
-      if (MapIt == OffsetMaps.end())
+      if (MapIt == OffsetMaps.end()) {
+        Pos = alignTo(DataEnd, 4);
         continue;
+      }
 
       const auto &BBMap = MapIt->second;
 
-      for (const auto &Block : Lines) {
-        for (const auto &LineEntry : Block.LineNumbers) {
-          uint32_t OldOffset = LineEntry.Offset;
-          LineInfo LI(LineEntry.Flags);
+      // Skip header: RelocOffset(4) + Segment(2) + Flags(2) + CodeSize(4) = 12
+      uint64_t FileBlockPos = DataStart + 12;
 
+      while (FileBlockPos + 12 <= DataEnd) {
+        // File block: FileIndex(4) + NumLines(4) + BlockSize(4)
+        uint32_t NumLines =
+            support::endian::read32le(&C13Bytes[FileBlockPos + 4]);
+        uint32_t BlockSize =
+            support::endian::read32le(&C13Bytes[FileBlockPos + 8]);
+
+        uint64_t LineStart = FileBlockPos + 12;
+
+        for (uint32_t L = 0; L < NumLines; ++L) {
+          uint64_t EntryPos = LineStart + L * 8;
+          if (EntryPos + 8 > DataEnd)
+            break;
+
+          uint32_t OldOffset =
+              support::endian::read32le(&C13Bytes[EntryPos]);
+          uint32_t Flags =
+              support::endian::read32le(&C13Bytes[EntryPos + 4]);
+          LineInfo LI(Flags);
+
+          // Remap through BB offset map.
           uint32_t NewOffset = OldOffset;
           for (size_t J = 0; J < BBMap.size(); ++J) {
             uint32_t BBOldStart = BBMap[J].first;
@@ -243,18 +284,27 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
             }
           }
 
-          LLVM_DEBUG(dbgs() << "BOLT-DEBUG:   line " << LI.getStartLine()
-                            << " offset 0x" << Twine::utohexstr(OldOffset)
-                            << " -> 0x" << Twine::utohexstr(NewOffset)
-                            << "\n");
-
           if (OldOffset != NewOffset) {
-            Patches.push_back({0, NewOffset});
+            // Stream offset = C13 base in stream + position within C13 data
+            uint64_t StreamOff = C13StreamBase + EntryPos;
+            Patches.push_back({StreamOff, NewOffset});
             ++RemappedLines;
+            LLVM_DEBUG(dbgs() << "BOLT-DEBUG:   line " << LI.getStartLine()
+                              << " offset 0x" << Twine::utohexstr(OldOffset)
+                              << " -> 0x" << Twine::utohexstr(NewOffset)
+                              << " at stream offset " << StreamOff << "\n");
           }
         }
+
+        FileBlockPos += BlockSize;
       }
+
+      Pos = alignTo(DataEnd, 4);
     }
+
+    // Accumulate patches with their stream index for MSF patching later.
+    for (const auto &P : Patches)
+      AllPatches.push_back({ModiStream, P.StreamOffset, P.NewValue});
 
     if (!Patches.empty()) {
       outs() << "BOLT-INFO: " << Patches.size()
@@ -262,10 +312,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     }
   }
 
-  // In-place rewriting preserves function addresses so S_GPROC32 symbols
-  // are still correct. Only line tables within rewritten functions have
-  // stale instruction offsets due to BB reordering.  Copy the PDB next
-  // to the output binary so debuggers can find it.
+  // Copy the PDB, then apply line patches via MSF block arithmetic.
   SmallString<256> OutputPDB(OutputExe);
   sys::path::replace_extension(OutputPDB, ".pdb");
 
@@ -276,17 +323,41 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     return;
   }
 
-  outs() << "BOLT-INFO: copied PDB to " << OutputPDB << "\n";
+  if (!AllPatches.empty()) {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> PatchBuf =
+        MemoryBuffer::getFile(OutputPDB);
+    if (PatchBuf) {
+      std::string Data = (*PatchBuf)->getBuffer().str();
+      uint32_t BS = PDBFile.getBlockSize();
+      uint32_t Done = 0;
 
-  if (UpdatedSymbols > 0)
+      for (const auto &P : AllPatches) {
+        auto BL = PDBFile.getStreamBlockList(P.StreamIndex);
+        uint32_t BI = P.StreamOffset / BS;
+        uint32_t OB = P.StreamOffset % BS;
+        if (BI >= BL.size()) continue;
+        uint64_t FO = (uint64_t)BL[BI] * BS + OB;
+        if (FO + 4 > Data.size()) continue;
+        support::endian::write32le(&Data[FO], P.NewValue);
+        ++Done;
+      }
+
+      if (Done > 0) {
+        std::error_code WE;
+        raw_fd_ostream Out(OutputPDB, WE, sys::fs::OF_None);
+        if (!WE) Out.write(Data.data(), Data.size());
+      }
+    }
+  }
+
+  outs() << "BOLT-INFO: wrote PDB to " << OutputPDB << "\n";
+  if (RemappedLines > 0)
+    outs() << "BOLT-INFO: patched " << RemappedLines
+           << " line entries in PDB for " << UpdatedSymbols
+           << " rewritten functions\n";
+  else if (UpdatedSymbols > 0)
     outs() << "BOLT-INFO: " << UpdatedSymbols
-           << " rewritten functions have stale line info in PDB"
-           << (RemappedLines ? " (" + Twine(RemappedLines) +
-                                   " line entries need remapping)"
-                             : "")
-           << "\n"
-           << "BOLT-INFO: function-level symbols (names, addresses) are "
-              "correct\n";
+           << " rewritten functions, no line entries needed remapping\n";
   else
     outs() << "BOLT-INFO: PDB is fully accurate (no functions rewritten)\n";
 }

@@ -38,6 +38,7 @@ extern cl::opt<bool> AggregateOnly;
 extern cl::opt<bool> ForcePatch;
 extern cl::opt<bolt::JumpTableSupportLevel> JumpTables;
 extern cl::opt<bool> KeepTmp;
+extern cl::opt<bool> Lite;
 extern cl::opt<bool> NeverPrint;
 extern cl::opt<std::string> OutputFilename;
 extern cl::opt<bool> PrintAfterBranchFixup;
@@ -153,6 +154,11 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
   // Move jump tables into the emitted object so they get re-emitted with
   // correct entries after block reordering.  Same as MachO.
   opts::JumpTables = JTS_MOVE;
+
+  // Lite mode skips cold functions which does not work well for PE/COFF
+  // in-place patching.  Force full processing.
+  if (!opts::Lite.getNumOccurrences())
+    opts::Lite = false;
 
   // PE section alignment is typically 4KB (0x1000).
   BC->PageAlign = 0x1000;
