@@ -16,6 +16,7 @@
 #define BOLT_REWRITE_PDB_REWRITER_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include <cstdint>
 #include <string>
