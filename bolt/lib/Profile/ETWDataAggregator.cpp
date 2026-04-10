@@ -36,6 +36,12 @@ static cl::opt<std::string>
     ETWDumpFile("etw-dump",
                 cl::desc("Path to pre-generated xperf dump text file"),
                 cl::Optional, cl::cat(AggregatorCategory));
+
+static cl::opt<std::string>
+    ETWAnalyzerCSV("etwanalyzer-csv",
+                   cl::desc("ETWAnalyzer -dump LBR -csv output file (best "
+                            "for LBR branch data)"),
+                   cl::Optional, cl::cat(AggregatorCategory));
 } // namespace opts
 
 ETWDataAggregator::~ETWDataAggregator() {
@@ -264,9 +270,18 @@ Error ETWDataAggregator::parseXperfOutput() {
   // First pass: find the actual load address from I-Start events.
   parseImageLoadEvents(Dump);
 
-  // Second pass: parse SampledProfile events.  Real xperf format:
+  // Second pass: parse SampledProfile and LBR branch events.
+  //
+  // SampledProfile (timer interrupt, always available):
   //   SampledProfile, <ts>, z3.exe (PID), <tid>, <PrgrmCtr>, <cpu>, ...
-  // PrgrmCtr (field 4) is the actual sampled instruction pointer.
+  //
+  // LBR branch events (only when captured with -LastBranch):
+  //   BranchTrace, <ts>, z3.exe (PID), <tid>, <FromAddr>, <ToAddr>, <mispred>
+  //   LastBranch, <ts>, z3.exe (PID), <tid>, <FromAddr>, <ToAddr>, <mispred>
+  //
+  // LBR data is vastly better than timer samples for BOLT -- it gives exact
+  // branch from->to pairs instead of just "the CPU was here".  When LBR data
+  // is present, BOLT can do precise basic block reordering.
 
   StringRef Remaining = Dump;
   uint64_t LinesProcessed = 0;
@@ -278,9 +293,57 @@ Error ETWDataAggregator::parseXperfOutput() {
 
     if ((LinesProcessed & 0xFFFFF) == 0)
       outs() << "ETW2BOLT: processed " << (LinesProcessed / 1000000)
-             << "M lines, " << MatchedSamples << " samples matched\r";
+             << "M lines, " << MatchedSamples << " samples, "
+             << MatchedLBRBranches << " LBR branches\r";
 
     StringRef Trimmed = Line.ltrim();
+
+    // --- LBR branch events (highest quality data) ---
+    if (Trimmed.starts_with("BranchTrace") ||
+        Trimmed.starts_with("LastBranch")) {
+      ++TotalEvents;
+
+      // Format: BranchTrace, <ts>, proc (PID), <tid>, <FromAddr>, <ToAddr>,
+      //         <mispred>, ...
+      SmallVector<StringRef, 12> Parts;
+      Line.split(Parts, ',');
+      if (Parts.size() < 7)
+        continue;
+
+      uint64_t FromIP = 0, ToIP = 0;
+      StringRef FromField = Parts[4].trim();
+      StringRef ToField = Parts[5].trim();
+      if (FromField.consume_front("0x") || FromField.consume_front("0X"))
+        FromField.getAsInteger(16, FromIP);
+      if (ToField.consume_front("0x") || ToField.consume_front("0X"))
+        ToField.getAsInteger(16, ToIP);
+
+      if (FromIP == 0 || ToIP == 0)
+        continue;
+
+      // ASLR adjustment
+      if (ASLROffset != 0) {
+        FromIP =
+            static_cast<uint64_t>(static_cast<int64_t>(FromIP) - ASLROffset);
+        ToIP =
+            static_cast<uint64_t>(static_cast<int64_t>(ToIP) - ASLROffset);
+      }
+
+      // Misprediction flag
+      uint64_t Mispred = 0;
+      StringRef MispredField = Parts[6].trim();
+      if (MispredField.equals_insensitive("true") || MispredField == "1")
+        Mispred = 1;
+      else
+        MispredField.getAsInteger(0, Mispred);
+
+      if (recordBranchEvent(FromIP, ToIP, 1, Mispred))
+        ++MatchedLBRBranches;
+
+      continue;
+    }
+
+    // --- SampledProfile events (timer-based, always available) ---
     if (!Trimmed.starts_with("SampledProfile"))
       continue;
 
@@ -317,10 +380,15 @@ Error ETWDataAggregator::parseXperfOutput() {
     ++MatchedSamples;
 
     // Infer edges from consecutive samples in the same thread.
+    // This is a poor heuristic -- the timer fires ~1ms apart while the CPU
+    // executes millions of instructions between samples.  Only use this when
+    // no LBR data is available.  When LBR branches are present, they provide
+    // exact branch edges and this inference is unnecessary.
     if (ThreadID != 0) {
       auto &LastIP = LastIPPerThread[ThreadID];
       if (LastIP != 0 && LastIP != IP) {
         recordBranchEvent(LastIP, IP, 1, 0);
+        ++InferredBranches;
       }
       LastIP = IP;
     }
@@ -335,8 +403,162 @@ ETWDataAggregator::writeAggregatedFile(StringRef OutputFilename) const {
   return writeBranchProfile(OutputFilename);
 }
 
+Error ETWDataAggregator::parseETWAnalyzerCSV() {
+  // ETWAnalyzer -dump LBR -csv produces clean CSV with branch from/to pairs:
+  //   ProcessName,ProcessId,ThreadId,FromAddress,ToAddress,Timestamp,
+  //   BranchType,Count,Mispredicted
+  //
+  // This is the best quality LBR data source on Windows -- ETWAnalyzer
+  // handles all the ETL complexity and gives us pre-parsed branch records.
+
+  ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
+      MemoryBuffer::getFile(opts::ETWAnalyzerCSV);
+  if (!BufOrErr)
+    return createStringError(BufOrErr.getError(),
+                             "cannot read ETWAnalyzer CSV %s",
+                             opts::ETWAnalyzerCSV.c_str());
+
+  outs() << "ETW2BOLT: parsing ETWAnalyzer LBR CSV: "
+         << opts::ETWAnalyzerCSV << "\n";
+
+  StringRef Content = (*BufOrErr)->getBuffer();
+
+  // Parse header line to find column indices.
+  auto [HeaderLine, Body] = Content.split('\n');
+  // Strip BOM if present
+  if (HeaderLine.starts_with("\xef\xbb\xbf"))
+    HeaderLine = HeaderLine.drop_front(3);
+
+  SmallVector<StringRef, 16> Headers;
+  HeaderLine.split(Headers, ',');
+
+  int FromCol = -1, ToCol = -1, CountCol = -1, MispredCol = -1;
+  for (int I = 0; I < (int)Headers.size(); ++I) {
+    StringRef H = Headers[I].trim().trim('"');
+    if (H.equals_insensitive("FromAddress") || H.equals_insensitive("From") ||
+        H.equals_insensitive("SourceAddress") ||
+        H.equals_insensitive("BranchFrom"))
+      FromCol = I;
+    else if (H.equals_insensitive("ToAddress") || H.equals_insensitive("To") ||
+             H.equals_insensitive("TargetAddress") ||
+             H.equals_insensitive("BranchTo"))
+      ToCol = I;
+    else if (H.equals_insensitive("Count") ||
+             H.equals_insensitive("SampleCount") ||
+             H.equals_insensitive("Samples") ||
+             H.equals_insensitive("Weight"))
+      CountCol = I;
+    else if (H.equals_insensitive("Mispredicted") ||
+             H.equals_insensitive("Mispred"))
+      MispredCol = I;
+  }
+
+  if (FromCol < 0 || ToCol < 0) {
+    return createStringError(
+        errc::invalid_argument,
+        "ETWAnalyzer CSV missing FromAddress/ToAddress columns. "
+        "Expected output from: ETWAnalyzer -dump LBR -csv <file>");
+  }
+
+  // We need ASLR info. Parse image load from the binary itself since
+  // the CSV doesn't contain it. Use the same preferred base logic.
+  if (ASLROffset == 0 && BC) {
+    uint64_t PreferredBase = 0;
+    ErrorOr<std::unique_ptr<MemoryBuffer>> FileBuf =
+        MemoryBuffer::getFile(BC->getFilename());
+    if (FileBuf) {
+      Expected<std::unique_ptr<object::ObjectFile>> ObjOrErr =
+          object::ObjectFile::createObjectFile((*FileBuf)->getMemBufferRef());
+      if (ObjOrErr) {
+        if (auto *COFF = dyn_cast<object::COFFObjectFile>(ObjOrErr->get()))
+          PreferredBase = COFF->getImageBase();
+      } else {
+        consumeError(ObjOrErr.takeError());
+      }
+    }
+    // For CSV mode, addresses may already be rebased or not.
+    // We try both with and without offset -- if no functions match with
+    // offset 0, the addresses are likely runtime (ASLR'd) addresses.
+    (void)PreferredBase;
+  }
+
+  uint64_t RowsRead = 0, RowsMatched = 0;
+
+  while (!Body.empty()) {
+    auto [Line, Rest] = Body.split('\n');
+    Body = Rest;
+    StringRef Trimmed = Line.trim();
+    if (Trimmed.empty())
+      continue;
+
+    SmallVector<StringRef, 16> Fields;
+    Trimmed.split(Fields, ',');
+    if ((int)Fields.size() <= std::max(FromCol, ToCol))
+      continue;
+
+    ++RowsRead;
+
+    // Parse From and To addresses
+    uint64_t FromIP = 0, ToIP = 0;
+    StringRef FromStr = Fields[FromCol].trim().trim('"');
+    StringRef ToStr = Fields[ToCol].trim().trim('"');
+
+    if (FromStr.consume_front("0x") || FromStr.consume_front("0X"))
+      FromStr.getAsInteger(16, FromIP);
+    else
+      FromStr.getAsInteger(0, FromIP);
+
+    if (ToStr.consume_front("0x") || ToStr.consume_front("0X"))
+      ToStr.getAsInteger(16, ToIP);
+    else
+      ToStr.getAsInteger(0, ToIP);
+
+    if (FromIP == 0 || ToIP == 0)
+      continue;
+
+    // ASLR adjustment
+    if (ASLROffset != 0) {
+      FromIP =
+          static_cast<uint64_t>(static_cast<int64_t>(FromIP) - ASLROffset);
+      ToIP = static_cast<uint64_t>(static_cast<int64_t>(ToIP) - ASLROffset);
+    }
+
+    // Count
+    uint64_t Count = 1;
+    if (CountCol >= 0 && CountCol < (int)Fields.size()) {
+      StringRef CountStr = Fields[CountCol].trim().trim('"');
+      CountStr.getAsInteger(0, Count);
+      if (Count == 0)
+        Count = 1;
+    }
+
+    // Misprediction
+    uint64_t Mispred = 0;
+    if (MispredCol >= 0 && MispredCol < (int)Fields.size()) {
+      StringRef MispredStr = Fields[MispredCol].trim().trim('"');
+      if (MispredStr.equals_insensitive("true") || MispredStr == "1")
+        Mispred = 1;
+    }
+
+    if (recordBranchEvent(FromIP, ToIP, Count, Mispred)) {
+      ++RowsMatched;
+      MatchedLBRBranches += Count;
+    }
+  }
+
+  outs() << "ETW2BOLT: parsed " << RowsRead << " CSV rows, " << RowsMatched
+         << " matched to binary (" << MatchedLBRBranches
+         << " LBR branches)\n";
+
+  return Error::success();
+}
+
 Error ETWDataAggregator::preprocessProfile(BinaryContext &BC) {
   this->BC = &BC;
+
+  // ETWAnalyzer CSV is a separate path -- no xperf needed.
+  if (!opts::ETWAnalyzerCSV.empty())
+    return Error::success();
 
   // Get the dump text -- either from a user-provided file or by running xperf.
   if (!opts::ETWDumpFile.empty()) {
@@ -352,11 +574,34 @@ Error ETWDataAggregator::preprocessProfile(BinaryContext &BC) {
 Error ETWDataAggregator::readProfile(BinaryContext &BC) {
   this->BC = &BC;
 
-  if (Error E = parseXperfOutput())
-    return E;
+  // If ETWAnalyzer CSV is provided, use that (best LBR data source).
+  if (!opts::ETWAnalyzerCSV.empty()) {
+    if (Error E = parseETWAnalyzerCSV())
+      return E;
+  } else {
+    if (Error E = parseXperfOutput())
+      return E;
+  }
 
+  // Report statistics
   outs() << "ETW2BOLT: " << TotalEvents << " events, " << MatchedSamples
-         << " matched to binary\n";
+         << " IP samples matched";
+  if (MatchedLBRBranches > 0)
+    outs() << ", " << MatchedLBRBranches << " LBR branches";
+  if (InferredBranches > 0)
+    outs() << ", " << InferredBranches
+           << " inferred from consecutive samples";
+  outs() << "\n";
+
+  if (MatchedLBRBranches > 0 && InferredBranches > 0)
+    outs() << "ETW2BOLT: LBR data present -- inferred branches are "
+              "supplementary\n";
+  else if (MatchedLBRBranches == 0 && InferredBranches > 0)
+    outs() << "ETW2BOLT: no LBR data -- using inferred branches only. "
+              "For better results, capture with:\n"
+              "  xperf -on PROC_THREAD+LOADER+PROFILE "
+              "-LastBranch PROFILE "
+              "conditionalbranches,nearrelativecalls,nearreturns\n";
 
   if (NamesToBranches.empty()) {
     errs() << "ETW2BOLT: no profile data matched the binary\n";

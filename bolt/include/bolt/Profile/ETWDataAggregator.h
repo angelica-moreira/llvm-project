@@ -82,9 +82,13 @@ private:
   /// DataAggregator uses mmap events for ASLR on Linux.
   void parseImageLoadEvents(StringRef Dump);
 
-  /// Second pass: parse SampledProfile events, adjust IPs for ASLR, and
-  /// aggregate into NamesToBranches.
+  /// Second pass: parse SampledProfile and LBR branch events from xperf dump.
   Error parseXperfOutput();
+
+  /// Parse ETWAnalyzer -dump LBR -csv output.  This is the best quality
+  /// LBR data source -- ETWAnalyzer handles all ETL complexity and gives
+  /// pre-parsed branch records with from/to addresses and misprediction flags.
+  Error parseETWAnalyzerCSV();
 
   /// Record a branch from absolute address From to To with the given counts.
   /// Resolves addresses to BinaryFunctions via BinaryContext, converts to
@@ -109,6 +113,8 @@ private:
 
   uint64_t TotalEvents{0};
   uint64_t MatchedSamples{0};
+  uint64_t MatchedLBRBranches{0};
+  uint64_t InferredBranches{0};
 };
 
 } // namespace bolt
