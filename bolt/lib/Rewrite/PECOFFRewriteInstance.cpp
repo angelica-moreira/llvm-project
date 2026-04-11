@@ -24,6 +24,7 @@
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Errc.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
@@ -1314,6 +1315,27 @@ void PECOFFRewriteInstance::run() {
           BB->getOutputSize() ? BB->getOutputSize() : BB->estimateSize();
     }
   }
+
+  // Only emit functions whose layout actually changed.  Without this,
+  // the MC assembler re-encodes all 38K+ simple functions, and many
+  // come back larger than the original due to different encoding choices
+  // (REX prefix conventions, branch size selection, etc.).  These would
+  // all count as "size overflow" even though BOLT didn't intend to
+  // change them.  Marking unmodified functions as ignored makes
+  // shouldEmit() return false, so emitAndLink() only processes the
+  // handful of functions we actually want to rewrite.
+  uint64_t SkippedEmit = 0;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (!BF.isSimple() || !BF.hasCFG())
+      continue;
+    if (!ModifiedFunctions.count(BF.getAddress())) {
+      BF.setIgnored();
+      ++SkippedEmit;
+    }
+  }
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: " << SkippedEmit
+                    << " unmodified functions marked ignored (not emitted)\n");
 
   emitAndLink();
   rewriteFile();
