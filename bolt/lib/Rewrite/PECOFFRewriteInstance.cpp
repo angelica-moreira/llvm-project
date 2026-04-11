@@ -16,15 +16,15 @@
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Profile/ETWDataAggregator.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
+#include "bolt/Rewrite/ExecutableFileMemoryManager.h"
+#include "bolt/Rewrite/JITLinkLinker.h"
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/BinaryFormat/COFF.h"
-#include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
-#include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
@@ -463,8 +463,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
       continue;
 
     BF->setMaxSize(Size);
+    // In-place patching: output address == input address.
+    BF->setOutputAddress(BF->getAddress());
 
-    // Mark functions with exception handlers as non-simple to skip them
     if (HasHandler) {
       BF->setSimple(false);
       ++FuncsSkippedHandler;
@@ -614,6 +615,45 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   BC->logBOLTErrorsAndQuitOnFatal(Manager.runPasses());
 }
 
+void PECOFFRewriteInstance::mapCodeSections(
+    BOLTLinker::SectionMapper MapSection) {
+  for (BinaryFunction *Function : BC->getAllBinaryFunctions()) {
+    if (!Function->isEmitted())
+      continue;
+    if (Function->getOutputAddress() == 0)
+      continue;
+    ErrorOr<BinarySection &> FuncSection = Function->getCodeSection();
+    if (!FuncSection) {
+      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: no code section for "
+                        << Function->getOneName() << "\n");
+      continue;
+    }
+
+    FuncSection->setOutputAddress(Function->getOutputAddress());
+    MapSection(*FuncSection, Function->getOutputAddress());
+    Function->setImageAddress(FuncSection->getAllocAddress());
+    Function->setImageSize(FuncSection->getOutputSize());
+  }
+
+  // Map jump table data sections to their original addresses so JITLink
+  // resolves the JT entry relocations correctly.  Track mapped sections
+  // to avoid redundant calls when multiple functions share a JT section.
+  DenseSet<uint64_t> MappedJTSections;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (!BF.isEmitted())
+      continue;
+    for (const auto &JTKV : BF.jumpTables()) {
+      uint64_t JTVA = JTKV.second->getAddress();
+      ErrorOr<BinarySection &> JTSection = BC->getSectionForAddress(JTVA);
+      if (JTSection && MappedJTSections.insert(JTSection->getAddress()).second) {
+        JTSection->setOutputAddress(JTSection->getAddress());
+        MapSection(*JTSection, JTSection->getAddress());
+      }
+    }
+  }
+}
+
 void PECOFFRewriteInstance::emitAndLink() {
   std::error_code EC;
   std::unique_ptr<::llvm::ToolOutputFile> TempOut =
@@ -636,344 +676,18 @@ void PECOFFRewriteInstance::emitAndLink() {
   outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
          << " bytes\n";
 
-  // We resolve relocations ourselves instead of going through JITLink.
-  // JITLink was designed for small JIT objects and has O(n^2) algorithms
-  // that hang when processing a COFF object with thousands of sections
-  // (one per function).  Since PE/COFF rewriting is in-place and all
-  // function addresses are known, we just need the assembled bytes with
-  // relocations applied.
-
-  std::unique_ptr<MemoryBuffer> ObjBuf =
+  std::unique_ptr<MemoryBuffer> ObjectMemBuffer =
       MemoryBuffer::getMemBuffer(ObjContents, "bolt-coff-object", false);
 
-  Expected<std::unique_ptr<object::ObjectFile>> ObjOrErr =
-      object::ObjectFile::createObjectFile(ObjBuf->getMemBufferRef());
-  if (!ObjOrErr) {
-    errs() << "BOLT-ERROR: cannot parse emitted object: "
-           << toString(ObjOrErr.takeError()) << "\n";
-    exit(1);
-  }
+  auto EFMM = std::make_unique<ExecutableFileMemoryManager>(*BC);
+  EFMM->setNewSecPrefix(getNewSecPrefix());
+  EFMM->setOrgSecPrefix(getOrgSecPrefix());
 
-  auto *Obj = cast<object::COFFObjectFile>(ObjOrErr->get());
-
-  // Map section names to the BinaryFunction they belong to.  The MC emitter
-  // creates one section per function, named like ".l.text.<id>".
-  StringMap<BinaryFunction *> SectionToFunc;
-  for (auto &BFI : BC->getBinaryFunctions()) {
-    BinaryFunction &BF = BFI.second;
-    if (!BF.isEmitted())
-      continue;
-    SmallString<32> SecName = BF.getCodeSectionName();
-    SectionToFunc[SecName] = &BF;
-  }
-
-  // Map section names to their original virtual addresses.  Defined symbols
-  // in the COFF object reference these sections, so we need the VA to compute
-  // the final symbol address (section_VA + offset_in_section).
-  StringMap<uint64_t> SectionNameToVA;
-  for (const auto &Sec : Obj->sections()) {
-    Expected<StringRef> NameOrErr = Sec.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-    auto It = SectionToFunc.find(*NameOrErr);
-    if (It != SectionToFunc.end())
-      SectionNameToVA[*NameOrErr] = It->second->getAddress();
-  }
-
-  // Process each function section: copy its bytes and resolve relocations.
-  // Reserve space to prevent reallocation which would invalidate pointers
-  // stored via setImageAddress.
-  // Reserve for both function sections and .rdata JT sections to prevent
-  // reallocation that would invalidate pointers set via setImageAddress.
-  {
-    size_t RdataCount = 0;
-    for (const auto &S : Obj->sections()) {
-      Expected<StringRef> N = S.getName();
-      if (!N) {
-        consumeError(N.takeError());
-        continue;
-      }
-      if (*N == ".rdata" && !S.relocations().empty())
-        ++RdataCount;
-    }
-    ResolvedFunctionBytes.reserve(SectionToFunc.size() + RdataCount);
-  }
-  uint64_t ResolvedCount = 0;
-  for (const auto &Sec : Obj->sections()) {
-    Expected<StringRef> NameOrErr = Sec.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-
-    auto FuncIt = SectionToFunc.find(*NameOrErr);
-    if (FuncIt == SectionToFunc.end())
-      continue;
-
-    BinaryFunction *BF = FuncIt->second;
-    uint64_t SectionVA = BF->getAddress();
-
-    Expected<StringRef> ContentsOrErr = Sec.getContents();
-    if (!ContentsOrErr) {
-      errs() << "BOLT-WARNING: cannot read section " << *NameOrErr << "\n";
-      consumeError(ContentsOrErr.takeError());
-      continue;
-    }
-
-    // Make a writable copy so we can patch in the resolved relocations.
-    ResolvedFunctionBytes.emplace_back(ContentsOrErr->begin(),
-                                       ContentsOrErr->end());
-    auto &Buffer = ResolvedFunctionBytes.back();
-    MutableArrayRef<uint8_t> Data(Buffer);
-
-    bool HasUnresolved = false;
-    for (const auto &Rel : Sec.relocations()) {
-      uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
-      if (SymVA == 0) {
-        errs() << "BOLT-WARNING: unresolved relocation in \""
-               << BF->getPrintName() << "\" at offset " << Rel.getOffset()
-               << ", skipping function\n";
-        HasUnresolved = true;
-      }
-      applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
-    }
-    if (HasUnresolved)
-      BF->setSimple(false);
-
-    BF->setImageAddress(reinterpret_cast<uint64_t>(Data.data()));
-    BF->setImageSize(Data.size());
-    ++ResolvedCount;
-  }
-
-  // Process jump table data sections (.rdata).  With JTS_MOVE the emitter
-  // writes JT entries with relocations pointing to BB symbols.  We resolve
-  // them the same way as code relocations and store the result so
-  // rewriteFile() can pwrite them back.
-
-  // Build a JT address to owning function map for the owner lookup below.
-  DenseMap<uint64_t, uint64_t> JTToOwner;
-  for (const auto &BFI : BC->getBinaryFunctions())
-    for (const auto &JTKV : BFI.second.jumpTables())
-      JTToOwner[JTKV.second->getAddress()] = BFI.second.getAddress();
-
-  for (const auto &Sec : Obj->sections()) {
-    Expected<StringRef> NameOrErr = Sec.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-    if (*NameOrErr != ".rdata")
-      continue;
-
-    if (Sec.relocations().empty())
-      continue;
-
-    // Find this section's base VA from the first known symbol in it.
-    uint64_t SectionVA = 0;
-    object::section_iterator SecIt(Sec);
-    for (const auto &Sym : Obj->symbols()) {
-      Expected<object::section_iterator> SymSec = Sym.getSection();
-      if (!SymSec) {
-        consumeError(SymSec.takeError());
-        continue;
-      }
-      if (*SymSec == Obj->section_end() || **SymSec != *SecIt)
-        continue;
-      Expected<StringRef> SymName = Sym.getName();
-      if (!SymName) {
-        consumeError(SymName.takeError());
-        continue;
-      }
-      if (const BinaryData *BD = BC->getBinaryDataByName(*SymName)) {
-        uint64_t Offset = 0;
-        if (Expected<uint64_t> SymVal = Sym.getValue())
-          Offset = *SymVal;
-        else
-          consumeError(SymVal.takeError());
-        SectionVA = BD->getAddress() - Offset;
-        // Also register in the shared map so resolveRelocSymbol can
-        // resolve symbols defined in this section.
-        SectionNameToVA[*NameOrErr] = SectionVA;
-        break;
-      }
-    }
-
-    if (SectionVA == 0)
-      continue;
-
-    Expected<StringRef> ContentsOrErr = Sec.getContents();
-    if (!ContentsOrErr) {
-      consumeError(ContentsOrErr.takeError());
-      continue;
-    }
-
-    ResolvedFunctionBytes.emplace_back(ContentsOrErr->begin(),
-                                       ContentsOrErr->end());
-    auto &Buffer = ResolvedFunctionBytes.back();
-    MutableArrayRef<uint8_t> Data(Buffer);
-
-    for (const auto &Rel : Sec.relocations()) {
-      uint64_t SymVA = resolveRelocSymbol(Obj, Rel, SectionNameToVA);
-      if (SymVA == 0)
-        errs() << "BOLT-WARNING: unresolved JT relocation at offset "
-               << Rel.getOffset() << " in .rdata section\n";
-      applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
-    }
-
-    uint64_t OwnerVA = 0;
-    auto JTIt = JTToOwner.find(SectionVA);
-    if (JTIt != JTToOwner.end())
-      OwnerVA = JTIt->second;
-    ResolvedJTData.push_back(
-        {SectionVA, OwnerVA, std::vector<uint8_t>(Buffer)});
-  }
-
-  outs() << "BOLT-INFO: resolved relocations for " << ResolvedCount
-         << " functions\n";
-}
-
-uint64_t PECOFFRewriteInstance::resolveRelocSymbol(
-    const object::COFFObjectFile *Obj, const object::RelocationRef &Rel,
-    const StringMap<uint64_t> &SectionNameToVA) {
-  object::symbol_iterator SI = Rel.getSymbol();
-  if (SI == Obj->symbol_end()) {
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: relocation at offset " << Rel.getOffset()
-                      << " has no symbol\n");
-    return 0;
-  }
-
-  object::SymbolRef Sym = *SI;
-
-  // Defined symbol in the emitted object -- its address is the section's
-  // original VA plus the symbol's offset within that section.
-  Expected<object::section_iterator> SecOrErr = Sym.getSection();
-  if (!SecOrErr) {
-    consumeError(SecOrErr.takeError());
-  } else if (*SecOrErr != Obj->section_end()) {
-    Expected<StringRef> SecName = (*SecOrErr)->getName();
-    if (!SecName) {
-      consumeError(SecName.takeError());
-    } else {
-      auto It = SectionNameToVA.find(*SecName);
-      if (It != SectionNameToVA.end()) {
-        uint64_t Offset = 0;
-        if (Expected<uint64_t> ValOrErr = Sym.getValue())
-          Offset = *ValOrErr;
-        else
-          consumeError(ValOrErr.takeError());
-        LLVM_DEBUG({
-          dbgs() << "BOLT-DEBUG: resolved defined symbol in section "
-                 << *SecName << " at VA 0x"
-                 << Twine::utohexstr(It->second + Offset) << "\n";
-        });
-        return It->second + Offset;
-      }
-    }
-  }
-
-  // External symbol -- look it up by name in BinaryContext.
-  Expected<StringRef> NameOrErr = Sym.getName();
-  if (!NameOrErr) {
-    consumeError(NameOrErr.takeError());
-    return 0;
-  }
-  StringRef Name = *NameOrErr;
-
-  if (const BinaryData *BD = BC->getBinaryDataByName(Name)) {
-    uint64_t Addr = BD->isMoved() && !BD->isJumpTable() ? BD->getOutputAddress()
-                                                        : BD->getAddress();
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: resolved " << Name << " via BinaryData"
-                      << " at 0x" << Twine::utohexstr(Addr) << "\n");
-    return Addr;
-  }
-
-  // BOLT creates symbols like FUNCat0x<addr> and DATAat0x<addr> for
-  // references into the original binary.  Parse the embedded address.
-  size_t HexPos = Name.find("0x");
-  if (HexPos != StringRef::npos) {
-    uint64_t Addr = 0;
-    if (!Name.substr(HexPos + 2).getAsInteger(16, Addr) && Addr != 0) {
-      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: parsed address 0x"
-                        << Twine::utohexstr(Addr) << " from " << Name << "\n");
-      return Addr;
-    }
-  }
-
-  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: unresolved symbol " << Name << "\n");
-  return 0;
-}
-
-void PECOFFRewriteInstance::applyCOFFRelocation(
-    MutableArrayRef<uint8_t> Data, uint64_t SectionVA,
-    const object::RelocationRef &Rel, uint64_t SymVA) {
-  uint64_t Offset = Rel.getOffset();
-
-  switch (Rel.getType()) {
-  case COFF::IMAGE_REL_AMD64_REL32: {
-    if (Offset + 4 > Data.size()) {
-      LLVM_DEBUG(dbgs() << "BOLT-DEBUG: REL32 at offset " << Offset
-                        << " overflows section of size " << Data.size()
-                        << "\n");
-      return;
-    }
-    int32_t Existing = support::endian::read32le(&Data[Offset]);
-    uint64_t RelocVA = SectionVA + Offset;
-    int32_t Value = static_cast<int32_t>(SymVA - RelocVA - 4) + Existing;
-    support::endian::write32le(&Data[Offset], Value);
-    break;
-  }
-  case COFF::IMAGE_REL_AMD64_REL32_1:
-  case COFF::IMAGE_REL_AMD64_REL32_2:
-  case COFF::IMAGE_REL_AMD64_REL32_3:
-  case COFF::IMAGE_REL_AMD64_REL32_4:
-  case COFF::IMAGE_REL_AMD64_REL32_5: {
-    if (Offset + 4 > Data.size())
-      return;
-    // REL32_N subtracts an extra N bytes from the displacement.
-    unsigned Extra = Rel.getType() - COFF::IMAGE_REL_AMD64_REL32;
-    int32_t Existing = support::endian::read32le(&Data[Offset]);
-    uint64_t RelocVA = SectionVA + Offset;
-    int32_t Value =
-        static_cast<int32_t>(SymVA - RelocVA - 4 - Extra) + Existing;
-    support::endian::write32le(&Data[Offset], Value);
-    break;
-  }
-  case COFF::IMAGE_REL_AMD64_ADDR64: {
-    if (Offset + 8 > Data.size())
-      return;
-    int64_t Existing = support::endian::read64le(&Data[Offset]);
-    support::endian::write64le(&Data[Offset], SymVA + Existing);
-    break;
-  }
-  case COFF::IMAGE_REL_AMD64_ADDR32NB: {
-    // Image-base-relative 32-bit address.
-    if (Offset + 4 > Data.size())
-      return;
-    int32_t Existing = support::endian::read32le(&Data[Offset]);
-    uint64_t ImageBase = InputFile->getImageBase();
-    int32_t Value = static_cast<int32_t>(SymVA - ImageBase) + Existing;
-    support::endian::write32le(&Data[Offset], Value);
-    break;
-  }
-  case COFF::IMAGE_REL_AMD64_ADDR32: {
-    if (Offset + 4 > Data.size())
-      return;
-    int32_t Existing = support::endian::read32le(&Data[Offset]);
-    int32_t Value = static_cast<int32_t>(SymVA) + Existing;
-    support::endian::write32le(&Data[Offset], Value);
-    break;
-  }
-  case COFF::IMAGE_REL_AMD64_SECTION:
-  case COFF::IMAGE_REL_AMD64_SECREL:
-    // Debug info relocations -- not relevant for code patching.
-    break;
-  default:
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: unhandled COFF relocation type "
-                      << Rel.getType() << " at offset " << Offset << "\n");
-    break;
-  }
+  Linker = std::make_unique<JITLinkLinker>(*BC, std::move(EFMM));
+  Linker->loadObject(ObjectMemBuffer->getMemBufferRef(),
+                     [this](auto MapSection) {
+                       mapCodeSections(MapSection);
+                     });
 }
 
 void PECOFFRewriteInstance::rewriteFile() {
@@ -1069,23 +783,6 @@ void PECOFFRewriteInstance::rewriteFile() {
     }
 
     ++RewrittenCount;
-  }
-
-  // Write resolved jump table data back to their original .rdata offsets.
-  // Only write JT data for functions that were actually rewritten above.
-  // If a function was skipped (size overflow or not modified), its jump
-  // table must keep the original entries to match the original code.
-  for (const auto &JTD : ResolvedJTData) {
-    if (JTD.OwnerVA != 0 && !ModifiedFunctions.count(JTD.OwnerVA))
-      continue;
-    auto FileOff = VAToFileOffset(JTD.VA);
-    if (!FileOff)
-      continue;
-    OS.pwrite(reinterpret_cast<const char *>(JTD.Data.data()), JTD.Data.size(),
-              *FileOff);
-    LLVM_DEBUG(dbgs() << "BOLT-DEBUG: wrote " << JTD.Data.size()
-                      << " bytes of JT data at file offset 0x"
-                      << Twine::utohexstr(*FileOff) << "\n");
   }
 
   NumFuncsOverflow = OverflowCount;
