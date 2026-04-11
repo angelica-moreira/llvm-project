@@ -1,0 +1,13 @@
+## Test that llvm-bolt processes PE/COFF binaries with CFG Guard enabled.
+## With in-place patching, function entry RVAs are preserved, so the
+## GFids table remains valid without patching.
+
+# RUN: yaml2obj %p/Inputs/cfg-guard.yaml -o %t.exe
+# RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s
+
+# CHECK: BOLT-INFO: processing PE/COFF binary
+# CHECK: BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)
+# CHECK: BOLT-INFO: 2 functions discovered from .pdata
+# CHECK: BOLT-INFO: disassembled 2 functions
+# CHECK: BOLT-INFO: no profile data, producing identity copy
+# CHECK-NOT: BOLT-ERROR

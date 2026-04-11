@@ -22,9 +22,9 @@
 #include "llvm/BinaryFormat/COFF.h"
 #include "llvm/MC/MCObjectStreamer.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Errc.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
@@ -540,20 +540,16 @@ void PECOFFRewriteInstance::postProcessFunctions() {
   }
 }
 
-void PECOFFRewriteInstance::runOptimizationPasses() {
-  // Protect prolog instructions from ShortenInstructions.  UNWIND_INFO
-  // references byte offsets within the prolog; shortening an instruction
-  // there would shift all subsequent offsets and corrupt the unwind data.
-  //
-  // ShortenInstructions already skips instructions that have a Size
-  // annotation (see BinaryPasses.cpp line ~1107).  We exploit this by
-  // annotating prolog instructions with their original sizes.
+/// Mark prolog instructions as immutable so that size-changing passes
+/// (ShortenInstructions, RemoveNops) leave them alone.  SEH unwind data
+/// references byte offsets within the prolog, so every instruction there
+/// must keep its original encoding and size.
+void PECOFFRewriteInstance::freezePrologInstructions() {
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
     if (!BF.hasCFG() || !BF.isSimple())
       continue;
 
-    // Look up the prolog size from the parsed SEH unwind info.
     uint64_t FuncRVA = BF.getAddress() - InputFile->getImageBase();
     auto SEHIt = FunctionSEHInfo.find(FuncRVA);
     if (SEHIt == FunctionSEHInfo.end())
@@ -562,36 +558,38 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
     if (PrologSize == 0)
       continue;
 
-    // The prolog is always in the entry basic block.  Walk its
-    // instructions and annotate those within the prolog region.
-    BinaryBasicBlock *EntryBB = &BF.front();
+    // The prolog occupies the first PrologSize bytes of the entry block.
+    BinaryBasicBlock &EntryBB = BF.front();
     uint32_t Offset = 0;
-    for (MCInst &Inst : *EntryBB) {
+    for (MCInst &Inst : EntryBB) {
       if (Offset >= PrologSize)
         break;
       unsigned InstSize = BC->computeInstructionSize(Inst);
+      // Size annotation prevents ShortenInstructions from re-encoding.
       if (InstSize > 0)
         BC->MIB->setSize(Inst, InstSize);
+      // Clearing the NOP annotation prevents RemoveNops from deleting
+      // alignment padding that is part of the prolog.
+      if (BC->MIB->isNoop(Inst))
+        BC->MIB->removeAnnotation(Inst, "NOP");
       Offset += InstSize;
     }
   }
+}
+
+void PECOFFRewriteInstance::runOptimizationPasses() {
+  freezePrologInstructions();
 
   BinaryFunctionPassManager Manager(*BC);
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
 
-  // Shorten instructions before reordering.  This reclaims bytes from
-  // redundant encodings (long jmp→short, mov rax,0→xor eax,eax, etc.)
-  // that compensate for the extra jumps reordering introduces.
-  // Prolog instructions are protected by the Size annotation above.
+  // Reclaim bytes from redundant instruction encodings before reordering.
+  // This offsets the extra jumps that block reordering introduces.
   Manager.registerPass(
       std::make_unique<ShortenInstructions>(opts::NeverPrint));
 
-  // Strip inter-block NOPs that MSVC uses for alignment padding.
-  // After reordering, these NOPs are misplaced and waste bytes we need
-  // for the extra jumps.  Prolog NOPs are safe: they have Size
-  // annotations from the guard above, and RemoveNops only strips
-  // instructions without side effects — the prolog's push/mov/sub
-  // instructions won't be touched.
+  // Remove inter-block alignment NOPs that are no longer useful after
+  // reordering.  Prolog NOPs are excluded (annotation cleared above).
   Manager.registerPass(std::make_unique<RemoveNops>(opts::NeverPrint));
 
   Manager.registerPass(
@@ -1155,35 +1153,24 @@ void PECOFFRewriteInstance::run() {
       exit(1);
     }
 
-    // Control Flow Guard: the GFids table lists valid indirect call targets,
-    // which are function entry RVAs.  With in-place patching, function
-    // entries don't move — only code inside the function is reordered.
-    // The GFids bitmap remains valid because all entry points stay at
-    // their original addresses.
-    //
-    // Intra-function indirect branches (switch/jump tables) are not
-    // protected by CFG — they use the function's own jump table, which
-    // BOLT rewrites with correct target offsets via JTS_MOVE.
-    //
-    // We allow CFG Guard binaries but warn in case a future scenario
-    // involves address-taken labels or other non-entry CFG targets.
+    // Control Flow Guard: the GFids table contains function entry RVAs.
+    // In-place patching preserves all entry points at their original
+    // addresses, so the table remains valid.  Intra-function indirect
+    // branches (jump tables) are not covered by CFG and are handled
+    // separately via JTS_MOVE.
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
       outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF). "
-                "Function entry RVAs are preserved by in-place patching; "
-                "the GFids table remains valid.\n";
+                "Entry point RVAs are unchanged; GFids table is valid.\n";
     }
 
-    // Code integrity enforcement (IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)
-    // means the OS validates the binary's Authenticode signature at load
-    // time.  Any byte change — even a single NOP — invalidates the
-    // signature and the loader refuses to start the process.
+    // Code integrity enforcement requires a valid Authenticode signature.
+    // Any byte change invalidates it and the loader rejects the binary.
     if (PE && (PE->DLLCharacteristics &
                COFF::IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)) {
-      errs() << "BOLT-ERROR: binary has code integrity enforcement enabled "
-                "(/INTEGRITYCHECK). Rewriting any bytes invalidates the "
-                "Authenticode signature and the OS will refuse to load "
-                "the binary. Remove /INTEGRITYCHECK from the linker flags.\n";
+      errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK. Rewriting "
+                "invalidates the Authenticode signature. Remove "
+                "/INTEGRITYCHECK from the linker flags.\n";
       exit(1);
     }
 
@@ -1328,14 +1315,11 @@ void PECOFFRewriteInstance::run() {
     }
   }
 
-  // Only emit functions whose layout actually changed.  Without this,
-  // the MC assembler re-encodes all 38K+ simple functions, and many
-  // come back larger than the original due to different encoding choices
-  // (REX prefix conventions, branch size selection, etc.).  These would
-  // all count as "size overflow" even though BOLT didn't intend to
-  // change them.  Marking unmodified functions as ignored makes
-  // shouldEmit() return false, so emitAndLink() only processes the
-  // handful of functions we actually want to rewrite.
+  // Skip emission for functions whose layout did not change.  The MC
+  // assembler may re-encode unchanged functions with slightly different
+  // (sometimes larger) byte sequences, causing false size overflows.
+  // Limiting emission to modified functions avoids this and reduces the
+  // emitted object to only what we intend to patch back.
   uint64_t SkippedEmit = 0;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
@@ -1346,8 +1330,8 @@ void PECOFFRewriteInstance::run() {
       ++SkippedEmit;
     }
   }
-  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: " << SkippedEmit
-                    << " unmodified functions marked ignored (not emitted)\n");
+  LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipped emission for " << SkippedEmit
+                    << " unmodified functions\n");
 
   emitAndLink();
   rewriteFile();

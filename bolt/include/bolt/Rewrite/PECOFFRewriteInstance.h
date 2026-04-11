@@ -105,6 +105,7 @@ class PECOFFRewriteInstance {
   void buildFunctionsCFG();
   void postProcessFunctions();
   void runOptimizationPasses();
+  void freezePrologInstructions();
   void emitAndLink();
   void rewriteFile();
   void identityRewriteFile();
