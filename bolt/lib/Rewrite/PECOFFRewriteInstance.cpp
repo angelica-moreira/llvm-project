@@ -540,8 +540,51 @@ void PECOFFRewriteInstance::postProcessFunctions() {
 }
 
 void PECOFFRewriteInstance::runOptimizationPasses() {
+  // Protect prolog instructions from ShortenInstructions.  UNWIND_INFO
+  // references byte offsets within the prolog; shortening an instruction
+  // there would shift all subsequent offsets and corrupt the unwind data.
+  //
+  // ShortenInstructions already skips instructions that have a Size
+  // annotation (see BinaryPasses.cpp line ~1107).  We exploit this by
+  // annotating prolog instructions with their original sizes.
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (!BF.hasCFG() || !BF.isSimple())
+      continue;
+
+    // Look up the prolog size from the parsed SEH unwind info.
+    uint64_t FuncRVA = BF.getAddress() - InputFile->getImageBase();
+    auto SEHIt = FunctionSEHInfo.find(FuncRVA);
+    if (SEHIt == FunctionSEHInfo.end())
+      continue;
+    uint8_t PrologSize = SEHIt->second.PrologSize;
+    if (PrologSize == 0)
+      continue;
+
+    // The prolog is always in the entry basic block.  Walk its
+    // instructions and annotate those within the prolog region.
+    BinaryBasicBlock *EntryBB = &BF.front();
+    uint32_t Offset = 0;
+    for (MCInst &Inst : *EntryBB) {
+      if (Offset >= PrologSize)
+        break;
+      unsigned InstSize = BC->computeInstructionSize(Inst);
+      if (InstSize > 0)
+        BC->MIB->setSize(Inst, InstSize);
+      Offset += InstSize;
+    }
+  }
+
   BinaryFunctionPassManager Manager(*BC);
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
+
+  // Shorten instructions before reordering.  This reclaims bytes from
+  // redundant encodings (long jmp→short, mov rax,0→xor eax,eax, etc.)
+  // that compensate for the extra jumps reordering introduces.
+  // Prolog instructions are protected by the Size annotation above.
+  Manager.registerPass(
+      std::make_unique<ShortenInstructions>(opts::NeverPrint));
+
   Manager.registerPass(
       std::make_unique<ReorderBasicBlocks>(opts::PrintReordered));
   Manager.registerPass(
