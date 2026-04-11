@@ -125,8 +125,8 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
   }
 
   // Choose the right reader based on the file type.
-  // PE/COFF supports ETW traces (.etl) and fdata text profiles.
-  if (ETWDataAggregator::checkETLMagic(Filename))
+  if (ETWDataAggregator::checkETLMagic(Filename) ||
+      Filename.ends_with_insensitive(".csv"))
     ProfileReader = std::make_unique<ETWDataAggregator>(Filename);
   else
     ProfileReader = std::make_unique<DataReader>(Filename);
@@ -174,12 +174,11 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
     opts::AlignText = BC->PageAlign;
 }
 
-// PE/COFF uses its own pass pipeline (not BinaryPassManager) to avoid
-// passes that change instruction sizes.  ShortenInstructions and RemoveNops
-// must NOT be registered here because they alter byte offsets within
-// functions, invalidating UNWIND_INFO prolog sizes and unwind code offsets
-// in .xdata.  Unlike ELF where DWARF CFI is regenerated, Windows unwind
-// data is preserved byte-for-byte.
+// PE/COFF uses a restricted pass pipeline.  ShortenInstructions and
+// RemoveNops are excluded because they alter byte offsets within functions,
+// which would corrupt UNWIND_INFO prolog sizes and unwind code offsets
+// in .xdata.  Unlike ELF where DWARF CFI can be regenerated, Windows
+// unwind data is preserved byte-for-byte in the original .xdata section.
 
 void PECOFFRewriteInstance::readSpecialSections() {
   for (const object::SectionRef &Section : InputFile->sections()) {
@@ -760,18 +759,19 @@ void PECOFFRewriteInstance::emitAndLink() {
       applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
     }
 
-    // Find the owning function by scanning for a jump table at this VA.
+    // Find the owning function.  Build a lookup map on first use to avoid
+    // scanning all functions × all JTs for every .rdata section (O(n²)).
     uint64_t OwnerVA = 0;
-    for (const auto &BFI : BC->getBinaryFunctions()) {
-      for (const auto &JTKV : BFI.second.jumpTables()) {
-        if (JTKV.second->getAddress() == SectionVA) {
-          OwnerVA = BFI.second.getAddress();
-          break;
-        }
-      }
-      if (OwnerVA != 0)
-        break;
+    // Lazily built: JT VA → owning function VA.
+    static DenseMap<uint64_t, uint64_t> JTToOwner;
+    if (JTToOwner.empty()) {
+      for (const auto &BFI : BC->getBinaryFunctions())
+        for (const auto &JTKV : BFI.second.jumpTables())
+          JTToOwner[JTKV.second->getAddress()] = BFI.second.getAddress();
     }
+    auto JTIt = JTToOwner.find(SectionVA);
+    if (JTIt != JTToOwner.end())
+      OwnerVA = JTIt->second;
     ResolvedJTData.push_back(
         {SectionVA, OwnerVA, std::vector<uint8_t>(Buffer)});
   }

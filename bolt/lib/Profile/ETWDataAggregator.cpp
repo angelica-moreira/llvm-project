@@ -438,6 +438,48 @@ Error ETWDataAggregator::parseETWAnalyzerCSV() {
         "  ETWAnalyzer -dump LBR -fd <file> -csv lbr.csv");
 
   int MaxCol = std::max(FromCol, ToCol);
+
+  // ETWAnalyzer CSV contains runtime (ASLR'd) addresses, not file RVAs.
+  // Auto-detect the ASLR offset by probing the first address against
+  // BinaryContext's function map at various base offsets.
+  if (ASLROffset == 0 && BC) {
+    uint64_t PreferredBase = readPreferredBase();
+    if (PreferredBase != 0) {
+      // Peek at the first data row to get a sample address.
+      StringRef Peek = Body;
+      while (!Peek.empty()) {
+        auto [PeekLine, PeekRest] = Peek.split('\n');
+        Peek = PeekRest;
+        if (PeekLine.trim().empty())
+          continue;
+        SmallVector<StringRef, 16> PeekFields;
+        PeekLine.split(PeekFields, ',');
+        if ((int)PeekFields.size() <= MaxCol)
+          continue;
+        uint64_t SampleAddr = parseHex(PeekFields[FromCol].trim('"'));
+        if (SampleAddr == 0)
+          continue;
+        // If the raw address already resolves, no ASLR adjustment needed.
+        if (BC->getBinaryFunctionContainingAddress(SampleAddr, false, true))
+          break;
+        // Try with a guessed offset: sample is likely near ImageBase.
+        uint64_t GuessBase = SampleAddr & ~0xFFFFFULL;
+        int64_t GuessOffset =
+            static_cast<int64_t>(GuessBase) -
+            static_cast<int64_t>(PreferredBase);
+        uint64_t Adjusted = static_cast<uint64_t>(
+            static_cast<int64_t>(SampleAddr) - GuessOffset);
+        if (BC->getBinaryFunctionContainingAddress(Adjusted, false, true)) {
+          ASLROffset = GuessOffset;
+          outs() << "ETW2BOLT: detected ASLR offset "
+                 << (ASLROffset > 0 ? "+" : "") << ASLROffset
+                 << " from CSV addresses\n";
+        }
+        break;
+      }
+    }
+  }
+
   uint64_t RowsRead = 0, RowsMatched = 0;
 
   while (!Body.empty()) {
