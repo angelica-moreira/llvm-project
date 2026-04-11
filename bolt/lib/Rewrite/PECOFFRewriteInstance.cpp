@@ -586,6 +586,14 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   Manager.registerPass(
       std::make_unique<ShortenInstructions>(opts::NeverPrint));
 
+  // Strip inter-block NOPs that MSVC uses for alignment padding.
+  // After reordering, these NOPs are misplaced and waste bytes we need
+  // for the extra jumps.  Prolog NOPs are safe: they have Size
+  // annotations from the guard above, and RemoveNops only strips
+  // instructions without side effects — the prolog's push/mov/sub
+  // instructions won't be touched.
+  Manager.registerPass(std::make_unique<RemoveNops>(opts::NeverPrint));
+
   Manager.registerPass(
       std::make_unique<ReorderBasicBlocks>(opts::PrintReordered));
   Manager.registerPass(
@@ -1016,6 +1024,10 @@ void PECOFFRewriteInstance::rewriteFile() {
     uint64_t OriginalSize = Function.getMaxSize();
 
     if (EmittedSize > OriginalSize) {
+      if (opts::Verbosity >= 1)
+        outs() << "BOLT: overflow \"" << Function << "\" emitted="
+               << EmittedSize << " original=" << OriginalSize
+               << " (+" << (EmittedSize - OriginalSize) << " bytes)\n";
       ++OverflowCount;
       continue;
     }
