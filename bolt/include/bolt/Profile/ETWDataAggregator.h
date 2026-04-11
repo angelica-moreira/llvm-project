@@ -6,18 +6,13 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Reads Windows ETW (Event Tracing for Windows) trace data and aggregates it
-// into BOLT's profile format.  This is the Windows equivalent of
-// DataAggregator which handles Linux perf data.
+// Windows equivalent of DataAggregator.  Reads ETW trace data and converts
+// it into BOLT's profile format.
 //
 // Architecture mirrors perf2bolt:
-//   perf2bolt:  perf.data  -> `perf script` subprocess -> parse text -> fdata
-//   etw2bolt:   trace.etl  -> `xperf -a dumper` subprocess -> parse text ->
-//   fdata
-//
-// Inherits DataReader to reuse the NamesToBranches data structures,
-// FuncBranchData, BranchInfo, Location types, and the profile matching
-// infrastructure.
+//   perf2bolt:  perf.data  -> `perf script` -> parse text -> profile
+//   etw2bolt:   trace.etl  -> `xperf -a dumper` -> parse text -> profile
+//               -or-       ETWAnalyzer CSV (LBR) -> parse CSV -> profile
 //
 //===----------------------------------------------------------------------===//
 
@@ -56,59 +51,41 @@ public:
 
   bool mayHaveProfileData(const BinaryFunction &BF) override;
 
-  /// Check whether a file looks like an ETL trace.
   static bool checkETLMagic(StringRef FileName);
 
 private:
   std::string ETLFilename;
   BinaryContext *BC{nullptr};
 
-  /// Path to xperf.exe, auto-detected or from command line.
   std::string XperfPath;
-
-  /// Path to the temp file holding xperf dumper output.
   std::string DumpFilePath;
 
-  /// Find xperf.exe in standard locations.
   std::string findXperf() const;
-
-  /// Shell out to `xperf -a dumper` to convert ETL to text, just like
-  /// DataAggregator shells out to `perf script`.
   Error launchXperf();
 
-  /// First pass: scan for ImageLoad events to detect the actual load
-  /// address of the target binary.  With ASLR the runtime address differs
-  /// from the preferred ImageBase in the PE header.  This mirrors how
-  /// DataAggregator uses mmap events for ASLR on Linux.
+  /// Read the preferred ImageBase from the PE header.
+  uint64_t readPreferredBase() const;
+
+  /// Scan I-Start events to find the runtime load address (ASLR).
   void parseImageLoadEvents(StringRef Dump);
 
-  /// Second pass: parse SampledProfile and LBR branch events from xperf dump.
+  /// Parse xperf dump text: SampledProfile events and LBR branch records.
   Error parseXperfOutput();
 
-  /// Parse ETWAnalyzer -dump LBR -csv output.  This is the best quality
-  /// LBR data source -- ETWAnalyzer handles all ETL complexity and gives
-  /// pre-parsed branch records with from/to addresses and misprediction flags.
+  /// Parse ETWAnalyzer -dump LBR -csv output.
   Error parseETWAnalyzerCSV();
 
-  /// Record a branch from absolute address From to To with the given counts.
-  /// Resolves addresses to BinaryFunctions via BinaryContext, converts to
-  /// function-relative offsets, and updates NamesToBranches -- same logic as
-  /// DataAggregator::doBranch().
+  /// Record a branch from absolute address From to To.  Resolves to
+  /// function-relative offsets and updates NamesToBranches.
   bool recordBranchEvent(uint64_t From, uint64_t To, uint64_t Count,
                          uint64_t Mispreds);
 
-  /// Write the aggregated profile to the output fdata file.  Uses the same
-  /// format as DataAggregator::writeAggregatedFile().
   std::error_code writeAggregatedFile(StringRef OutputFilename) const;
 
-  /// Per-thread last instruction pointer, used to infer branches from
-  /// consecutive samples (basic mode, same as perf2bolt without LBR).
+  /// Per-thread last IP, used to infer edges from consecutive samples.
   std::map<uint64_t, uint64_t> LastIPPerThread;
 
-  /// ASLR offset: ActualLoadAddress - PreferredImageBase.
-  /// Added to zero when ASLR is not detected, subtracted from sample IPs
-  /// to convert runtime addresses to preferred addresses that match
-  /// BinaryContext's function map.
+  /// Runtime load address minus preferred ImageBase.
   int64_t ASLROffset{0};
 
   uint64_t TotalEvents{0};
