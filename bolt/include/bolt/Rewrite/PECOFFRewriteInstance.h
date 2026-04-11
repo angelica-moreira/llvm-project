@@ -36,6 +36,7 @@ class ProfileReaderBase;
 
 /// Parsed SEH unwind information for a single function.
 struct SEHUnwindInfo {
+  uint32_t EndRVA = 0;
   uint8_t Version = 0;
   uint8_t Flags = 0;
   uint8_t PrologSize = 0;
@@ -60,8 +61,10 @@ class PECOFFRewriteInstance {
 
   std::unique_ptr<ToolOutputFile> Out;
 
+  /// Cached PE ImageBase, read once during construction.
+  uint64_t ImageBase = 0;
+
   /// Functions whose basic block layout was changed by optimization passes.
-  /// Only these functions get their bytes replaced in the output binary.
   DenseSet<uint64_t> ModifiedFunctions;
 
   /// Address translation for rewritten functions: maps old instruction

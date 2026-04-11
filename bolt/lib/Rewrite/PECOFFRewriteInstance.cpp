@@ -69,6 +69,11 @@ struct RuntimeFunction {
   support::ulittle32_t UnwindInfoAddress;
 };
 
+// x86-64 unwind info flags from UNWIND_INFO.Flags.
+constexpr uint8_t UNW_FLAG_EHANDLER = 0x01;
+constexpr uint8_t UNW_FLAG_UHANDLER = 0x02;
+constexpr uint8_t UNW_FLAG_CHAININFO = 0x04;
+
 Expected<std::unique_ptr<PECOFFRewriteInstance>>
 PECOFFRewriteInstance::create(object::COFFObjectFile *InputFile,
                               StringRef ToolPath) {
@@ -110,6 +115,8 @@ PECOFFRewriteInstance::PECOFFRewriteInstance(object::COFFObjectFile *InputFile,
   BC->initializeTarget(std::unique_ptr<MCPlusBuilder>(
       createMCPlusBuilder(BC->TheTriple->getArch(), BC->MIA.get(),
                           BC->MII.get(), BC->MRI.get(), BC->STI.get())));
+
+  ImageBase = InputFile->getImageBase();
 }
 
 PECOFFRewriteInstance::~PECOFFRewriteInstance() {}
@@ -289,6 +296,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
       continue;
 
     SEHUnwindInfo Info;
+    Info.EndRVA = EndRVA;
 
     // Parse UNWIND_INFO from .xdata if available
     if (!XDataContents.empty() && UnwindRVA >= XDataRVA) {
@@ -317,11 +325,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
         if (CountOfCodes % 2 != 0)
           HandlerDataOffset += 2;
 
-        // Check for exception handler
-        const uint8_t UNW_FLAG_EHANDLER = 0x01;
-        const uint8_t UNW_FLAG_UHANDLER = 0x02;
-        const uint8_t UNW_FLAG_CHAININFO = 0x04;
-
+        // Check for exception handler or chained info.
         if (Info.Flags & UNW_FLAG_CHAININFO) {
           Info.IsChained = true;
           // Chained RUNTIME_FUNCTION follows the unwind codes
@@ -363,10 +367,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 }
 
 void PECOFFRewriteInstance::discoverFileObjects() {
-  uint64_t ImageBase = InputFile->getImageBase();
 
-  // Build a symbol name map from the COFF symbol table
-  StringMap<uint64_t> SymbolAddresses;
+  // Build address-to-name map from the COFF symbol table.
   std::map<uint64_t, StringRef> AddressToName;
 
   for (const object::SymbolRef &Symbol : InputFile->symbols()) {
@@ -391,65 +393,25 @@ void PECOFFRewriteInstance::discoverFileObjects() {
     AddressToName[*AddressOrErr] = *NameOrErr;
   }
 
-  // Find .pdata section to enumerate functions
-  const object::coff_section *PDataSec = nullptr;
-  for (const object::SectionRef &Section : InputFile->sections()) {
-    Expected<StringRef> NameOrErr = Section.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-    if (*NameOrErr == ".pdata")
-      PDataSec = InputFile->getCOFFSection(Section);
-  }
-
-  if (!PDataSec) {
-    outs() << "BOLT-WARNING: no .pdata section, cannot discover functions\n";
-    return;
-  }
-
-  ArrayRef<uint8_t> PDataContents;
-  if (Error E = InputFile->getSectionContents(PDataSec, PDataContents)) {
-    consumeError(std::move(E));
-    return;
-  }
-
-  size_t NumEntries = PDataContents.size() / sizeof(RuntimeFunction);
-  auto *Entries =
-      reinterpret_cast<const RuntimeFunction *>(PDataContents.data());
-
+  // Enumerate functions from pre-parsed SEH data (populated by
+  // readExceptionHandling) instead of re-scanning .pdata raw bytes.
   uint64_t FuncsCreated = 0;
   uint64_t FuncsSkippedHandler = 0;
 
-  for (size_t I = 0; I < NumEntries; ++I) {
-    uint32_t BeginRVA = Entries[I].BeginAddress;
-    uint32_t EndRVA = Entries[I].EndAddress;
-
-    if (BeginRVA == 0 && EndRVA == 0)
-      continue;
-
-    // Skip chained entries (they're part of another function)
-    auto SEHIt = FunctionSEHInfo.find(BeginRVA);
-    if (SEHIt != FunctionSEHInfo.end() && SEHIt->second.IsChained)
+  for (const auto &[BeginRVA, Info] : FunctionSEHInfo) {
+    if (Info.IsChained)
       continue;
 
     uint64_t Address = ImageBase + BeginRVA;
-    uint64_t Size = EndRVA - BeginRVA;
+    uint64_t Size = Info.EndRVA - BeginRVA;
 
     if (Size == 0)
       continue;
 
-    // Find the section containing this function
     ErrorOr<BinarySection &> Section = BC->getSectionForAddress(Address);
     if (!Section)
       continue;
 
-    // Check if function has an exception handler
-    bool HasHandler = false;
-    if (SEHIt != FunctionSEHInfo.end())
-      HasHandler = SEHIt->second.HasExceptionHandler;
-
-    // Generate function name from symbol table or address
     std::string FuncName;
     auto NameIt = AddressToName.find(Address);
     if (NameIt != AddressToName.end())
@@ -463,10 +425,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
       continue;
 
     BF->setMaxSize(Size);
-    // In-place patching: output address == input address.
     BF->setOutputAddress(BF->getAddress());
 
-    if (HasHandler) {
+    if (Info.HasExceptionHandler) {
       BF->setSimple(false);
       ++FuncsSkippedHandler;
     }
@@ -560,7 +521,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
     if (!BF.hasCFG() || !BF.isSimple())
       continue;
 
-    uint64_t FuncRVA = BF.getAddress() - InputFile->getImageBase();
+    uint64_t FuncRVA = BF.getAddress() - ImageBase;
     auto SEHIt = FunctionSEHInfo.find(FuncRVA);
     if (SEHIt == FunctionSEHInfo.end())
       continue;
@@ -701,9 +662,7 @@ void PECOFFRewriteInstance::rewriteFile() {
   // bodies below, leaving headers, imports, relocations etc. untouched.
   OS << InputFile->getData();
 
-  // We need to translate virtual addresses to file offsets.  PE sections have
-  // a VirtualAddress and a PointerToRawData that together define the mapping.
-  uint64_t ImageBase = InputFile->getImageBase();
+  // Translate virtual addresses to file offsets for pwrite.
   struct SectionLayout {
     uint32_t VA;
     uint32_t Size;
@@ -939,7 +898,7 @@ void PECOFFRewriteInstance::run() {
     identityRewriteFile();
     if (hasCodeViewDebugInfo(InputFile))
       PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                              *BC, InputFile->getImageBase(),
+                              *BC, ImageBase,
                               ModifiedFunctions, FunctionOffsetMaps);
     return;
   }
@@ -1040,7 +999,7 @@ void PECOFFRewriteInstance::run() {
 
   if (hasCodeViewDebugInfo(InputFile))
     PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
-                            InputFile->getImageBase(), ModifiedFunctions,
+                            ImageBase, ModifiedFunctions,
                             FunctionOffsetMaps);
 }
 
