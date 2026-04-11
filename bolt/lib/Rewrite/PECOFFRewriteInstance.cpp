@@ -1155,23 +1155,23 @@ void PECOFFRewriteInstance::run() {
       exit(1);
     }
 
-    // Control Flow Guard maintains a bitmap of valid indirect call
-    // targets at specific RVAs.  After block reordering, internal branch
-    // targets within a function may move to different offsets.  While
-    // function entry points (the primary CFG targets) remain at their
-    // original RVAs, any CFG-protected indirect call whose target was a
-    // non-entry BB will fail validation and the OS will terminate the
-    // process.  This is a hard error because the failure is silent and
-    // intermittent — it depends on which indirect calls the rewritten
-    // code exercises at runtime.
+    // Control Flow Guard: the GFids table lists valid indirect call targets,
+    // which are function entry RVAs.  With in-place patching, function
+    // entries don't move — only code inside the function is reordered.
+    // The GFids bitmap remains valid because all entry points stay at
+    // their original addresses.
+    //
+    // Intra-function indirect branches (switch/jump tables) are not
+    // protected by CFG — they use the function's own jump table, which
+    // BOLT rewrites with correct target offsets via JTS_MOVE.
+    //
+    // We allow CFG Guard binaries but warn in case a future scenario
+    // involves address-taken labels or other non-entry CFG targets.
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
-      errs() << "BOLT-ERROR: binary has Control Flow Guard enabled "
-                "(/GUARD:CF). Block reordering invalidates CFG target "
-                "RVAs for non-entry indirect call targets, causing the "
-                "OS to terminate the process. Recompile and link without "
-                "/GUARD:CF, or use 'link /GUARD:NO'.\n";
-      exit(1);
+      outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF). "
+                "Function entry RVAs are preserved by in-place patching; "
+                "the GFids table remains valid.\n";
     }
 
     // Code integrity enforcement (IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)
