@@ -156,6 +156,15 @@ void PECOFFRewriteInstance::processProfileData() {
     report_error("cannot read profile", std::move(E));
 }
 
+/// Check whether the input PE has a CodeView debug directory entry,
+/// which indicates a PDB is associated with this binary.
+static bool hasCodeViewDebugInfo(const object::COFFObjectFile *File) {
+  return llvm::any_of(File->debug_directories(),
+                      [](const object::debug_directory &D) {
+                        return D.Type == COFF::IMAGE_DEBUG_TYPE_CODEVIEW;
+                      });
+}
+
 void PECOFFRewriteInstance::adjustCommandLineOptions() {
   opts::ForcePatch = true;
 
@@ -1236,9 +1245,10 @@ void PECOFFRewriteInstance::run() {
   if (!ProfileReader) {
     outs() << "BOLT-INFO: no profile data, producing identity copy\n";
     identityRewriteFile();
-    PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
-                            InputFile->getImageBase(), ModifiedFunctions,
-                            FunctionOffsetMaps);
+    if (hasCodeViewDebugInfo(InputFile))
+      PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
+                              *BC, InputFile->getImageBase(),
+                              ModifiedFunctions, FunctionOffsetMaps);
     return;
   }
 
@@ -1336,10 +1346,10 @@ void PECOFFRewriteInstance::run() {
   emitAndLink();
   rewriteFile();
 
-  // Update PDB debug info to match the new binary layout.
-  PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
-                          InputFile->getImageBase(), ModifiedFunctions,
-                          FunctionOffsetMaps);
+  if (hasCodeViewDebugInfo(InputFile))
+    PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
+                            InputFile->getImageBase(), ModifiedFunctions,
+                            FunctionOffsetMaps);
 }
 
 } // namespace bolt
