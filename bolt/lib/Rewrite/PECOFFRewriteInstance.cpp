@@ -751,9 +751,13 @@ void PECOFFRewriteInstance::emitAndLink() {
   // writes JT entries with relocations pointing to BB symbols.  We resolve
   // them the same way as code relocations and store the result so
   // rewriteFile() can pwrite them back.
-  // Compute the VA for each .rdata section independently by finding
-  // a symbol defined in it, to avoid collisions if multiple .rdata
-  // sections exist.
+
+  // Build a JT address to owning function map for the owner lookup below.
+  DenseMap<uint64_t, uint64_t> JTToOwner;
+  for (const auto &BFI : BC->getBinaryFunctions())
+    for (const auto &JTKV : BFI.second.jumpTables())
+      JTToOwner[JTKV.second->getAddress()] = BFI.second.getAddress();
+
   for (const auto &Sec : Obj->sections()) {
     Expected<StringRef> NameOrErr = Sec.getName();
     if (!NameOrErr) {
@@ -818,16 +822,7 @@ void PECOFFRewriteInstance::emitAndLink() {
       applyCOFFRelocation(Data, SectionVA, Rel, SymVA);
     }
 
-    // Find the owning function.  Build a lookup map on first use to avoid
-    // scanning all functions × all JTs for every .rdata section (O(n²)).
     uint64_t OwnerVA = 0;
-    // Lazily built: JT VA → owning function VA.
-    static DenseMap<uint64_t, uint64_t> JTToOwner;
-    if (JTToOwner.empty()) {
-      for (const auto &BFI : BC->getBinaryFunctions())
-        for (const auto &JTKV : BFI.second.jumpTables())
-          JTToOwner[JTKV.second->getAddress()] = BFI.second.getAddress();
-    }
     auto JTIt = JTToOwner.find(SectionVA);
     if (JTIt != JTToOwner.end())
       OwnerVA = JTIt->second;
