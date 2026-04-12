@@ -32,6 +32,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -225,8 +226,6 @@ uint64_t ETWDataAggregator::readPreferredBase() const {
 void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
   uint64_t PreferredBase = readPreferredBase();
   if (PreferredBase == 0 && !BC->getBinaryFunctions().empty()) {
-    // Derive from the first function address with a 1MB mask.  This is
-    // imprecise but handles binaries with large headers or /MERGE sections.
     PreferredBase =
         BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFFULL;
     errs() << "ETW2BOLT: warning: cannot read PE ImageBase; derived 0x"
@@ -240,16 +239,19 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
     auto [Line, Rest] = Dump.split('\n');
     Dump = Rest;
 
-    if (!Line.ltrim().starts_with("I-Start"))
+    // Handle \r\n line endings (common in Windows tool output).
+    StringRef Trimmed = Line.ltrim();
+    if (Trimmed.ends_with("\r"))
+      Trimmed = Trimmed.drop_back(1);
+
+    if (!Trimmed.starts_with("I-Start"))
       continue;
 
     SmallVector<StringRef, 16> Parts;
-    Line.split(Parts, ',');
+    Trimmed.split(Parts, ',');
     if (Parts.size() < 4)
       continue;
 
-    // Field 2: "processname.exe (PID)".  Match as a delimited token to
-    // avoid "z3.exe" matching "libz3.exe".
     StringRef ProcField = Parts[2].trim();
     if (!ProcField.starts_with_insensitive(BinaryName))
       continue;
@@ -288,7 +290,26 @@ Error ETWDataAggregator::parseXperfOutput() {
   uint64_t BufSize = (*BufOrErr)->getBufferSize();
   outs() << "ETW2BOLT: parsing " << (BufSize / 1024) << " KB xperf dump...\n";
 
-  StringRef Dump = (*BufOrErr)->getBuffer();
+  StringRef RawBuf = (*BufOrErr)->getBuffer();
+
+  // xperf on Windows produces UTF-16 LE output.  Detect the BOM and convert
+  // to UTF-8 so the line parser works with normal ASCII comparisons.
+  std::string UTF8Storage;
+  StringRef Dump;
+  if (RawBuf.size() >= 2 &&
+      static_cast<uint8_t>(RawBuf[0]) == 0xFF &&
+      static_cast<uint8_t>(RawBuf[1]) == 0xFE) {
+    outs() << "ETW2BOLT: converting UTF-16 LE dump to UTF-8...\n";
+    ArrayRef<char> Src(RawBuf.data() + 2, RawBuf.size() - 2);
+    if (!convertUTF16ToUTF8String(Src, UTF8Storage))
+      return createStringError(std::errc::illegal_byte_sequence,
+                               "failed to convert UTF-16 xperf dump to UTF-8");
+    outs() << "ETW2BOLT: converted to " << (UTF8Storage.size() / 1024)
+           << " KB UTF-8\n";
+    Dump = StringRef(UTF8Storage);
+  } else {
+    Dump = RawBuf;
+  }
 
   parseImageLoadEvents(Dump);
 
@@ -316,6 +337,8 @@ Error ETWDataAggregator::parseXperfOutput() {
              << " LBR\r";
 
     StringRef Trimmed = Line.ltrim();
+    if (Trimmed.ends_with("\r"))
+      Trimmed = Trimmed.drop_back(1);
 
     // LBR branch records.
     if (Trimmed.starts_with("BranchTrace") ||
@@ -323,7 +346,7 @@ Error ETWDataAggregator::parseXperfOutput() {
       ++TotalEvents;
 
       SmallVector<StringRef, 12> Parts;
-      Line.split(Parts, ',');
+      Trimmed.split(Parts, ',');
       if (Parts.size() < 7)
         continue;
 
@@ -350,18 +373,37 @@ Error ETWDataAggregator::parseXperfOutput() {
     ++TotalEvents;
 
     SmallVector<StringRef, 12> Parts;
-    Line.split(Parts, ',');
+    Trimmed.split(Parts, ',');
     if (Parts.size() < 6)
       continue;
 
     uint64_t ThreadID = 0;
     Parts[3].trim().getAsInteger(0, ThreadID);
 
+    // Column 4 is the raw interrupted IP.  When the sample hits in the
+    // kernel (e.g. during a syscall), this is a kernel address that won't
+    // match any function in the binary.  The -stackwalk columns (6+)
+    // contain "module!0xaddr" tokens; scan them for a user-mode IP that
+    // belongs to our binary.
     uint64_t IP = adjustForASLR(parseHex(Parts[4]), ASLROffset);
+    if (!BC->getBinaryFunctionContainingAddress(IP, false, true)) {
+      // Try stack walk columns for a matching user-mode address.
+      IP = 0;
+      StringRef BinaryName = llvm::sys::path::filename(BC->getFilename());
+      for (size_t I = 6; I < Parts.size(); ++I) {
+        StringRef Token = Parts[I].trim();
+        if (!Token.starts_with_insensitive(BinaryName))
+          continue;
+        size_t Bang = Token.find('!');
+        if (Bang == StringRef::npos)
+          continue;
+        IP = adjustForASLR(parseHex(Token.substr(Bang + 1)), ASLROffset);
+        if (IP && BC->getBinaryFunctionContainingAddress(IP, false, true))
+          break;
+        IP = 0;
+      }
+    }
     if (IP == 0)
-      continue;
-
-    if (!BC->getBinaryFunctionContainingAddress(IP, false, true))
       continue;
 
     ++MatchedSamples;
