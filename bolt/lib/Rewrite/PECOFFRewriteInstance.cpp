@@ -554,13 +554,9 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   BinaryFunctionPassManager Manager(*BC);
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
 
-  // Reclaim bytes from redundant instruction encodings before reordering.
-  // This offsets the extra jumps that block reordering introduces.
   Manager.registerPass(
       std::make_unique<ShortenInstructions>(opts::NeverPrint));
 
-  // Remove inter-block alignment NOPs that are no longer useful after
-  // reordering.  Prolog NOPs are excluded (annotation cleared above).
   Manager.registerPass(std::make_unique<RemoveNops>(opts::NeverPrint));
 
   Manager.registerPass(
@@ -976,11 +972,7 @@ void PECOFFRewriteInstance::run() {
     }
   }
 
-  // Skip emission for functions whose layout did not change.  The MC
-  // assembler may re-encode unchanged functions with slightly different
-  // (sometimes larger) byte sequences, causing false size overflows.
-  // Limiting emission to modified functions avoids this and reduces the
-  // emitted object to only what we intend to patch back.
+  // Skip emission for functions whose layout did not change.
   uint64_t SkippedEmit = 0;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
@@ -991,6 +983,34 @@ void PECOFFRewriteInstance::run() {
       ++SkippedEmit;
     }
   }
+
+  // Exact size check for modified functions, mirroring ELF's
+  // CheckLargeFunctions pass.  Uses calculateEmittedSize() (trial MC
+  // emission) which accounts for instruction re-encoding.  Functions that
+  // exceed their allocation are marked non-simple to prevent emission.
+  uint64_t LargeFuncCount = 0;
+  for (uint64_t FuncVA : ModifiedFunctions) {
+    auto It = BC->getBinaryFunctions().find(FuncVA);
+    if (It == BC->getBinaryFunctions().end())
+      continue;
+    BinaryFunction &BF = It->second;
+    if (!BF.isSimple())
+      continue;
+    uint64_t HotSize, ColdSize;
+    std::tie(HotSize, ColdSize) =
+        BC->calculateEmittedSize(BF, /*FixBranches=*/false);
+    if (HotSize > BF.getMaxSize()) {
+      if (opts::Verbosity >= 1)
+        outs() << "BOLT-INFO: " << BF << " emitted size " << HotSize
+               << " exceeds allocation " << BF.getMaxSize()
+               << ", skipping\n";
+      BF.setSimple(false);
+      ++LargeFuncCount;
+    }
+  }
+  if (LargeFuncCount)
+    outs() << "BOLT-INFO: " << LargeFuncCount
+           << " functions exceed original size (skipped)\n";
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipped emission for " << SkippedEmit
                     << " unmodified functions\n");
 
