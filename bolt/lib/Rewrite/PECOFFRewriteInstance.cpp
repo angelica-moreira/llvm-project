@@ -658,7 +658,8 @@ void PECOFFRewriteInstance::rewriteFile() {
   // bodies below, leaving headers, imports, relocations etc. untouched.
   OS << InputFile->getData();
 
-  // Translate virtual addresses to file offsets for pwrite.
+  const auto *PE = InputFile->getPE32PlusHeader();
+
   struct SectionLayout {
     uint32_t VA;
     uint32_t Size;
@@ -681,72 +682,165 @@ void PECOFFRewriteInstance::rewriteFile() {
     return std::nullopt;
   };
 
-  uint64_t RewrittenCount = 0;
+  uint64_t InPlaceCount = 0;
+  uint64_t OOPWritten = 0;
   uint64_t OverflowCount = 0;
 
-  for (auto &BFI : BC->getBinaryFunctions()) {
-    BinaryFunction &Function = BFI.second;
-    if (!Function.isSimple())
-      continue;
-    if (!Function.isEmitted())
-      continue;
+  uint32_t NewSecRawPtr = 0;
+  uint32_t NewSecVA = 0;
+  if (PE) {
+    uint32_t LastSecRawEnd = 0;
+    uint32_t LastEndVA = 0;
+    for (const object::SectionRef &Sec : InputFile->sections()) {
+      const auto *CS = InputFile->getCOFFSection(Sec);
+      uint32_t EndRaw = CS->PointerToRawData + CS->SizeOfRawData;
+      uint32_t EndVA = CS->VirtualAddress + CS->VirtualSize;
+      if (EndRaw > LastSecRawEnd)
+        LastSecRawEnd = EndRaw;
+      if (EndVA > LastEndVA)
+        LastEndVA = EndVA;
+    }
+    NewSecRawPtr = alignTo(LastSecRawEnd, PE->FileAlignment);
+    NewSecVA = alignTo(LastEndVA, PE->SectionAlignment);
+  }
 
+  // Write all emitted functions.  Regular functions in the main map
+  // plus injected functions (patches created by createInstructionPatch).
+  auto writeFunction = [&](BinaryFunction &Function) {
+    if (!Function.isEmitted() || Function.getImageSize() == 0)
+      return;
+
+    uint64_t OutputAddr = Function.getOutputAddress();
+    uint64_t OrigAddr = Function.getAddress();
     uint64_t EmittedSize = Function.getImageSize();
-    uint64_t OriginalSize = Function.getMaxSize();
+    uint32_t OutputRVA = static_cast<uint32_t>(OutputAddr - ImageBase);
 
-    if (EmittedSize > OriginalSize) {
-      if (opts::Verbosity >= 1)
-        outs() << "BOLT: overflow \"" << Function << "\" emitted="
-               << EmittedSize << " original=" << OriginalSize
-               << " (+" << (EmittedSize - OriginalSize) << " bytes)\n";
-      ++OverflowCount;
-      continue;
+    std::optional<uint64_t> FileOff;
+    if (OutputRVA >= NewSecVA && NewSecRawPtr > 0)
+      FileOff = NewSecRawPtr + (OutputRVA - NewSecVA);
+    else
+      FileOff = VAToFileOffset(OutputAddr);
+
+    if (!FileOff)
+      return;
+
+    // For non-patch regular functions, check ModifiedFunctions.
+    if (!Function.isPatch() && OutputAddr == OrigAddr) {
+      if (!ModifiedFunctions.count(OrigAddr))
+        return;
+      if (EmittedSize > Function.getMaxSize()) {
+        ++OverflowCount;
+        return;
+      }
     }
 
-    auto FileOff = VAToFileOffset(Function.getAddress());
-    if (!FileOff) {
-      if (opts::Verbosity >= 1)
-        outs() << "BOLT-WARNING: cannot map address 0x"
-               << Twine::utohexstr(Function.getAddress())
-               << " to file offset for \"" << Function << "\", skipping\n";
-      continue;
-    }
+    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()),
+              EmittedSize, *FileOff);
 
-    // Compare emitted bytes with the original.  The MC assembler often
-    // produces different encodings (e.g. dropping redundant REX prefixes)
-    // even when the optimization passes did not change the layout.  Writing
-    // those re-encoded bytes back would corrupt the UNWIND_INFO byte offsets
-    // in .xdata and the base relocation entries in .reloc, so we only patch
-    // functions whose layout was actually modified by the passes.
-    if (!ModifiedFunctions.count(Function.getAddress())) {
-      continue;
-    }
-
-    if (opts::Verbosity >= 2)
-      outs() << "BOLT: rewriting \"" << Function << "\""
-             << " size=" << EmittedSize << "/" << OriginalSize
-             << " at file offset 0x" << Twine::utohexstr(*FileOff) << "\n";
-
-    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()), EmittedSize,
-              *FileOff);
-
-    // Fill leftover space with int3 so stale code traps cleanly.
-    if (EmittedSize < OriginalSize) {
-      std::vector<uint8_t> Padding(OriginalSize - EmittedSize, 0xCC);
+    // Pad in-place functions.
+    if (!Function.isPatch() && OutputAddr == OrigAddr &&
+        EmittedSize < Function.getMaxSize()) {
+      std::vector<uint8_t> Padding(Function.getMaxSize() - EmittedSize,
+                                   0xCC);
       OS.pwrite(reinterpret_cast<char *>(Padding.data()), Padding.size(),
                 *FileOff + EmittedSize);
     }
 
-    ++RewrittenCount;
+    if (Function.isPatch())
+      return;
+    if (OutputAddr == OrigAddr)
+      ++InPlaceCount;
+    else
+      ++OOPWritten;
+  };
+
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &BF = BFI.second;
+    if (BF.isSimple())
+      writeFunction(BF);
+  }
+  for (BinaryFunction *BF : BC->getInjectedBinaryFunctions())
+    writeFunction(*BF);
+
+  // Write .bolt section header and update PE headers if any OOP functions.
+  if (OOPWritten > 0 && PE) {
+    uint32_t NumSections = InputFile->getNumberOfSections();
+    const auto *COFFHdr = InputFile->getCOFFHeader();
+    StringRef FileData = InputFile->getData();
+    uint32_t PEOff = support::endian::read32le(FileData.data() + 0x3C);
+    uint32_t CoffHdrOff = PEOff + 4;
+    uint32_t OptHdrOff = CoffHdrOff + sizeof(object::coff_file_header);
+    uint32_t SecTableOff = OptHdrOff + COFFHdr->SizeOfOptionalHeader;
+    uint32_t SecTableEnd = SecTableOff + NumSections * 40;
+
+    if (SecTableEnd + 40 <= PE->SizeOfHeaders) {
+      // Compute .bolt section extent from what was written.
+      uint32_t MaxBoltEnd = 0;
+      for (BinaryFunction *Function : BC->getAllBinaryFunctions()) {
+        if (!Function->isEmitted() || Function->getImageSize() == 0)
+          continue;
+        uint32_t ORVA =
+            static_cast<uint32_t>(Function->getOutputAddress() - ImageBase);
+        if (ORVA >= NewSecVA) {
+          uint32_t End = (ORVA - NewSecVA) + Function->getImageSize();
+          if (End > MaxBoltEnd)
+            MaxBoltEnd = End;
+        }
+      }
+
+      uint32_t NewSecVSize = MaxBoltEnd;
+      uint32_t NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
+
+      // Pad to FileAlignment.
+      if (NewSecRawSize > NewSecVSize) {
+        std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0xCC);
+        OS.seek(NewSecRawPtr + NewSecVSize);
+        OS.write(reinterpret_cast<char *>(Pad.data()), Pad.size());
+      }
+
+      // PE header updates.
+      uint16_t NewNumSections = NumSections + 1;
+      OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2,
+                CoffHdrOff + 2);
+      uint32_t NewSizeOfImage =
+          alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
+      uint32_t NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
+      OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
+                OptHdrOff + 4);
+      OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
+                OptHdrOff + 56);
+
+      // Section header.
+      object::coff_section NewSec = {};
+      std::memcpy(NewSec.Name, ".bolt\0\0\0", 8);
+      NewSec.VirtualSize = NewSecVSize;
+      NewSec.VirtualAddress = NewSecVA;
+      NewSec.SizeOfRawData = NewSecRawSize;
+      NewSec.PointerToRawData = NewSecRawPtr;
+      NewSec.Characteristics =
+          COFF::IMAGE_SCN_CNT_CODE |
+          COFF::IMAGE_SCN_MEM_EXECUTE |
+          COFF::IMAGE_SCN_MEM_READ;
+      OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
+                SecTableEnd);
+
+      outs() << "BOLT-INFO: added .bolt section at VA 0x"
+             << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
+             << " functions)\n";
+    }
   }
 
   NumFuncsOverflow = OverflowCount;
   Out->keep();
 
-  outs() << "BOLT-INFO: " << RewrittenCount << " functions rewritten\n";
+  outs() << "BOLT-INFO: " << InPlaceCount
+         << " functions rewritten in-place\n";
+  if (OOPWritten)
+    outs() << "BOLT-INFO: " << OOPWritten
+           << " functions moved to .bolt section\n";
   if (OverflowCount)
     outs() << "BOLT-INFO: " << OverflowCount
-           << " functions skipped (size overflow)\n";
+           << " functions could not be optimized\n";
   outs() << "BOLT-INFO: output binary: " << opts::OutputFilename << "\n";
 }
 
@@ -984,11 +1078,44 @@ void PECOFFRewriteInstance::run() {
     }
   }
 
-  // Exact size check for modified functions, mirroring ELF's
-  // CheckLargeFunctions pass.  Uses calculateEmittedSize() (trial MC
-  // emission) which accounts for instruction re-encoding.  Functions that
-  // exceed their allocation are marked non-simple to prevent emission.
-  uint64_t LargeFuncCount = 0;
+  // Handle oversized functions using the same approach as ELF's
+  // PatchEntries pass.  For each function that exceeds its original
+  // allocation:
+  //   1. Assign a new output address in a .bolt section
+  //   2. Create a patch function at the original address containing a
+  //      JMP to the function's symbol
+  //   3. Both go through emitAndLink() — JITLink resolves the JMP
+  //      target via symbol reference, not raw arithmetic
+  //
+  // This is robust because createInstructionPatch() and
+  // createLongTailCall() are the same BOLT APIs used on ELF, where
+  // they handle all edge cases (secondary entry points, symbol
+  // resolution, proper code section assignment).
+  const auto *PE = InputFile->getPE32PlusHeader();
+  uint32_t BoltSecVA = 0;
+  if (PE) {
+    uint32_t SecAlign = PE->SectionAlignment;
+    uint32_t LastEndVA = 0;
+    for (const object::SectionRef &Sec : InputFile->sections()) {
+      const auto *CS = InputFile->getCOFFSection(Sec);
+      uint32_t End = CS->VirtualAddress + CS->VirtualSize;
+      if (End > LastEndVA)
+        LastEndVA = End;
+    }
+    BoltSecVA = alignTo(LastEndVA, SecAlign);
+  }
+
+  // Compute the JMP patch size once.
+  size_t PatchSize = 0;
+  {
+    InstructionListType Seq;
+    BC->MIB->createLongTailCall(Seq, BC->Ctx->createTempSymbol(),
+                                BC->Ctx.get());
+    PatchSize = BC->computeCodeSize(Seq.begin(), Seq.end());
+  }
+
+  uint32_t BoltCurOff = 0;
+  uint64_t OOPCount = 0;
   for (uint64_t FuncVA : ModifiedFunctions) {
     auto It = BC->getBinaryFunctions().find(FuncVA);
     if (It == BC->getBinaryFunctions().end())
@@ -999,18 +1126,55 @@ void PECOFFRewriteInstance::run() {
     uint64_t HotSize, ColdSize;
     std::tie(HotSize, ColdSize) =
         BC->calculateEmittedSize(BF, /*FixBranches=*/false);
-    if (HotSize > BF.getMaxSize()) {
+    if (HotSize <= BF.getMaxSize())
+      continue;
+
+    // Check that the original function is large enough for the patch.
+    if (BF.getMaxSize() < PatchSize) {
       if (opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: " << BF << " emitted size " << HotSize
-               << " exceeds allocation " << BF.getMaxSize()
-               << ", skipping\n";
+        outs() << "BOLT-INFO: " << BF << " too small for patch ("
+               << BF.getMaxSize() << " < " << PatchSize << ")\n";
       BF.setSimple(false);
-      ++LargeFuncCount;
+      continue;
     }
+
+    // Assign new address in .bolt section.
+    BoltCurOff = alignTo(BoltCurOff, 16);
+    uint64_t NewVA = ImageBase + BoltSecVA + BoltCurOff;
+    BF.setOutputAddress(NewVA);
+    BoltCurOff += HotSize;
+
+    // Create a patch function at the original address, exactly like
+    // ELF's PatchEntries pass.  The patch contains a JMP to the
+    // function's symbol; JITLink resolves it during linking.
+    bool PatchOK = true;
+    BF.forEachEntryPoint([&](uint64_t Offset, const MCSymbol *Symbol) {
+      if (Offset + PatchSize > BF.getMaxSize()) {
+        PatchOK = false;
+        return false;
+      }
+      InstructionListType JmpSeq;
+      BC->MIB->createLongTailCall(JmpSeq, Symbol, BC->Ctx.get());
+      BC->createInstructionPatch(
+          BF.getAddress() + Offset, JmpSeq,
+          NameResolver::append(Symbol->getName(), ".org.0"));
+      return true;
+    });
+
+    if (!PatchOK) {
+      BF.setSimple(false);
+      continue;
+    }
+
+    ++OOPCount;
+    if (opts::Verbosity >= 1)
+      outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
+             << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
+             << " with entry patch\n";
   }
-  if (LargeFuncCount)
-    outs() << "BOLT-INFO: " << LargeFuncCount
-           << " functions exceed original size (skipped)\n";
+  if (OOPCount)
+    outs() << "BOLT-INFO: " << OOPCount
+           << " functions moved to .bolt section\n";
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipped emission for " << SkippedEmit
                     << " unmodified functions\n");
 
