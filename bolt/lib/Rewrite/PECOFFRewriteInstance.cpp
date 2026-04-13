@@ -501,6 +501,58 @@ void PECOFFRewriteInstance::buildFunctionsCFG() {
 }
 
 void PECOFFRewriteInstance::postProcessFunctions() {
+  // PE/COFF fix: detect basic blocks that fall through to the next function
+  // (cross-function fall-through).  MSVC splits logical functions across
+  // multiple RUNTIME_FUNCTION entries; the last block of one entry falls
+  // through to the first block of the next.  Without an explicit branch,
+  // FixupBranches would insert a RET, corrupting the control flow.
+  // Add an explicit tail-call JMP to the fall-through target so that block
+  // reordering and OOP emission preserve the original semantics.
+  uint64_t FTFixups = 0;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &Function = BFI.second;
+    if (!Function.hasCFG() || !Function.isSimple())
+      continue;
+
+    uint64_t FuncEnd = Function.getAddress() + Function.getMaxSize();
+    uint32_t FuncEndRVA = static_cast<uint32_t>(FuncEnd - ImageBase);
+
+    // Check if the fall-through target is a known function in .pdata
+    // (including chained entries that aren't registered as BinaryFunctions).
+    if (FunctionSEHInfo.find(FuncEndRVA) == FunctionSEHInfo.end())
+      continue;
+
+    // Find the block that originally ended at the function boundary.
+    // After disassembly (before reordering), blocks are in address order.
+    // Scan all blocks for one that lacks a terminator and has no
+    // successor — this is the block whose fall-through crosses into
+    // the next function.
+    for (BinaryBasicBlock &BB : Function) {
+      if (BB.empty())
+        continue;
+      // Skip blocks that already have a terminator.
+      const MCInst &Last = *BB.rbegin();
+      if (BC->MIB->isTerminator(Last) || BC->MIB->isReturn(Last))
+        continue;
+      // Skip blocks that have successors (fall-through within the function).
+      if (BB.succ_size() > 0)
+        continue;
+
+      // This block has no terminator and no successors — it was a
+      // cross-function fall-through.  Add a tail-call JMP to the
+      // next function.
+      MCSymbol *FTSym =
+          BC->getOrCreateGlobalSymbol(FuncEnd, "FUNCat0x");
+      MCInst JmpInst;
+      BC->MIB->createTailCall(JmpInst, FTSym, BC->Ctx.get());
+      BB.addInstruction(JmpInst);
+      ++FTFixups;
+    }
+  }
+  if (FTFixups)
+    outs() << "BOLT-INFO: added " << FTFixups
+           << " cross-function fall-through fixups\n";
+
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
     if (Function.empty())
@@ -827,6 +879,124 @@ void PECOFFRewriteInstance::rewriteFile() {
       outs() << "BOLT-INFO: added .bolt section at VA 0x"
              << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
              << " functions)\n";
+
+      // Add .pdata entries for OOP functions in the .bolt section.
+      // Without .pdata, the SEH unwinder cannot unwind through .bolt
+      // functions, causing stack corruption when C++ exceptions are thrown.
+      //
+      // The new entries go at the end of the existing .pdata section
+      // (they have the highest RVAs, maintaining sort order).  We also
+      // fix the original .pdata entries: the trampoline at the original
+      // address is only PatchSize bytes, so shrink EndRVA accordingly.
+      uint32_t ExcDirOff = OptHdrOff + 112 + 3 * 8; // Data directory #3
+      uint32_t ExcRVA =
+          support::endian::read32le(FileData.data() + ExcDirOff);
+      uint32_t ExcSize =
+          support::endian::read32le(FileData.data() + ExcDirOff + 4);
+      uint32_t NumPdataEntries = ExcSize / sizeof(RuntimeFunction);
+
+      // Find .pdata section file offset.
+      uint32_t PDataFileOff = 0;
+      uint32_t PDataSecRawSize = 0;
+      for (const object::SectionRef &Sec : InputFile->sections()) {
+        const auto *CS = InputFile->getCOFFSection(Sec);
+        if (ExcRVA >= CS->VirtualAddress &&
+            ExcRVA < CS->VirtualAddress + CS->VirtualSize) {
+          PDataFileOff =
+              CS->PointerToRawData + (ExcRVA - CS->VirtualAddress);
+          PDataSecRawSize = CS->SizeOfRawData;
+          break;
+        }
+      }
+
+      if (PDataFileOff > 0) {
+        uint32_t PDataEnd = PDataFileOff + ExcSize;
+        uint32_t SlackBytes = PDataSecRawSize - ExcSize;
+        const uint32_t PatchSize = 5; // JMP rel32
+
+        // Collect OOP functions and build new .pdata entries.
+        SmallVector<RuntimeFunction, 16> NewEntries;
+        for (auto &BFI : BC->getBinaryFunctions()) {
+          BinaryFunction &BF = BFI.second;
+          if (!BF.isEmitted() || BF.getImageSize() == 0)
+            continue;
+          uint64_t OutputAddr = BF.getOutputAddress();
+          uint64_t OrigAddr = BF.getAddress();
+          if (OutputAddr == OrigAddr)
+            continue; // in-place function
+          uint32_t OrigRVA =
+              static_cast<uint32_t>(OrigAddr - ImageBase);
+          uint32_t BoltRVA =
+              static_cast<uint32_t>(OutputAddr - ImageBase);
+
+          // Look up the original UNWIND_INFO RVA.
+          auto SEHIt = FunctionSEHInfo.find(OrigRVA);
+          if (SEHIt == FunctionSEHInfo.end())
+            continue;
+
+          // Find the original .pdata entry and read its UnwindInfoRVA.
+          // Binary search through the .pdata array.
+          uint32_t UnwindInfoRVA = 0;
+          auto *Entries = reinterpret_cast<const RuntimeFunction *>(
+              FileData.data() + PDataFileOff);
+          for (uint32_t J = 0; J < NumPdataEntries; ++J) {
+            if (Entries[J].BeginAddress == OrigRVA) {
+              UnwindInfoRVA = Entries[J].UnwindInfoAddress;
+              // Shrink the original entry to cover only the trampoline.
+              RuntimeFunction Patched;
+              Patched.BeginAddress = OrigRVA;
+              Patched.EndAddress = OrigRVA + PatchSize;
+              // Point to a trivial UNWIND_INFO (or zero, which makes it
+              // a leaf — trampoline has no prolog).  For safety, keep the
+              // original UnwindInfoAddress; the unwinder will apply prolog
+              // unwinds only if RIP is within PrologSize, and the
+              // trampoline JMP at offset 0 is before any unwind code.
+              Patched.UnwindInfoAddress = UnwindInfoRVA;
+              OS.pwrite(reinterpret_cast<char *>(&Patched),
+                        sizeof(RuntimeFunction),
+                        PDataFileOff + J * sizeof(RuntimeFunction));
+              break;
+            }
+          }
+
+          if (UnwindInfoRVA == 0)
+            continue;
+
+          // New .pdata entry for the .bolt copy.
+          RuntimeFunction NewEntry;
+          NewEntry.BeginAddress = BoltRVA;
+          NewEntry.EndAddress = BoltRVA + BF.getImageSize();
+          NewEntry.UnwindInfoAddress = UnwindInfoRVA;
+          NewEntries.push_back(NewEntry);
+        }
+
+        // Sort new entries by BeginAddress (they should already be sorted
+        // since .bolt layout is sequential, but be safe).
+        llvm::sort(NewEntries, [](const RuntimeFunction &A,
+                                  const RuntimeFunction &B) {
+          return A.BeginAddress < B.BeginAddress;
+        });
+
+        // Write new entries at the end of .pdata if they fit.
+        uint32_t NewBytes = NewEntries.size() * sizeof(RuntimeFunction);
+        if (NewBytes <= SlackBytes) {
+          OS.pwrite(reinterpret_cast<char *>(NewEntries.data()), NewBytes,
+                    PDataEnd);
+
+          // Update exception directory size.
+          uint32_t NewExcSize =
+              ExcSize + NewEntries.size() * sizeof(RuntimeFunction);
+          OS.pwrite(reinterpret_cast<char *>(&NewExcSize), 4,
+                    ExcDirOff + 4);
+
+          outs() << "BOLT-INFO: added " << NewEntries.size()
+                 << " .pdata entries for .bolt functions\n";
+        } else {
+          outs() << "BOLT-WARNING: not enough .pdata slack for "
+                 << NewEntries.size() << " entries (need " << NewBytes
+                 << ", have " << SlackBytes << " bytes)\n";
+        }
+      }
     }
   }
 
@@ -1189,3 +1359,4 @@ void PECOFFRewriteInstance::run() {
 
 } // namespace bolt
 } // namespace llvm
+
