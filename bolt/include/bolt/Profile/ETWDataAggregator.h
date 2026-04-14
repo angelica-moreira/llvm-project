@@ -69,6 +69,9 @@ private:
   /// Scan I-Start events to find the runtime load address (ASLR).
   void parseImageLoadEvents(StringRef Dump);
 
+  /// Infer ASLR offset from stack walk frames when no I-Start is available.
+  void detectASLRFromSamples(StringRef Dump);
+
   /// Parse xperf dump text: SampledProfile events and LBR branch records.
   Error parseXperfOutput();
 

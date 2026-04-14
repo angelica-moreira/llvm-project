@@ -280,6 +280,59 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
          << ", assuming no ASLR\n";
 }
 
+/// Infer the ASLR offset by probing stack walk frames in SampledProfile
+/// events.  Each frame has the form "binary.exe!0xRuntimeAddr".  We
+/// subtract candidate offsets (aligned to 64KB, the ASLR granularity)
+/// until the adjusted address resolves to a known function.
+void ETWDataAggregator::detectASLRFromSamples(StringRef Dump) {
+  uint64_t PreferredBase = readPreferredBase();
+  if (PreferredBase == 0)
+    PreferredBase =
+        BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFFULL;
+
+  StringRef BinaryName = llvm::sys::path::filename(BC->getFilename());
+
+  while (!Dump.empty()) {
+    auto [Line, Rest] = Dump.split('\n');
+    Dump = Rest;
+
+    StringRef Trimmed = Line.ltrim();
+    if (!Trimmed.starts_with("SampledProfile"))
+      continue;
+
+    SmallVector<StringRef, 12> Cols;
+    Trimmed.split(Cols, ',');
+
+    for (size_t I = 6; I < Cols.size(); ++I) {
+      StringRef Token = Cols[I].trim();
+      if (!Token.starts_with_insensitive(BinaryName))
+        continue;
+      size_t Bang = Token.find('!');
+      if (Bang == StringRef::npos)
+        continue;
+      uint64_t RuntimeAddr = parseHex(Token.substr(Bang + 1));
+      if (RuntimeAddr == 0)
+        continue;
+
+      int64_t Guess = static_cast<int64_t>(RuntimeAddr & ~0xFFFFULL) -
+                      static_cast<int64_t>(PreferredBase);
+
+      for (int64_t Delta = -0x10000; Delta <= 0x10000; Delta += 0x10000) {
+        int64_t Candidate = Guess + Delta;
+        uint64_t Adjusted = RuntimeAddr - Candidate;
+        if (BC->getBinaryFunctionContainingAddress(Adjusted, false, true)) {
+          ASLROffset = Candidate;
+          outs() << "ETW2BOLT: detected ASLR offset from stack sample: "
+                 << (ASLROffset > 0 ? "+" : "") << ASLROffset
+                 << " (runtime 0x" << Twine::utohexstr(RuntimeAddr)
+                 << " -> binary 0x" << Twine::utohexstr(Adjusted) << ")\n";
+          return;
+        }
+      }
+    }
+  }
+}
+
 Error ETWDataAggregator::parseXperfOutput() {
   ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
       MemoryBuffer::getFile(DumpFilePath);
@@ -312,6 +365,12 @@ Error ETWDataAggregator::parseXperfOutput() {
   }
 
   parseImageLoadEvents(Dump);
+
+  // If the target process was already running when the trace started, no
+  // I-Start event exists.  Infer the ASLR offset from the first stack
+  // walk frame that names our binary.
+  if (ASLROffset == 0 && BC && !BC->getBinaryFunctions().empty())
+    detectASLRFromSamples(Dump);
 
   // Two event types in the dump:
   //
