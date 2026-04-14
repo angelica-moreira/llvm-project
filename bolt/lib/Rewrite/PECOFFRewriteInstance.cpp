@@ -501,48 +501,57 @@ void PECOFFRewriteInstance::buildFunctionsCFG() {
 }
 
 void PECOFFRewriteInstance::postProcessFunctions() {
-  // PE/COFF fix: detect basic blocks that fall through to the next function
-  // (cross-function fall-through).  MSVC splits logical functions across
-  // multiple RUNTIME_FUNCTION entries; the last block of one entry falls
-  // through to the first block of the next.  Without an explicit branch,
-  // FixupBranches would insert a RET, corrupting the control flow.
-  // Add an explicit tail-call JMP to the fall-through target so that block
-  // reordering and OOP emission preserve the original semantics.
+  // PE/COFF fix: detect basic blocks that fall through to code outside the
+  // function.  MSVC splits logical functions across multiple RUNTIME_FUNCTION
+  // entries, and the disassembler may not recognize all internal targets,
+  // leaving blocks with no terminator and no successors.  Without an explicit
+  // branch, FixupBranches would insert a RET, corrupting control flow.
+  //
+  // The robust approach: for every block that has no terminator and no
+  // successors, compute the fall-through address from the block's original
+  // offset and add a tail-call JMP there.
   uint64_t FTFixups = 0;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
     if (!Function.hasCFG() || !Function.isSimple())
       continue;
 
-    uint64_t FuncEnd = Function.getAddress() + Function.getMaxSize();
-    uint32_t FuncEndRVA = static_cast<uint32_t>(FuncEnd - ImageBase);
-
-    // Check if the fall-through target is a known function in .pdata
-    // (including chained entries that aren't registered as BinaryFunctions).
-    if (FunctionSEHInfo.find(FuncEndRVA) == FunctionSEHInfo.end())
-      continue;
-
-    // Find the block that originally ended at the function boundary.
-    // After disassembly (before reordering), blocks are in address order.
-    // Scan all blocks for one that lacks a terminator and has no
-    // successor — this is the block whose fall-through crosses into
-    // the next function.
     for (BinaryBasicBlock &BB : Function) {
       if (BB.empty())
         continue;
-      // Skip blocks that already have a terminator.
       const MCInst &Last = *BB.rbegin();
       if (BC->MIB->isTerminator(Last) || BC->MIB->isReturn(Last))
         continue;
-      // Skip blocks that have successors (fall-through within the function).
       if (BB.succ_size() > 0)
         continue;
 
-      // This block has no terminator and no successors — it was a
-      // cross-function fall-through.  Add a tail-call JMP to the
-      // next function.
+      // Compute the fall-through address: the byte after this block's
+      // last instruction in the original layout.
+      uint64_t BlockEnd = 0;
+
+      // Try to get the block's original end from the offset annotation
+      // on the last instruction plus its size.
+      auto LastOff =
+          BC->MIB->tryGetAnnotationAs<uint32_t>(Last, "Offset");
+      if (LastOff) {
+        uint32_t LastSize = BC->computeInstructionSize(Last);
+        BlockEnd = Function.getAddress() + *LastOff + LastSize;
+      }
+
+      // Fallback: use function end address (the common case for
+      // cross-function fall-throughs at the function boundary).
+      if (BlockEnd == 0)
+        BlockEnd = Function.getAddress() + Function.getMaxSize();
+
+      // Only add the fixup if the target is a valid code address.
+      if (!BC->getBinaryFunctionContainingAddress(BlockEnd, false, true) &&
+          FunctionSEHInfo.find(
+              static_cast<uint32_t>(BlockEnd - ImageBase)) ==
+              FunctionSEHInfo.end())
+        continue;
+
       MCSymbol *FTSym =
-          BC->getOrCreateGlobalSymbol(FuncEnd, "FUNCat0x");
+          BC->getOrCreateGlobalSymbol(BlockEnd, "FUNCat0x");
       MCInst JmpInst;
       BC->MIB->createTailCall(JmpInst, FTSym, BC->Ctx.get());
       BB.addInstruction(JmpInst);
@@ -847,13 +856,6 @@ void PECOFFRewriteInstance::rewriteFile() {
       uint32_t NewSecVSize = MaxBoltEnd;
       uint32_t NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
 
-      // Pad to FileAlignment.
-      if (NewSecRawSize > NewSecVSize) {
-        std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0xCC);
-        OS.seek(NewSecRawPtr + NewSecVSize);
-        OS.write(reinterpret_cast<char *>(Pad.data()), Pad.size());
-      }
-
       // PE header updates using offsetof to avoid magic numbers.
       using PEHdr = object::pe32plus_header;
       uint16_t NewNumSections = NumSections + 1;
@@ -867,7 +869,7 @@ void PECOFFRewriteInstance::rewriteFile() {
       OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
                 OptHdrOff + offsetof(PEHdr, SizeOfImage));
 
-      // Section header.
+      // Section header (will be rewritten after .pdata is appended).
       object::coff_section NewSec = {};
       std::memcpy(NewSec.Name, ".bolt\0\0\0", 8);
       NewSec.VirtualSize = NewSecVSize;
@@ -885,15 +887,10 @@ void PECOFFRewriteInstance::rewriteFile() {
              << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
              << " functions)\n";
 
-      // Add .pdata entries for OOP functions in the .bolt section.
-      // Without .pdata, the SEH unwinder cannot walk through .bolt
-      // functions, causing stack corruption on C++ exceptions.
-      //
-      // New entries go at the end of the existing .pdata section
-      // (they have the highest RVAs, maintaining sort order).  The
-      // original .pdata entries are shrunk to cover only the trampoline.
-      // The exception directory (data_directory[EXCEPTION_TABLE]) follows
-      // the PE32+ optional header.  Use sizeof + LLVM enum for the index.
+      // Append .pdata for OOP functions into the .bolt section.
+      // Copy the entire original .pdata array, patch OOP entries to cover
+      // only the trampoline, and append new entries for .bolt functions.
+      // This avoids the slack-space limit of the original .pdata section.
       uint32_t ExcDirOff = OptHdrOff + sizeof(PEHdr) +
                            COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
       if (ExcDirOff + 8 > FileData.size()) {
@@ -905,96 +902,119 @@ void PECOFFRewriteInstance::rewriteFile() {
           support::endian::read32le(FileData.data() + ExcDirOff + 4);
       uint32_t NumPdataEntries = ExcSize / sizeof(RuntimeFunction);
 
-      // Find .pdata section file offset.
       uint32_t PDataFileOff = 0;
-      uint32_t PDataSecRawSize = 0;
       for (const object::SectionRef &Sec : InputFile->sections()) {
         const auto *CS = InputFile->getCOFFSection(Sec);
         if (ExcRVA >= CS->VirtualAddress &&
             ExcRVA < CS->VirtualAddress + CS->VirtualSize) {
           PDataFileOff =
               CS->PointerToRawData + (ExcRVA - CS->VirtualAddress);
-          PDataSecRawSize = CS->SizeOfRawData;
           break;
         }
       }
 
-      if (PDataFileOff > 0 && ExcSize <= PDataSecRawSize &&
-          PDataFileOff + NumPdataEntries * sizeof(RuntimeFunction) <=
-              FileData.size()) {
-        uint32_t PDataEnd = PDataFileOff + ExcSize;
-        uint32_t SlackBytes = PDataSecRawSize - ExcSize;
+      if (PDataFileOff > 0 &&
+          PDataFileOff + ExcSize <= FileData.size()) {
         const uint32_t PatchSize = 5; // JMP rel32
 
-        SmallVector<RuntimeFunction, 16> NewEntries;
-        auto *Entries = reinterpret_cast<const RuntimeFunction *>(
-            FileData.data() + PDataFileOff);
-
+        struct OOPInfo {
+          uint32_t OrigRVA, BoltRVA, Size;
+        };
+        SmallVector<OOPInfo, 16> OOPFuncs;
         for (auto &BFI : BC->getBinaryFunctions()) {
           BinaryFunction &BF = BFI.second;
           if (!BF.isEmitted() || BF.getImageSize() == 0)
             continue;
-          uint64_t OutputAddr = BF.getOutputAddress();
-          uint64_t OrigAddr = BF.getAddress();
-          if (OutputAddr == OrigAddr)
+          if (BF.getOutputAddress() == BF.getAddress())
             continue;
           uint32_t OrigRVA =
-              static_cast<uint32_t>(OrigAddr - ImageBase);
-          uint32_t BoltRVA =
-              static_cast<uint32_t>(OutputAddr - ImageBase);
-
-          auto SEHIt = FunctionSEHInfo.find(OrigRVA);
-          if (SEHIt == FunctionSEHInfo.end())
+              static_cast<uint32_t>(BF.getAddress() - ImageBase);
+          if (FunctionSEHInfo.find(OrigRVA) == FunctionSEHInfo.end())
             continue;
-
-          // Find the original .pdata entry and shrink it to the trampoline.
-          uint32_t UnwindInfoRVA = 0;
-          for (uint32_t J = 0; J < NumPdataEntries; ++J) {
-            if (Entries[J].BeginAddress == OrigRVA) {
-              UnwindInfoRVA = Entries[J].UnwindInfoAddress;
-              RuntimeFunction Patched;
-              Patched.BeginAddress = OrigRVA;
-              Patched.EndAddress = OrigRVA + PatchSize;
-              Patched.UnwindInfoAddress = UnwindInfoRVA;
-              OS.pwrite(reinterpret_cast<char *>(&Patched),
-                        sizeof(RuntimeFunction),
-                        PDataFileOff + J * sizeof(RuntimeFunction));
-              break;
-            }
-          }
-
-          if (UnwindInfoRVA == 0)
-            continue;
-
-          RuntimeFunction NewEntry;
-          NewEntry.BeginAddress = BoltRVA;
-          NewEntry.EndAddress = BoltRVA + BF.getImageSize();
-          NewEntry.UnwindInfoAddress = UnwindInfoRVA;
-          NewEntries.push_back(NewEntry);
+          OOPFuncs.push_back(
+              {OrigRVA,
+               static_cast<uint32_t>(BF.getOutputAddress() - ImageBase),
+               static_cast<uint32_t>(BF.getImageSize())});
         }
 
-        llvm::sort(NewEntries, [](const RuntimeFunction &A,
-                                  const RuntimeFunction &B) {
+        DenseSet<uint32_t> OOPOrigRVAs;
+        for (const auto &O : OOPFuncs)
+          OOPOrigRVAs.insert(O.OrigRVA);
+
+        // Copy original .pdata, shrink OOP entries to trampoline size.
+        auto *OrigEntries = reinterpret_cast<const RuntimeFunction *>(
+            FileData.data() + PDataFileOff);
+        SmallVector<RuntimeFunction> Combined(OrigEntries,
+                                              OrigEntries + NumPdataEntries);
+
+        DenseMap<uint32_t, uint32_t> UnwindMap;
+        for (auto &E : Combined) {
+          if (OOPOrigRVAs.count(E.BeginAddress)) {
+            UnwindMap[E.BeginAddress] = E.UnwindInfoAddress;
+            E.EndAddress = E.BeginAddress + PatchSize;
+          }
+        }
+
+        // Append entries for .bolt copies (highest RVAs, sort order preserved).
+        for (const auto &O : OOPFuncs) {
+          auto It = UnwindMap.find(O.OrigRVA);
+          if (It == UnwindMap.end())
+            continue;
+          RuntimeFunction New;
+          New.BeginAddress = O.BoltRVA;
+          New.EndAddress = O.BoltRVA + O.Size;
+          New.UnwindInfoAddress = It->second;
+          Combined.push_back(New);
+        }
+
+        // Windows SEH requires .pdata sorted by BeginAddress.
+        llvm::sort(Combined, [](const RuntimeFunction &A,
+                                const RuntimeFunction &B) {
           return A.BeginAddress < B.BeginAddress;
         });
 
-        uint32_t NewBytes = NewEntries.size() * sizeof(RuntimeFunction);
-        if (NewBytes <= SlackBytes) {
-          OS.pwrite(reinterpret_cast<char *>(NewEntries.data()), NewBytes,
-                    PDataEnd);
+        // Write combined .pdata after code in .bolt (4-byte aligned).
+        uint32_t PDataOffset = alignTo(NewSecVSize, 4);
+        uint32_t CombinedBytes =
+            Combined.size() * sizeof(RuntimeFunction);
+        uint32_t BoltPDataRVA = NewSecVA + PDataOffset;
 
-          uint32_t NewExcSize =
-              ExcSize + NewEntries.size() * sizeof(RuntimeFunction);
-          OS.pwrite(reinterpret_cast<char *>(&NewExcSize), 4,
-                    ExcDirOff + 4);
+        OS.seek(NewSecRawPtr + PDataOffset);
+        OS.write(reinterpret_cast<const char *>(Combined.data()),
+                 CombinedBytes);
 
-          outs() << "BOLT-INFO: added " << NewEntries.size()
-                 << " .pdata entries for .bolt functions\n";
-        } else {
-          outs() << "BOLT-WARNING: not enough .pdata slack for "
-                 << NewEntries.size() << " entries (need " << NewBytes
-                 << ", have " << SlackBytes << " bytes)\n";
+        // Recompute section sizes now that .pdata is included.
+        NewSecVSize = PDataOffset + CombinedBytes;
+        NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
+        if (NewSecRawSize > NewSecVSize) {
+          std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0x00);
+          OS.seek(NewSecRawPtr + NewSecVSize);
+          OS.write(reinterpret_cast<const char *>(Pad.data()),
+                   Pad.size());
         }
+
+        NewSec.VirtualSize = NewSecVSize;
+        NewSec.SizeOfRawData = NewSecRawSize;
+        NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
+                  SecTableEnd);
+
+        NewSizeOfImage =
+            alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
+        NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
+        OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfCode));
+        OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfImage));
+
+        // Redirect exception directory to the .bolt copy.
+        OS.pwrite(reinterpret_cast<char *>(&BoltPDataRVA), 4,
+                  ExcDirOff);
+        OS.pwrite(reinterpret_cast<char *>(&CombinedBytes), 4,
+                  ExcDirOff + 4);
+
+        outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
+               << OOPFuncs.size() << " new) written to .bolt section\n";
       }
       } // ExcDirOff bounds check
     }
@@ -1275,6 +1295,14 @@ void PECOFFRewriteInstance::run() {
     BoltSecVA = alignTo(LastEndVA, SecAlign);
   }
 
+  // Build a set of RVAs that are the end of some .pdata entry.  Functions
+  // whose begin RVA is in this set are part of a contiguous split group
+  // and must not be moved out-of-place (their predecessor may branch into
+  // them at mid-function offsets, not just the entry).
+  DenseSet<uint32_t> SplitTargetRVAs;
+  for (const auto &[RVA, Info] : FunctionSEHInfo)
+    SplitTargetRVAs.insert(Info.EndRVA);
+
   // Compute the JMP patch size once.
   size_t PatchSize = 0;
   {
@@ -1304,6 +1332,16 @@ void PECOFFRewriteInstance::run() {
       if (opts::Verbosity >= 1)
         outs() << "BOLT-INFO: " << BF << " too small for patch ("
                << BF.getMaxSize() << " < " << PatchSize << ")\n";
+      BF.setSimple(false);
+      continue;
+    }
+
+    // Skip OOP for functions in contiguous .pdata groups (MSVC split
+    // functions).  Blocks in one entry may branch into the next; moving
+    // one part to .bolt would invalidate those mid-function targets.
+    uint32_t FuncRVA = static_cast<uint32_t>(BF.getAddress() - ImageBase);
+    uint32_t FuncEndRVA = FuncRVA + BF.getMaxSize();
+    if (FunctionSEHInfo.count(FuncEndRVA) || SplitTargetRVAs.count(FuncRVA)) {
       BF.setSimple(false);
       continue;
     }

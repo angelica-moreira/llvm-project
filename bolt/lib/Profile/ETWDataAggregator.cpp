@@ -467,10 +467,19 @@ Error ETWDataAggregator::parseXperfOutput() {
 
     ++MatchedSamples;
 
-    // Infer branch edges from consecutive samples on the same thread.
-    // This is a last-resort heuristic: the timer fires ~1ms apart, so the
-    // CPU has executed millions of instructions between samples.  The
-    // resulting edges are noisy.  Prefer real LBR data when available.
+    // Record the IP sample for no_lbr output.
+    const BinaryFunction *Func =
+        BC->getBinaryFunctionContainingAddress(IP, false, true);
+    if (Func) {
+      uint64_t Offset = IP - Func->getAddress();
+      std::string Name = Func->getOneName().str();
+      BasicSamples[{Name, Offset}] += 1;
+    }
+
+    // When LBR data is available, edges come from BranchTrace/LastBranch
+    // events above.  As a fallback, infer edges from consecutive timer
+    // samples on the same thread.  These are noisy (the timer fires ~1ms
+    // apart) but provide some signal when LBR is not available.
     if (ThreadID != 0) {
       auto &LastIP = LastIPPerThread[ThreadID];
       if (LastIP != 0 && LastIP != IP) {
@@ -487,7 +496,29 @@ Error ETWDataAggregator::parseXperfOutput() {
 
 std::error_code
 ETWDataAggregator::writeAggregatedFile(StringRef OutputFilename) const {
-  return writeBranchProfile(OutputFilename);
+  // When real LBR branch data was collected, write the standard edge format.
+  if (MatchedLBRBranches > 0)
+    return writeBranchProfile(OutputFilename);
+
+  // Timer-only profile: write no_lbr format with per-IP sample counts.
+  // BOLT uses these to estimate basic block execution counts.
+  std::error_code EC;
+  raw_fd_ostream OutFile(OutputFilename, EC, sys::fs::OpenFlags::OF_None);
+  if (EC)
+    return EC;
+
+  OutFile << "no_lbr\n";
+  uint64_t Written = 0;
+  for (const auto &[Key, Count] : BasicSamples) {
+    const auto &[FuncName, Offset] = Key;
+    OutFile << "1 " << FuncName << " "
+            << Twine::utohexstr(Offset) << " " << Count << "\n";
+    ++Written;
+  }
+
+  outs() << "BOLT-INFO: wrote " << Written
+         << " basic samples (no_lbr) to " << OutputFilename << "\n";
+  return std::error_code();
 }
 
 Error ETWDataAggregator::parseETWAnalyzerCSV() {

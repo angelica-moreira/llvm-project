@@ -88,6 +88,10 @@ private:
   /// Per-thread last IP, used to infer edges from consecutive samples.
   std::map<uint64_t, uint64_t> LastIPPerThread;
 
+  /// IP sample counts: maps (function_name, offset) to hit count.
+  /// Used for no_lbr output when only timer samples are available.
+  std::map<std::pair<std::string, uint64_t>, uint64_t> BasicSamples;
+
   /// Runtime load address minus preferred ImageBase.
   int64_t ASLROffset{0};
 
