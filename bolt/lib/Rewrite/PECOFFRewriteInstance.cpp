@@ -819,13 +819,17 @@ void PECOFFRewriteInstance::rewriteFile() {
     uint32_t NumSections = InputFile->getNumberOfSections();
     const auto *COFFHdr = InputFile->getCOFFHeader();
     StringRef FileData = InputFile->getData();
+
+    constexpr uint32_t SecHdrSize = sizeof(object::coff_section);
+
+    // PE structure already validated by COFFObjectFile parser.
     uint32_t PEOff = support::endian::read32le(FileData.data() + 0x3C);
     uint32_t CoffHdrOff = PEOff + 4;
     uint32_t OptHdrOff = CoffHdrOff + sizeof(object::coff_file_header);
     uint32_t SecTableOff = OptHdrOff + COFFHdr->SizeOfOptionalHeader;
-    uint32_t SecTableEnd = SecTableOff + NumSections * 40;
+    uint32_t SecTableEnd = SecTableOff + NumSections * SecHdrSize;
 
-    if (SecTableEnd + 40 <= PE->SizeOfHeaders) {
+    if (SecTableEnd + SecHdrSize <= PE->SizeOfHeaders) {
       // Compute .bolt section extent from what was written.
       uint32_t MaxBoltEnd = 0;
       for (BinaryFunction *Function : BC->getAllBinaryFunctions()) {
@@ -850,7 +854,8 @@ void PECOFFRewriteInstance::rewriteFile() {
         OS.write(reinterpret_cast<char *>(Pad.data()), Pad.size());
       }
 
-      // PE header updates.
+      // PE header updates using offsetof to avoid magic numbers.
+      using PEHdr = object::pe32plus_header;
       uint16_t NewNumSections = NumSections + 1;
       OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2,
                 CoffHdrOff + 2);
@@ -858,9 +863,9 @@ void PECOFFRewriteInstance::rewriteFile() {
           alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
       uint32_t NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
       OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
-                OptHdrOff + 4);
+                OptHdrOff + offsetof(PEHdr, SizeOfCode));
       OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
-                OptHdrOff + 56);
+                OptHdrOff + offsetof(PEHdr, SizeOfImage));
 
       // Section header.
       object::coff_section NewSec = {};
@@ -881,14 +886,19 @@ void PECOFFRewriteInstance::rewriteFile() {
              << " functions)\n";
 
       // Add .pdata entries for OOP functions in the .bolt section.
-      // Without .pdata, the SEH unwinder cannot unwind through .bolt
-      // functions, causing stack corruption when C++ exceptions are thrown.
+      // Without .pdata, the SEH unwinder cannot walk through .bolt
+      // functions, causing stack corruption on C++ exceptions.
       //
-      // The new entries go at the end of the existing .pdata section
-      // (they have the highest RVAs, maintaining sort order).  We also
-      // fix the original .pdata entries: the trampoline at the original
-      // address is only PatchSize bytes, so shrink EndRVA accordingly.
-      uint32_t ExcDirOff = OptHdrOff + 112 + 3 * 8; // Data directory #3
+      // New entries go at the end of the existing .pdata section
+      // (they have the highest RVAs, maintaining sort order).  The
+      // original .pdata entries are shrunk to cover only the trampoline.
+      // The exception directory (data_directory[EXCEPTION_TABLE]) follows
+      // the PE32+ optional header.  Use sizeof + LLVM enum for the index.
+      uint32_t ExcDirOff = OptHdrOff + sizeof(PEHdr) +
+                           COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
+      if (ExcDirOff + 8 > FileData.size()) {
+        outs() << "BOLT-WARNING: exception directory offset out of bounds\n";
+      } else {
       uint32_t ExcRVA =
           support::endian::read32le(FileData.data() + ExcDirOff);
       uint32_t ExcSize =
@@ -909,13 +919,17 @@ void PECOFFRewriteInstance::rewriteFile() {
         }
       }
 
-      if (PDataFileOff > 0) {
+      if (PDataFileOff > 0 && ExcSize <= PDataSecRawSize &&
+          PDataFileOff + NumPdataEntries * sizeof(RuntimeFunction) <=
+              FileData.size()) {
         uint32_t PDataEnd = PDataFileOff + ExcSize;
         uint32_t SlackBytes = PDataSecRawSize - ExcSize;
         const uint32_t PatchSize = 5; // JMP rel32
 
-        // Collect OOP functions and build new .pdata entries.
         SmallVector<RuntimeFunction, 16> NewEntries;
+        auto *Entries = reinterpret_cast<const RuntimeFunction *>(
+            FileData.data() + PDataFileOff);
+
         for (auto &BFI : BC->getBinaryFunctions()) {
           BinaryFunction &BF = BFI.second;
           if (!BF.isEmitted() || BF.getImageSize() == 0)
@@ -923,34 +937,24 @@ void PECOFFRewriteInstance::rewriteFile() {
           uint64_t OutputAddr = BF.getOutputAddress();
           uint64_t OrigAddr = BF.getAddress();
           if (OutputAddr == OrigAddr)
-            continue; // in-place function
+            continue;
           uint32_t OrigRVA =
               static_cast<uint32_t>(OrigAddr - ImageBase);
           uint32_t BoltRVA =
               static_cast<uint32_t>(OutputAddr - ImageBase);
 
-          // Look up the original UNWIND_INFO RVA.
           auto SEHIt = FunctionSEHInfo.find(OrigRVA);
           if (SEHIt == FunctionSEHInfo.end())
             continue;
 
-          // Find the original .pdata entry and read its UnwindInfoRVA.
-          // Binary search through the .pdata array.
+          // Find the original .pdata entry and shrink it to the trampoline.
           uint32_t UnwindInfoRVA = 0;
-          auto *Entries = reinterpret_cast<const RuntimeFunction *>(
-              FileData.data() + PDataFileOff);
           for (uint32_t J = 0; J < NumPdataEntries; ++J) {
             if (Entries[J].BeginAddress == OrigRVA) {
               UnwindInfoRVA = Entries[J].UnwindInfoAddress;
-              // Shrink the original entry to cover only the trampoline.
               RuntimeFunction Patched;
               Patched.BeginAddress = OrigRVA;
               Patched.EndAddress = OrigRVA + PatchSize;
-              // Point to a trivial UNWIND_INFO (or zero, which makes it
-              // a leaf — trampoline has no prolog).  For safety, keep the
-              // original UnwindInfoAddress; the unwinder will apply prolog
-              // unwinds only if RIP is within PrologSize, and the
-              // trampoline JMP at offset 0 is before any unwind code.
               Patched.UnwindInfoAddress = UnwindInfoRVA;
               OS.pwrite(reinterpret_cast<char *>(&Patched),
                         sizeof(RuntimeFunction),
@@ -962,7 +966,6 @@ void PECOFFRewriteInstance::rewriteFile() {
           if (UnwindInfoRVA == 0)
             continue;
 
-          // New .pdata entry for the .bolt copy.
           RuntimeFunction NewEntry;
           NewEntry.BeginAddress = BoltRVA;
           NewEntry.EndAddress = BoltRVA + BF.getImageSize();
@@ -970,20 +973,16 @@ void PECOFFRewriteInstance::rewriteFile() {
           NewEntries.push_back(NewEntry);
         }
 
-        // Sort new entries by BeginAddress (they should already be sorted
-        // since .bolt layout is sequential, but be safe).
         llvm::sort(NewEntries, [](const RuntimeFunction &A,
                                   const RuntimeFunction &B) {
           return A.BeginAddress < B.BeginAddress;
         });
 
-        // Write new entries at the end of .pdata if they fit.
         uint32_t NewBytes = NewEntries.size() * sizeof(RuntimeFunction);
         if (NewBytes <= SlackBytes) {
           OS.pwrite(reinterpret_cast<char *>(NewEntries.data()), NewBytes,
                     PDataEnd);
 
-          // Update exception directory size.
           uint32_t NewExcSize =
               ExcSize + NewEntries.size() * sizeof(RuntimeFunction);
           OS.pwrite(reinterpret_cast<char *>(&NewExcSize), 4,
@@ -997,6 +996,7 @@ void PECOFFRewriteInstance::rewriteFile() {
                  << ", have " << SlackBytes << " bytes)\n";
         }
       }
+      } // ExcDirOff bounds check
     }
   }
 
