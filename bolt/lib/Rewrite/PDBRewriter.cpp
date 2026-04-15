@@ -94,9 +94,16 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   }
 
   if (!sys::fs::exists(PDBPath)) {
-    outs() << "BOLT-WARNING: PDB file " << PDBPath
-           << " not found, debug info will be stale\n";
-    return;
+    // Try the PDB next to the input binary (common when copying both files).
+    SmallString<256> Adjacent(sys::path::parent_path(InputExe));
+    sys::path::append(Adjacent, sys::path::filename(PDBPath));
+    if (sys::fs::exists(Adjacent)) {
+      PDBPath = std::string(Adjacent);
+    } else {
+      outs() << "BOLT-WARNING: PDB file " << PDBPath
+             << " not found, debug info will be stale\n";
+      return;
+    }
   }
 
   outs() << "BOLT-INFO: updating PDB " << PDBPath << "\n";
