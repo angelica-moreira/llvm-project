@@ -13,6 +13,7 @@
 #include "bolt/Core/JumpTable.h"
 #include "bolt/Core/MCPlusBuilder.h"
 #include "bolt/Passes/BinaryPasses.h"
+#include "bolt/Passes/InferEdgeCounts.h"
 #include "bolt/Profile/DataReader.h"
 #include "bolt/Profile/ETWDataAggregator.h"
 #include "bolt/Rewrite/BinaryPassManager.h"
@@ -619,6 +620,9 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
       std::make_unique<ShortenInstructions>(opts::NeverPrint));
 
   Manager.registerPass(std::make_unique<RemoveNops>(opts::NeverPrint));
+
+  Manager.registerPass(
+      std::make_unique<InferEdgeCounts>(opts::NeverPrint));
 
   Manager.registerPass(
       std::make_unique<ReorderBasicBlocks>(opts::PrintReordered));

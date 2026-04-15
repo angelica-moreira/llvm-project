@@ -16,6 +16,7 @@ add_llvm_library(LLVMBOLTPasses
   Hugify.cpp
   IdenticalCodeFolding.cpp
   IndirectCallPromotion.cpp
+  InferEdgeCounts.cpp
   Inliner.cpp
   Instrumentation.cpp
   JTFootprintReduction.cpp
