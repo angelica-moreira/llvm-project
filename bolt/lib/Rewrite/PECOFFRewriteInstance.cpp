@@ -52,6 +52,11 @@ extern cl::opt<bool> PrintDisasm;
 extern cl::opt<bool> PrintCFG;
 extern cl::opt<unsigned> Verbosity;
 
+cl::opt<bool> PECOFFInplaceOnly(
+    "pecoff-inplace-only",
+    cl::desc("Skip out-of-place emission; only rewrite functions that fit"),
+    cl::init(false));
+
 } // namespace opts
 
 namespace llvm {
@@ -1331,7 +1336,12 @@ void PECOFFRewriteInstance::run() {
     if (HotSize <= BF.getMaxSize())
       continue;
 
-    // Check that the original function is large enough for the patch.
+    // In inplace-only mode, skip functions that do not fit.
+    if (opts::PECOFFInplaceOnly) {
+      BF.setSimple(false);
+      continue;
+    }
+
     if (BF.getMaxSize() < PatchSize) {
       if (opts::Verbosity >= 1)
         outs() << "BOLT-INFO: " << BF << " too small for patch ("
