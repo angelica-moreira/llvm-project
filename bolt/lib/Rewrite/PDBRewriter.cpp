@@ -342,7 +342,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     for (const auto &P : Patches)
       AllPatches.push_back({ModiStream, P.StreamOffset, P.NewValue});
 
-    if (!Patches.empty()) {
+    if (!Patches.empty() && opts::Verbosity >= 1) {
       outs() << "BOLT-INFO: " << Patches.size()
              << " line entries remapped for module " << I << "\n";
     }
@@ -409,10 +409,10 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   if (RemappedLines > 0)
     outs() << "BOLT-INFO: patched " << RemappedLines
            << " line entries in PDB for " << UpdatedSymbols
-           << " rewritten functions\n";
+           << " in-place rewritten functions\n";
   else if (UpdatedSymbols > 0)
     outs() << "BOLT-INFO: " << UpdatedSymbols
-           << " rewritten functions, no line entries needed remapping\n";
+           << " rewritten functions found in PDB (no line remapping needed)\n";
   else
-    outs() << "BOLT-INFO: PDB is fully accurate (no functions rewritten)\n";
+    outs() << "BOLT-INFO: PDB unchanged (no rewritten functions found)\n";
 }

@@ -1036,7 +1036,7 @@ void PECOFFRewriteInstance::rewriteFile() {
          << " functions rewritten in-place\n";
   if (OOPWritten)
     outs() << "BOLT-INFO: " << OOPWritten
-           << " functions moved to .bolt section\n";
+           << " functions rewritten out-of-place (.bolt section)\n";
   if (OverflowCount)
     outs() << "BOLT-INFO: " << OverflowCount
            << " functions could not be optimized\n";
@@ -1263,6 +1263,10 @@ void PECOFFRewriteInstance::run() {
       NewOffset +=
           BB->getOutputSize() ? BB->getOutputSize() : BB->estimateSize();
     }
+    // Sort by original offset so the PDB rewriter can do range lookups.
+    llvm::sort(Map, [](const auto &A, const auto &B) {
+      return A.first < B.first;
+    });
   }
 
   // Skip emission for functions whose layout did not change.
@@ -1323,6 +1327,7 @@ void PECOFFRewriteInstance::run() {
 
   uint32_t BoltCurOff = 0;
   uint64_t OOPCount = 0;
+  DenseSet<uint64_t> OOPFunctions;
   for (uint64_t FuncVA : ModifiedFunctions) {
     auto It = BC->getBinaryFunctions().find(FuncVA);
     if (It == BC->getBinaryFunctions().end())
@@ -1346,6 +1351,14 @@ void PECOFFRewriteInstance::run() {
       if (opts::Verbosity >= 1)
         outs() << "BOLT-INFO: " << BF << " too small for patch ("
                << BF.getMaxSize() << " < " << PatchSize << ")\n";
+      BF.setSimple(false);
+      continue;
+    }
+
+    // Skip OOP for functions with jump tables.  PE/COFF JT data lives
+    // in .rdata which is not part of the emitted LinkGraph, so the
+    // section address mapping in mapCodeSections cannot resolve it.
+    if (BF.hasJumpTables()) {
       BF.setSimple(false);
       continue;
     }
@@ -1389,6 +1402,7 @@ void PECOFFRewriteInstance::run() {
     }
 
     ++OOPCount;
+    OOPFunctions.insert(FuncVA);
     if (opts::Verbosity >= 1)
       outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
              << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
@@ -1396,7 +1410,30 @@ void PECOFFRewriteInstance::run() {
   }
   if (OOPCount)
     outs() << "BOLT-INFO: " << OOPCount
-           << " functions moved to .bolt section\n";
+           << " functions rewritten out-of-place (.bolt section)\n";
+
+  // Clean up PDB offset maps: only keep functions actually rewritten in-place.
+  // Functions that went OOP have their code at a new address but PDB still
+  // references the original (JMP patch) — remapping their line offsets would
+  // be inconsistent.  Functions that were skipped (setSimple(false)) were
+  // never rewritten — remapping their lines would corrupt a correct PDB.
+  {
+    SmallVector<uint64_t, 64> ToRemove;
+    for (auto &Entry : FunctionOffsetMaps) {
+      uint64_t VA = Entry.first;
+      if (OOPFunctions.count(VA)) {
+        ToRemove.push_back(VA);
+        continue;
+      }
+      auto It = BC->getBinaryFunctions().find(VA);
+      if (It == BC->getBinaryFunctions().end() || !It->second.isSimple()) {
+        ToRemove.push_back(VA);
+        continue;
+      }
+    }
+    for (uint64_t VA : ToRemove)
+      FunctionOffsetMaps.erase(VA);
+  }
   LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipped emission for " << SkippedEmit
                     << " unmodified functions\n");
 

@@ -982,11 +982,12 @@ BinaryFunction::processIndirectBranch(MCInst &Instruction, unsigned Size,
     if (BC.getSectionForAddress(ArrayStart)->isWritable())
       return IndirectBranchType::UNKNOWN;
 
-    BC.outs() << "BOLT-INFO: fixed indirect branch detected in " << *this
-              << " at 0x" << Twine::utohexstr(getAddress() + Offset)
-              << " referencing data at 0x" << Twine::utohexstr(ArrayStart)
-              << " the destination value is 0x" << Twine::utohexstr(*Value)
-              << '\n';
+    if (opts::Verbosity >= 1)
+      BC.outs() << "BOLT-INFO: fixed indirect branch detected in " << *this
+                << " at 0x" << Twine::utohexstr(getAddress() + Offset)
+                << " referencing data at 0x" << Twine::utohexstr(ArrayStart)
+                << " the destination value is 0x" << Twine::utohexstr(*Value)
+                << '\n';
 
     TargetAddress = *Value;
     return BranchType;
@@ -1328,11 +1329,12 @@ Error BinaryFunction::disassemble() {
       if (isZeroPaddingAt(Offset))
         break;
 
-      BC.errs()
-          << "BOLT-WARNING: unable to disassemble instruction at offset 0x"
-          << Twine::utohexstr(Offset) << " (address 0x"
-          << Twine::utohexstr(AbsoluteInstrAddr) << ") in function " << *this
-          << '\n';
+      if (opts::Verbosity >= 1)
+        BC.errs()
+            << "BOLT-WARNING: unable to disassemble instruction at offset 0x"
+            << Twine::utohexstr(Offset) << " (address 0x"
+            << Twine::utohexstr(AbsoluteInstrAddr) << ") in function " << *this
+            << '\n';
       // Some AVX-512 instructions could not be disassembled at all.
       if (BC.HasRelocations && opts::TrapOnAVX512 && BC.isX86()) {
         setTrapOnEntry();
