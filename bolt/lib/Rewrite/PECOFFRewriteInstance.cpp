@@ -537,8 +537,7 @@ void PECOFFRewriteInstance::postProcessFunctions() {
 
       // Try to get the block's original end from the offset annotation
       // on the last instruction plus its size.
-      auto LastOff =
-          BC->MIB->tryGetAnnotationAs<uint32_t>(Last, "Offset");
+      auto LastOff = BC->MIB->tryGetAnnotationAs<uint32_t>(Last, "Offset");
       if (LastOff) {
         uint32_t LastSize = BC->computeInstructionSize(Last);
         BlockEnd = Function.getAddress() + *LastOff + LastSize;
@@ -551,13 +550,11 @@ void PECOFFRewriteInstance::postProcessFunctions() {
 
       // Only add the fixup if the target is a valid code address.
       if (!BC->getBinaryFunctionContainingAddress(BlockEnd, false, true) &&
-          FunctionSEHInfo.find(
-              static_cast<uint32_t>(BlockEnd - ImageBase)) ==
+          FunctionSEHInfo.find(static_cast<uint32_t>(BlockEnd - ImageBase)) ==
               FunctionSEHInfo.end())
         continue;
 
-      MCSymbol *FTSym =
-          BC->getOrCreateGlobalSymbol(BlockEnd, "FUNCat0x");
+      MCSymbol *FTSym = BC->getOrCreateGlobalSymbol(BlockEnd, "FUNCat0x");
       MCInst JmpInst;
       BC->MIB->createTailCall(JmpInst, FTSym, BC->Ctx.get());
       BB.addInstruction(JmpInst);
@@ -621,13 +618,14 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   BinaryFunctionPassManager Manager(*BC);
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
 
-  Manager.registerPass(
-      std::make_unique<ShortenInstructions>(opts::NeverPrint));
+  // DO NOT register ShortenInstructions or RemoveNops.  These passes
+  // change instruction sizes (e.g. dropping REX prefixes), which shifts
+  // byte offsets within functions.  On PE/COFF, UNWIND_INFO contains
+  // hardcoded byte offsets for prolog operations.  Changing any
+  // instruction size corrupts these offsets and causes crashes during
+  // stack unwinding or exception handling.
 
-  Manager.registerPass(std::make_unique<RemoveNops>(opts::NeverPrint));
-
-  Manager.registerPass(
-      std::make_unique<InferEdgeCounts>(opts::NeverPrint));
+  Manager.registerPass(std::make_unique<InferEdgeCounts>(opts::NeverPrint));
 
   Manager.registerPass(
       std::make_unique<ReorderBasicBlocks>(opts::PrintReordered));
@@ -673,7 +671,8 @@ void PECOFFRewriteInstance::mapCodeSections(
     for (const auto &JTKV : BF.jumpTables()) {
       uint64_t JTVA = JTKV.second->getAddress();
       ErrorOr<BinarySection &> JTSection = BC->getSectionForAddress(JTVA);
-      if (JTSection && MappedJTSections.insert(JTSection->getAddress()).second) {
+      if (JTSection &&
+          MappedJTSections.insert(JTSection->getAddress()).second) {
         JTSection->setOutputAddress(JTSection->getAddress());
         MapSection(*JTSection, JTSection->getAddress());
       }
@@ -712,9 +711,7 @@ void PECOFFRewriteInstance::emitAndLink() {
 
   Linker = std::make_unique<JITLinkLinker>(*BC, std::move(EFMM));
   Linker->loadObject(ObjectMemBuffer->getMemBufferRef(),
-                     [this](auto MapSection) {
-                       mapCodeSections(MapSection);
-                     });
+                     [this](auto MapSection) { mapCodeSections(MapSection); });
 }
 
 void PECOFFRewriteInstance::rewriteFile() {
@@ -802,16 +799,41 @@ void PECOFFRewriteInstance::rewriteFile() {
         ++OverflowCount;
         return;
       }
+
+      // Verify the function prolog bytes match the original.  The MC
+      // re-encoder can drop redundant REX prefixes (e.g. 0x40 before
+      // push rsi), changing byte offsets in the prolog.  This corrupts
+      // UNWIND_INFO CodeOffset fields which use hardcoded byte positions.
+      // Skip any function whose prolog bytes differ from the original.
+      auto SEHIt =
+          FunctionSEHInfo.find(static_cast<uint32_t>(OrigAddr - ImageBase));
+      if (SEHIt != FunctionSEHInfo.end() && SEHIt->second.PrologSize > 0) {
+        uint8_t PrologSize = SEHIt->second.PrologSize;
+        auto OrigFileOff = VAToFileOffset(OrigAddr);
+        if (OrigFileOff && PrologSize <= EmittedSize) {
+          const uint8_t *EmittedBytes =
+              reinterpret_cast<const uint8_t *>(Function.getImageAddress());
+          const uint8_t *OrigBytes = reinterpret_cast<const uint8_t *>(
+              InputFile->getData().data() + *OrigFileOff);
+          if (memcmp(EmittedBytes, OrigBytes, PrologSize) != 0) {
+            LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
+                              << " - prolog bytes changed by re-encoding\n");
+            if (opts::Verbosity >= 1)
+              outs() << "BOLT-INFO: skipping " << Function.getPrintName()
+                     << " - prolog re-encoded differently\n";
+            return;
+          }
+        }
+      }
     }
 
-    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()),
-              EmittedSize, *FileOff);
+    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()), EmittedSize,
+              *FileOff);
 
     // Pad in-place functions.
     if (!Function.isPatch() && OutputAddr == OrigAddr &&
         EmittedSize < Function.getMaxSize()) {
-      std::vector<uint8_t> Padding(Function.getMaxSize() - EmittedSize,
-                                   0xCC);
+      std::vector<uint8_t> Padding(Function.getMaxSize() - EmittedSize, 0xCC);
       OS.pwrite(reinterpret_cast<char *>(Padding.data()), Padding.size(),
                 *FileOff + EmittedSize);
     }
@@ -868,8 +890,7 @@ void PECOFFRewriteInstance::rewriteFile() {
       // PE header updates using offsetof to avoid magic numbers.
       using PEHdr = object::pe32plus_header;
       uint16_t NewNumSections = NumSections + 1;
-      OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2,
-                CoffHdrOff + 2);
+      OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2, CoffHdrOff + 2);
       uint32_t NewSizeOfImage =
           alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
       uint32_t NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
@@ -885,12 +906,10 @@ void PECOFFRewriteInstance::rewriteFile() {
       NewSec.VirtualAddress = NewSecVA;
       NewSec.SizeOfRawData = NewSecRawSize;
       NewSec.PointerToRawData = NewSecRawPtr;
-      NewSec.Characteristics =
-          COFF::IMAGE_SCN_CNT_CODE |
-          COFF::IMAGE_SCN_MEM_EXECUTE |
-          COFF::IMAGE_SCN_MEM_READ;
-      OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
-                SecTableEnd);
+      NewSec.Characteristics = COFF::IMAGE_SCN_CNT_CODE |
+                               COFF::IMAGE_SCN_MEM_EXECUTE |
+                               COFF::IMAGE_SCN_MEM_READ;
+      OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec), SecTableEnd);
 
       outs() << "BOLT-INFO: added .bolt section at VA 0x"
              << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
@@ -900,131 +919,127 @@ void PECOFFRewriteInstance::rewriteFile() {
       // Copy the entire original .pdata array, patch OOP entries to cover
       // only the trampoline, and append new entries for .bolt functions.
       // This avoids the slack-space limit of the original .pdata section.
-      uint32_t ExcDirOff = OptHdrOff + sizeof(PEHdr) +
-                           COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
+      uint32_t ExcDirOff =
+          OptHdrOff + sizeof(PEHdr) +
+          COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
       if (ExcDirOff + 8 > FileData.size()) {
         outs() << "BOLT-WARNING: exception directory offset out of bounds\n";
       } else {
-      uint32_t ExcRVA =
-          support::endian::read32le(FileData.data() + ExcDirOff);
-      uint32_t ExcSize =
-          support::endian::read32le(FileData.data() + ExcDirOff + 4);
-      uint32_t NumPdataEntries = ExcSize / sizeof(RuntimeFunction);
+        uint32_t ExcRVA =
+            support::endian::read32le(FileData.data() + ExcDirOff);
+        uint32_t ExcSize =
+            support::endian::read32le(FileData.data() + ExcDirOff + 4);
+        uint32_t NumPdataEntries = ExcSize / sizeof(RuntimeFunction);
 
-      uint32_t PDataFileOff = 0;
-      for (const object::SectionRef &Sec : InputFile->sections()) {
-        const auto *CS = InputFile->getCOFFSection(Sec);
-        if (ExcRVA >= CS->VirtualAddress &&
-            ExcRVA < CS->VirtualAddress + CS->VirtualSize) {
-          PDataFileOff =
-              CS->PointerToRawData + (ExcRVA - CS->VirtualAddress);
-          break;
-        }
-      }
-
-      if (PDataFileOff > 0 &&
-          PDataFileOff + ExcSize <= FileData.size()) {
-        const uint32_t PatchSize = 5; // JMP rel32
-
-        struct OOPInfo {
-          uint32_t OrigRVA, BoltRVA, Size;
-        };
-        SmallVector<OOPInfo, 16> OOPFuncs;
-        for (auto &BFI : BC->getBinaryFunctions()) {
-          BinaryFunction &BF = BFI.second;
-          if (!BF.isEmitted() || BF.getImageSize() == 0)
-            continue;
-          if (BF.getOutputAddress() == BF.getAddress())
-            continue;
-          uint32_t OrigRVA =
-              static_cast<uint32_t>(BF.getAddress() - ImageBase);
-          if (FunctionSEHInfo.find(OrigRVA) == FunctionSEHInfo.end())
-            continue;
-          OOPFuncs.push_back(
-              {OrigRVA,
-               static_cast<uint32_t>(BF.getOutputAddress() - ImageBase),
-               static_cast<uint32_t>(BF.getImageSize())});
-        }
-
-        DenseSet<uint32_t> OOPOrigRVAs;
-        for (const auto &O : OOPFuncs)
-          OOPOrigRVAs.insert(O.OrigRVA);
-
-        // Copy original .pdata, shrink OOP entries to trampoline size.
-        auto *OrigEntries = reinterpret_cast<const RuntimeFunction *>(
-            FileData.data() + PDataFileOff);
-        SmallVector<RuntimeFunction> Combined(OrigEntries,
-                                              OrigEntries + NumPdataEntries);
-
-        DenseMap<uint32_t, uint32_t> UnwindMap;
-        for (auto &E : Combined) {
-          if (OOPOrigRVAs.count(E.BeginAddress)) {
-            UnwindMap[E.BeginAddress] = E.UnwindInfoAddress;
-            E.EndAddress = E.BeginAddress + PatchSize;
+        uint32_t PDataFileOff = 0;
+        for (const object::SectionRef &Sec : InputFile->sections()) {
+          const auto *CS = InputFile->getCOFFSection(Sec);
+          if (ExcRVA >= CS->VirtualAddress &&
+              ExcRVA < CS->VirtualAddress + CS->VirtualSize) {
+            PDataFileOff = CS->PointerToRawData + (ExcRVA - CS->VirtualAddress);
+            break;
           }
         }
 
-        // Append entries for .bolt copies (highest RVAs, sort order preserved).
-        for (const auto &O : OOPFuncs) {
-          auto It = UnwindMap.find(O.OrigRVA);
-          if (It == UnwindMap.end())
-            continue;
-          RuntimeFunction New;
-          New.BeginAddress = O.BoltRVA;
-          New.EndAddress = O.BoltRVA + O.Size;
-          New.UnwindInfoAddress = It->second;
-          Combined.push_back(New);
+        if (PDataFileOff > 0 && PDataFileOff + ExcSize <= FileData.size()) {
+          const uint32_t PatchSize = 5; // JMP rel32
+
+          struct OOPInfo {
+            uint32_t OrigRVA, BoltRVA, Size;
+          };
+          SmallVector<OOPInfo, 16> OOPFuncs;
+          for (auto &BFI : BC->getBinaryFunctions()) {
+            BinaryFunction &BF = BFI.second;
+            if (!BF.isEmitted() || BF.getImageSize() == 0)
+              continue;
+            if (BF.getOutputAddress() == BF.getAddress())
+              continue;
+            uint32_t OrigRVA =
+                static_cast<uint32_t>(BF.getAddress() - ImageBase);
+            if (FunctionSEHInfo.find(OrigRVA) == FunctionSEHInfo.end())
+              continue;
+            OOPFuncs.push_back(
+                {OrigRVA,
+                 static_cast<uint32_t>(BF.getOutputAddress() - ImageBase),
+                 static_cast<uint32_t>(BF.getImageSize())});
+          }
+
+          DenseSet<uint32_t> OOPOrigRVAs;
+          for (const auto &O : OOPFuncs)
+            OOPOrigRVAs.insert(O.OrigRVA);
+
+          // Copy original .pdata, shrink OOP entries to trampoline size.
+          auto *OrigEntries = reinterpret_cast<const RuntimeFunction *>(
+              FileData.data() + PDataFileOff);
+          SmallVector<RuntimeFunction> Combined(OrigEntries,
+                                                OrigEntries + NumPdataEntries);
+
+          DenseMap<uint32_t, uint32_t> UnwindMap;
+          for (auto &E : Combined) {
+            if (OOPOrigRVAs.count(E.BeginAddress)) {
+              UnwindMap[E.BeginAddress] = E.UnwindInfoAddress;
+              E.EndAddress = E.BeginAddress + PatchSize;
+            }
+          }
+
+          // Append entries for .bolt copies (highest RVAs, sort order
+          // preserved).
+          for (const auto &O : OOPFuncs) {
+            auto It = UnwindMap.find(O.OrigRVA);
+            if (It == UnwindMap.end())
+              continue;
+            RuntimeFunction New;
+            New.BeginAddress = O.BoltRVA;
+            New.EndAddress = O.BoltRVA + O.Size;
+            New.UnwindInfoAddress = It->second;
+            Combined.push_back(New);
+          }
+
+          // Windows SEH requires .pdata sorted by BeginAddress.
+          llvm::sort(Combined,
+                     [](const RuntimeFunction &A, const RuntimeFunction &B) {
+                       return A.BeginAddress < B.BeginAddress;
+                     });
+
+          // Write combined .pdata after code in .bolt (4-byte aligned).
+          uint32_t PDataOffset = alignTo(NewSecVSize, 4);
+          uint32_t CombinedBytes = Combined.size() * sizeof(RuntimeFunction);
+          uint32_t BoltPDataRVA = NewSecVA + PDataOffset;
+
+          OS.seek(NewSecRawPtr + PDataOffset);
+          OS.write(reinterpret_cast<const char *>(Combined.data()),
+                   CombinedBytes);
+
+          // Recompute section sizes now that .pdata is included.
+          NewSecVSize = PDataOffset + CombinedBytes;
+          NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
+          if (NewSecRawSize > NewSecVSize) {
+            std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0x00);
+            OS.seek(NewSecRawPtr + NewSecVSize);
+            OS.write(reinterpret_cast<const char *>(Pad.data()), Pad.size());
+          }
+
+          NewSec.VirtualSize = NewSecVSize;
+          NewSec.SizeOfRawData = NewSecRawSize;
+          NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+          OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
+                    SecTableEnd);
+
+          NewSizeOfImage =
+              alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
+          NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
+          OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
+                    OptHdrOff + offsetof(PEHdr, SizeOfCode));
+          OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
+                    OptHdrOff + offsetof(PEHdr, SizeOfImage));
+
+          // Redirect exception directory to the .bolt copy.
+          OS.pwrite(reinterpret_cast<char *>(&BoltPDataRVA), 4, ExcDirOff);
+          OS.pwrite(reinterpret_cast<char *>(&CombinedBytes), 4, ExcDirOff + 4);
+
+          outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
+                 << OOPFuncs.size() << " new) written to .bolt section\n";
         }
-
-        // Windows SEH requires .pdata sorted by BeginAddress.
-        llvm::sort(Combined, [](const RuntimeFunction &A,
-                                const RuntimeFunction &B) {
-          return A.BeginAddress < B.BeginAddress;
-        });
-
-        // Write combined .pdata after code in .bolt (4-byte aligned).
-        uint32_t PDataOffset = alignTo(NewSecVSize, 4);
-        uint32_t CombinedBytes =
-            Combined.size() * sizeof(RuntimeFunction);
-        uint32_t BoltPDataRVA = NewSecVA + PDataOffset;
-
-        OS.seek(NewSecRawPtr + PDataOffset);
-        OS.write(reinterpret_cast<const char *>(Combined.data()),
-                 CombinedBytes);
-
-        // Recompute section sizes now that .pdata is included.
-        NewSecVSize = PDataOffset + CombinedBytes;
-        NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
-        if (NewSecRawSize > NewSecVSize) {
-          std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0x00);
-          OS.seek(NewSecRawPtr + NewSecVSize);
-          OS.write(reinterpret_cast<const char *>(Pad.data()),
-                   Pad.size());
-        }
-
-        NewSec.VirtualSize = NewSecVSize;
-        NewSec.SizeOfRawData = NewSecRawSize;
-        NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
-        OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
-                  SecTableEnd);
-
-        NewSizeOfImage =
-            alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
-        NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
-        OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
-                  OptHdrOff + offsetof(PEHdr, SizeOfCode));
-        OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
-                  OptHdrOff + offsetof(PEHdr, SizeOfImage));
-
-        // Redirect exception directory to the .bolt copy.
-        OS.pwrite(reinterpret_cast<char *>(&BoltPDataRVA), 4,
-                  ExcDirOff);
-        OS.pwrite(reinterpret_cast<char *>(&CombinedBytes), 4,
-                  ExcDirOff + 4);
-
-        outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
-               << OOPFuncs.size() << " new) written to .bolt section\n";
-      }
       } // ExcDirOff bounds check
     }
   }
@@ -1032,8 +1047,7 @@ void PECOFFRewriteInstance::rewriteFile() {
   NumFuncsOverflow = OverflowCount;
   Out->keep();
 
-  outs() << "BOLT-INFO: " << InPlaceCount
-         << " functions rewritten in-place\n";
+  outs() << "BOLT-INFO: " << InPlaceCount << " functions rewritten in-place\n";
   if (OOPWritten)
     outs() << "BOLT-INFO: " << OOPWritten
            << " functions rewritten out-of-place (.bolt section)\n";
@@ -1187,8 +1201,8 @@ void PECOFFRewriteInstance::run() {
     identityRewriteFile();
     if (hasCodeViewDebugInfo(InputFile))
       PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
-                              *BC, ImageBase,
-                              ModifiedFunctions, FunctionOffsetMaps);
+                              *BC, ImageBase, ModifiedFunctions,
+                              FunctionOffsetMaps);
     return;
   }
 
@@ -1264,9 +1278,8 @@ void PECOFFRewriteInstance::run() {
           BB->getOutputSize() ? BB->getOutputSize() : BB->estimateSize();
     }
     // Sort by original offset so the PDB rewriter can do range lookups.
-    llvm::sort(Map, [](const auto &A, const auto &B) {
-      return A.first < B.first;
-    });
+    llvm::sort(Map,
+               [](const auto &A, const auto &B) { return A.first < B.first; });
   }
 
   // Skip emission for functions whose layout did not change.
@@ -1442,10 +1455,8 @@ void PECOFFRewriteInstance::run() {
 
   if (hasCodeViewDebugInfo(InputFile))
     PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
-                            ImageBase, ModifiedFunctions,
-                            FunctionOffsetMaps);
+                            ImageBase, ModifiedFunctions, FunctionOffsetMaps);
 }
 
 } // namespace bolt
 } // namespace llvm
-
