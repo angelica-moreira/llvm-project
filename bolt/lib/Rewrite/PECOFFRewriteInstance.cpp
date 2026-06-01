@@ -733,6 +733,15 @@ void PECOFFRewriteInstance::rewriteFile() {
   // an absent cert table.
   const auto *PE = InputFile->getPE32PlusHeader();
   StringRef FileData = InputFile->getData();
+
+  // Compute PE header layout offsets once (used by cert stripping and OOP).
+  uint32_t PEOff = 0, CoffHdrOff = 0, OptHdrOff = 0;
+  if (PE) {
+    PEOff = support::endian::read32le(FileData.data() + 0x3C);
+    CoffHdrOff = PEOff + 4;
+    OptHdrOff = CoffHdrOff + sizeof(object::coff_file_header);
+  }
+
   uint64_t CopySize = FileData.size();
   uint32_t CertDirOff = 0;
   if (PE) {
@@ -745,14 +754,12 @@ void PECOFFRewriteInstance::rewriteFile() {
       uint32_t CertSize = SecDir->Size;
       if (CertFileOff + CertSize == FileData.size()) {
         CopySize = CertFileOff;
-
-        // Compute the data directory file offset for CERTIFICATE_TABLE so
-        // we can zero it out after all other writes are done.
-        uint32_t PEOff =
-            support::endian::read32le(FileData.data() + 0x3C);
-        uint32_t OptOff = PEOff + 4 + sizeof(object::coff_file_header);
-        CertDirOff = OptOff + sizeof(object::pe32plus_header) +
+        CertDirOff = OptHdrOff + sizeof(object::pe32plus_header) +
                      COFF::CERTIFICATE_TABLE * sizeof(object::data_directory);
+
+        outs() << "BOLT-INFO: stripping " << CertSize
+               << "-byte Authenticode certificate table at file offset 0x"
+               << Twine::utohexstr(CertFileOff) << "\n";
       }
     }
   }
@@ -804,6 +811,8 @@ void PECOFFRewriteInstance::rewriteFile() {
 
   // Write all emitted functions.  Regular functions in the main map
   // plus injected functions (patches created by createInstructionPatch).
+  // Pre-allocate a padding buffer to avoid per-function heap allocation.
+  SmallVector<uint8_t, 4096> PadBuf;
   auto writeFunction = [&](BinaryFunction &Function) {
     if (!Function.isEmitted() || Function.getImageSize() == 0)
       return;
@@ -875,8 +884,9 @@ void PECOFFRewriteInstance::rewriteFile() {
     // Pad in-place functions.
     if (!Function.isPatch() && OutputAddr == OrigAddr &&
         EmittedSize < Function.getMaxSize()) {
-      std::vector<uint8_t> Padding(Function.getMaxSize() - EmittedSize, 0xCC);
-      OS.pwrite(reinterpret_cast<char *>(Padding.data()), Padding.size(),
+      size_t PadSize = Function.getMaxSize() - EmittedSize;
+      PadBuf.assign(PadSize, 0xCC);
+      OS.pwrite(reinterpret_cast<char *>(PadBuf.data()), PadBuf.size(),
                 *FileOff + EmittedSize);
     }
 
@@ -903,10 +913,6 @@ void PECOFFRewriteInstance::rewriteFile() {
 
     constexpr uint32_t SecHdrSize = sizeof(object::coff_section);
 
-    // PE structure already validated by COFFObjectFile parser.
-    uint32_t PEOff = support::endian::read32le(FileData.data() + 0x3C);
-    uint32_t CoffHdrOff = PEOff + 4;
-    uint32_t OptHdrOff = CoffHdrOff + sizeof(object::coff_file_header);
     uint32_t SecTableOff = OptHdrOff + COFFHdr->SizeOfOptionalHeader;
     uint32_t SecTableEnd = SecTableOff + NumSections * SecHdrSize;
 
