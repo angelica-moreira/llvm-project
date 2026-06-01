@@ -248,11 +248,10 @@ public:
 } // namespace
 
 Expected<std::vector<BBAddrMap>> llvm::object::decodeBBAddrMapSection(
-    DataExtractor Data,
+    DataExtractor Data, unsigned AddrSize,
     const DenseMap<uint64_t, uint64_t> &FunctionOffsetTranslations,
     bool IsRelocatable, StringRef SectionDesc,
     std::vector<PGOAnalysisMap> *PGOAnalyses) {
-  unsigned AddrSize = Data.getAddressSize();
   COFFAddressExtractor Extractor(Data, AddrSize, FunctionOffsetTranslations,
                                  IsRelocatable);
   return decodeBBAddrMapPayload(Extractor, PGOAnalyses);

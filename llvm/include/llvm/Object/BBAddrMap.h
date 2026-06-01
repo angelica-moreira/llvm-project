@@ -291,7 +291,7 @@ decodeBBAddrMapPayload(AddressExtractor &Extractor,
 /// \p FunctionOffsetTranslations, then delegates to decodeBBAddrMapPayload.
 /// Falls back to the raw address when no relocation entry is found.
 Expected<std::vector<BBAddrMap>> decodeBBAddrMapSection(
-    DataExtractor Data,
+    DataExtractor Data, unsigned AddrSize,
     const DenseMap<uint64_t, uint64_t> &FunctionOffsetTranslations,
     bool IsRelocatable, StringRef SectionDesc,
     std::vector<PGOAnalysisMap> *PGOAnalyses = nullptr);

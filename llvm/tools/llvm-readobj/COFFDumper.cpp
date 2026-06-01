@@ -2527,7 +2527,7 @@ void COFFDumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
     DataExtractor Data(Contents, /*IsLittleEndian=*/true, AddrSize);
     std::vector<PGOAnalysisMap> PGOAnalyses;
     Expected<std::vector<BBAddrMap>> BBAddrMapOrErr =
-        decodeBBAddrMapSection(Data, FunctionOffsetTranslations,
+        decodeBBAddrMapSection(Data, AddrSize, FunctionOffsetTranslations,
                                IsRelocatable, Name, &PGOAnalyses);
     if (!BBAddrMapOrErr) {
       reportUniqueWarning("unable to decode .llvm_bb_addr_map section: " +
