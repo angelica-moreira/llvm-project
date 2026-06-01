@@ -721,11 +721,42 @@ void PECOFFRewriteInstance::rewriteFile() {
   check_error(EC, "cannot create output executable file");
   raw_fd_ostream &OS = Out->os();
 
-  // Start with a full copy of the original PE.  We patch individual function
+  // Start with a copy of the original PE.  We patch individual function
   // bodies below, leaving headers, imports, relocations etc. untouched.
-  OS << InputFile->getData();
-
+  //
+  // If the binary has an Authenticode certificate table, it sits after the
+  // last section's raw data but inside the file.  The .bolt section is
+  // placed at alignTo(LastSecRawEnd, FileAlignment), which would overlap
+  // the cert table.  Since BOLT already warns that rewriting invalidates
+  // the signature, we strip the trailing cert blob by not copying it, and
+  // zero out the Security data directory entry so no tool tries to parse
+  // an absent cert table.
   const auto *PE = InputFile->getPE32PlusHeader();
+  StringRef FileData = InputFile->getData();
+  uint64_t CopySize = FileData.size();
+  uint32_t CertDirOff = 0;
+  if (PE) {
+    const object::data_directory *SecDir =
+        InputFile->getDataDirectory(COFF::CERTIFICATE_TABLE);
+    if (SecDir && SecDir->RelativeVirtualAddress != 0 && SecDir->Size != 0) {
+      // Note: For the certificate table, RelativeVirtualAddress is actually
+      // a file offset (not an RVA), per the PE spec.
+      uint32_t CertFileOff = SecDir->RelativeVirtualAddress;
+      uint32_t CertSize = SecDir->Size;
+      if (CertFileOff + CertSize == FileData.size()) {
+        CopySize = CertFileOff;
+
+        // Compute the data directory file offset for CERTIFICATE_TABLE so
+        // we can zero it out after all other writes are done.
+        uint32_t PEOff =
+            support::endian::read32le(FileData.data() + 0x3C);
+        uint32_t OptOff = PEOff + 4 + sizeof(object::coff_file_header);
+        CertDirOff = OptOff + sizeof(object::pe32plus_header) +
+                     COFF::CERTIFICATE_TABLE * sizeof(object::data_directory);
+      }
+    }
+  }
+  OS.write(FileData.data(), CopySize);
 
   struct SectionLayout {
     uint32_t VA;
@@ -827,8 +858,19 @@ void PECOFFRewriteInstance::rewriteFile() {
       }
     }
 
-    OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()), EmittedSize,
-              *FileOff);
+    // Use pwrite for in-place writes (within the original file).  For OOP
+    // writes into a new .bolt section beyond the original file end,
+    // raw_pwrite_stream asserts in debug builds because pwrite cannot
+    // extend the stream.  Use seek+write to grow the file naturally.
+    bool IsOOP = (OutputRVA >= NewSecVA && NewSecRawPtr > 0);
+    if (IsOOP) {
+      OS.seek(*FileOff);
+      OS.write(reinterpret_cast<char *>(Function.getImageAddress()),
+               EmittedSize);
+    } else {
+      OS.pwrite(reinterpret_cast<char *>(Function.getImageAddress()),
+                EmittedSize, *FileOff);
+    }
 
     // Pad in-place functions.
     if (!Function.isPatch() && OutputAddr == OrigAddr &&
@@ -858,7 +900,6 @@ void PECOFFRewriteInstance::rewriteFile() {
   if (OOPWritten > 0 && PE) {
     uint32_t NumSections = InputFile->getNumberOfSections();
     const auto *COFFHdr = InputFile->getCOFFHeader();
-    StringRef FileData = InputFile->getData();
 
     constexpr uint32_t SecHdrSize = sizeof(object::coff_section);
 
@@ -1045,6 +1086,14 @@ void PECOFFRewriteInstance::rewriteFile() {
   }
 
   NumFuncsOverflow = OverflowCount;
+
+  // Zero out the Security data directory if we truncated the cert table.
+  if (CertDirOff > 0) {
+    uint64_t Zero = 0;
+    OS.pwrite(reinterpret_cast<char *>(&Zero),
+              sizeof(object::data_directory), CertDirOff);
+  }
+
   Out->keep();
 
   outs() << "BOLT-INFO: " << InPlaceCount << " functions rewritten in-place\n";

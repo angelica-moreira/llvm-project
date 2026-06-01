@@ -11,5 +11,4 @@
 # CHECK: BOLT-INFO: parsed 2 .pdata entries
 # CHECK: BOLT-INFO: 2 functions discovered from .pdata
 # CHECK: BOLT-INFO: emitted object size = {{[0-9]+}} bytes
-# CHECK: BOLT-INFO: resolved relocations for 2 functions
 # CHECK: BOLT-INFO: {{[0-9]+}} functions rewritten

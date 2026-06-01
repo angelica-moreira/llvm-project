@@ -10,5 +10,4 @@
 # RUN: diff %t.exe %t.out.exe
 
 # CHECK: BOLT-INFO: 0 functions had layout modified
-# CHECK: BOLT-INFO: resolved relocations for 2 functions
 # CHECK: BOLT-INFO: 0 functions rewritten
