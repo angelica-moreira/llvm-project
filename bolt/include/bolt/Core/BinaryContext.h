@@ -1100,7 +1100,10 @@ public:
       return Ctx->getCOFFSection(
           SectionName,
           COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_READ);
-    return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+    if (isELF())
+      return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+    return Ctx->getMachOSection("__DATA", SectionName, 0,
+                                SectionKind::getData());
   }
 
   /// \name Pre-assigned Section Names

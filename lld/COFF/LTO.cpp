@@ -114,7 +114,7 @@ lto::Config BitcodeCompiler::createConfig() {
       c.Options.BBSections = BasicBlockSection::List;
     }
   }
-  c.Options.BBAddrMap = ctx.config.ltoBBAddrMap;
+  c.Options.BBAddrMap |= ctx.config.ltoBBAddrMap;
   c.Options.UniqueBasicBlockSectionNames =
       ctx.config.ltoUniqueBasicBlockSectionNames;
 

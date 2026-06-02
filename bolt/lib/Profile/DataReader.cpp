@@ -1383,6 +1383,11 @@ DataReader::writeBranchProfile(StringRef OutputFilename) const {
 
   outs() << "BOLT-INFO: wrote " << BranchValues << " objects to "
          << OutputFilename << "\n";
+  if (OutFile.has_error()) {
+    std::error_code EC2 = OutFile.error();
+    OutFile.clear_error();
+    return EC2;
+  }
   return std::error_code();
 }
 

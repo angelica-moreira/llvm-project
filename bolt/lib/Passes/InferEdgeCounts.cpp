@@ -212,10 +212,27 @@ Error InferEdgeCounts::runOnFunctions(BinaryContext &BC) {
     if (!HasSamples)
       continue;
 
+    // Save original block counts so they can be restored if verification
+    // fails.  propagateFunction() overwrites them in-place.
+    DenseMap<const BinaryBasicBlock *, uint64_t> SavedCounts;
+    for (const BinaryBasicBlock &BB : BF)
+      SavedCounts[&BB] = BB.getExecutionCount();
+
     propagateFunction(BF);
 
-    if (verify(BF))
+    if (verify(BF)) {
       ++FuncsUpdated;
+    } else {
+      // Restore original block counts and clear edge counts so downstream
+      // passes see the original profile, not half-propagated data.
+      for (BinaryBasicBlock &BB : BF) {
+        auto It = SavedCounts.find(&BB);
+        if (It != SavedCounts.end())
+          BB.setExecutionCount(It->second);
+        for (BinaryBasicBlock *Succ : BB.successors())
+          BB.setSuccessorBranchInfo(*Succ, 0, 0);
+      }
+    }
   }
 
   if (FuncsUpdated)

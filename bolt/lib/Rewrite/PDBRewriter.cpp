@@ -299,7 +299,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
         uint64_t LineStart = FileBlockPos + 12;
 
         for (uint32_t L = 0; L < NumLines; ++L) {
-          uint64_t EntryPos = LineStart + L * 8;
+          uint64_t EntryPos = LineStart + (uint64_t)L * 8;
           if (EntryPos + 8 > DataEnd)
             break;
 

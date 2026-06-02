@@ -862,22 +862,30 @@ void PECOFFRewriteInstance::rewriteFile() {
 
   struct SectionLayout {
     uint32_t VA;
-    uint32_t Size;
+    uint32_t VirtualSize;
+    uint32_t RawSize;
     uint32_t FileOffset;
   };
   SmallVector<SectionLayout, 8> SectionMap;
 
   for (const object::SectionRef &Section : InputFile->sections()) {
     const object::coff_section *CS = InputFile->getCOFFSection(Section);
-    SectionMap.push_back(
-        {CS->VirtualAddress, CS->VirtualSize, CS->PointerToRawData});
+    SectionMap.push_back({CS->VirtualAddress, CS->VirtualSize,
+                          CS->SizeOfRawData, CS->PointerToRawData});
   }
 
+  // Map a VA to its file offset.  Uses the smaller of VirtualSize and
+  // SizeOfRawData to avoid returning offsets past the section's raw data
+  // on disk (VirtualSize > SizeOfRawData is legal — the loader zero-fills).
   auto VAToFileOffset = [&](uint64_t VA) -> std::optional<uint64_t> {
     uint32_t RVA = VA - ImageBase;
     for (const auto &S : SectionMap) {
-      if (RVA >= S.VA && RVA < S.VA + S.Size)
-        return S.FileOffset + (RVA - S.VA);
+      if (RVA >= S.VA && RVA < S.VA + S.VirtualSize) {
+        uint32_t Offset = RVA - S.VA;
+        if (Offset < S.RawSize)
+          return S.FileOffset + Offset;
+        return std::nullopt;
+      }
     }
     return std::nullopt;
   };
@@ -945,11 +953,12 @@ void PECOFFRewriteInstance::rewriteFile() {
       if (SEHIt != FunctionSEHInfo.end() && SEHIt->second.PrologSize > 0) {
         uint8_t PrologSize = SEHIt->second.PrologSize;
         auto OrigFileOff = VAToFileOffset(OrigAddr);
-        if (OrigFileOff && PrologSize <= EmittedSize) {
+        if (OrigFileOff && PrologSize <= EmittedSize &&
+            *OrigFileOff + PrologSize <= FileData.size()) {
           const uint8_t *EmittedBytes =
               reinterpret_cast<const uint8_t *>(Function.getImageAddress());
           const uint8_t *OrigBytes = reinterpret_cast<const uint8_t *>(
-              InputFile->getData().data() + *OrigFileOff);
+              FileData.data() + *OrigFileOff);
           if (memcmp(EmittedBytes, OrigBytes, PrologSize) != 0) {
             LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
                               << " - prolog bytes changed by re-encoding\n");
