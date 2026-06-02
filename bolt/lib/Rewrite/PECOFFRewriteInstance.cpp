@@ -23,6 +23,7 @@
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
 #include "llvm/BinaryFormat/COFF.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
@@ -575,11 +576,48 @@ void PECOFFRewriteInstance::postProcessFunctions() {
   }
 }
 
-/// Mark prolog instructions as immutable so that size-changing passes
-/// (ShortenInstructions, RemoveNops) leave them alone.  SEH unwind data
-/// references byte offsets within the prolog, so every instruction there
-/// must keep its original encoding and size.
+/// Returns true if \p Byte is an x86 legacy prefix (operand-size, address-
+/// size, segment, LOCK, REP).  These may appear before a REX prefix.
+static bool isLegacyPrefix(uint8_t Byte) {
+  switch (Byte) {
+  case 0x66: case 0x67: case 0xF0: case 0xF2: case 0xF3:
+  case 0x26: case 0x2E: case 0x36: case 0x3E: case 0x64: case 0x65:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Returns true if \p Byte is an x86-64 REX prefix (0x40–0x4F).
+static bool isREXPrefix(uint8_t Byte) {
+  return Byte >= 0x40 && Byte <= 0x4F;
+}
+
+/// Scan the first \p Len bytes starting at \p Data for a REX prefix,
+/// skipping any leading legacy prefixes.  Returns true if a REX byte
+/// is found.
+static bool originalHasREXPrefix(const uint8_t *Data, uint64_t Len) {
+  for (uint64_t I = 0; I < Len; ++I) {
+    if (isLegacyPrefix(Data[I]))
+      continue;
+    return isREXPrefix(Data[I]);
+  }
+  return false;
+}
+
+/// Freeze prolog instructions so that their emitted encoding exactly matches
+/// the original binary.  MSVC often emits redundant REX prefixes (e.g.
+/// `40 55` for `push rbp`) that the LLVM MC encoder would normally drop.
+/// SEH UNWIND_INFO CodeOffset fields reference byte positions within the
+/// prolog, so every instruction must keep its original size.
+///
+/// Strategy: for each prolog instruction whose original encoding started
+/// with a (possibly redundant) REX prefix, set the X86 IP_USE_REX MCInst
+/// flag.  The MC encoder checks this flag and emits a REX prefix even when
+/// it would otherwise be unnecessary.
 void PECOFFRewriteInstance::freezePrologInstructions() {
+  unsigned FixedCount = 0;
+
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
     if (!BF.hasCFG() || !BF.isSimple())
@@ -593,23 +631,80 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
     if (PrologSize == 0)
       continue;
 
-    // The prolog occupies the first PrologSize bytes of the entry block.
-    BinaryBasicBlock &EntryBB = BF.front();
-    uint32_t Offset = 0;
-    for (MCInst &Inst : EntryBB) {
-      if (Offset >= PrologSize)
+    // Locate the original function bytes in the input binary.
+    uint32_t FuncRVA32 = static_cast<uint32_t>(FuncRVA);
+    const uint8_t *OrigData = nullptr;
+    for (const object::SectionRef &Sec : InputFile->sections()) {
+      const auto *CS = InputFile->getCOFFSection(Sec);
+      if (FuncRVA32 >= CS->VirtualAddress &&
+          FuncRVA32 < CS->VirtualAddress + CS->VirtualSize) {
+        uint64_t FileOff =
+            CS->PointerToRawData + (FuncRVA32 - CS->VirtualAddress);
+        if (FileOff + PrologSize <= InputFile->getData().size())
+          OrigData = reinterpret_cast<const uint8_t *>(
+              InputFile->getData().data() + FileOff);
         break;
-      unsigned InstSize = BC->computeInstructionSize(Inst);
+      }
+    }
+
+    BinaryBasicBlock &EntryBB = BF.front();
+    uint32_t OrigOffset = 0;
+    for (MCInst &Inst : EntryBB) {
+      if (OrigOffset >= PrologSize)
+        break;
+
+      // Decode the original instruction to determine its size.
+      uint64_t OrigInstSize = 0;
+      if (OrigData) {
+        MCInst TmpInst;
+        ArrayRef<uint8_t> Bytes(OrigData + OrigOffset,
+                                PrologSize - OrigOffset);
+        if (!BC->DisAsm->getInstruction(TmpInst, OrigInstSize, Bytes, 0,
+                                        nulls()))
+          break; // Cannot decode — stop processing this prolog.
+      }
+
+      // If the original encoding has a REX prefix, force the encoder to
+      // preserve it.  Check whether the current encoding is shorter
+      // (indicating the encoder would drop the prefix).
+      if (OrigData && OrigInstSize > 0) {
+        unsigned CurSize = BC->computeInstructionSize(Inst);
+        if (CurSize < OrigInstSize &&
+            originalHasREXPrefix(OrigData + OrigOffset, OrigInstSize)) {
+          BC->MIB->forceREXPrefix(Inst);
+          unsigned NewSize = BC->computeInstructionSize(Inst);
+          if (NewSize == OrigInstSize) {
+            ++FixedCount;
+          } else {
+            // Unexpected: IP_USE_REX didn't fully close the size gap.
+            // Log and leave the flag set — it's still closer to correct.
+            LLVM_DEBUG(dbgs()
+                       << "BOLT-DEBUG: REX fix size mismatch for "
+                       << BF.getPrintName() << " prolog inst at +"
+                       << OrigOffset << ": orig=" << OrigInstSize
+                       << " new=" << NewSize << "\n");
+          }
+        }
+        OrigOffset += OrigInstSize;
+      } else {
+        // No original data available — use the re-encoded size.
+        OrigOffset += BC->computeInstructionSize(Inst);
+      }
+
       // Size annotation prevents ShortenInstructions from re-encoding.
-      if (InstSize > 0)
-        BC->MIB->setSize(Inst, InstSize);
+      unsigned FinalSize = BC->computeInstructionSize(Inst);
+      if (FinalSize > 0)
+        BC->MIB->setSize(Inst, FinalSize);
       // Clearing the NOP annotation prevents RemoveNops from deleting
       // alignment padding that is part of the prolog.
       if (BC->MIB->isNoop(Inst))
         BC->MIB->removeAnnotation(Inst, "NOP");
-      Offset += InstSize;
     }
   }
+
+  if (FixedCount)
+    outs() << "BOLT-INFO: preserved REX prefix on " << FixedCount
+           << " prolog instructions for SEH correctness\n";
 }
 
 void PECOFFRewriteInstance::runOptimizationPasses() {

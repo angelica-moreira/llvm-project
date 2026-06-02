@@ -894,6 +894,10 @@ public:
     }
   }
 
+  void forceREXPrefix(MCInst &Inst) const override {
+    Inst.setFlags(Inst.getFlags() | X86::IP_USE_REX);
+  }
+
   static uint8_t getMemDataSize(const MCInst &Inst, int MemOpNo) {
     using namespace llvm::X86;
     int OpType = getOperandType(Inst.getOpcode(), MemOpNo);

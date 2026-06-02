@@ -1638,6 +1638,12 @@ public:
     return false;
   }
 
+  /// For X86, set the IP_USE_REX flag on \p Inst so the MC encoder emits a
+  /// REX prefix even when it is not strictly required by the operands.
+  /// Used by PE/COFF to preserve prolog instruction sizes that SEH
+  /// UNWIND_INFO CodeOffset fields reference.
+  virtual void forceREXPrefix(MCInst &Inst) const {}
+
   /// Modifies the set \p Regs by adding registers \p Inst may rewrite. Caller
   /// is responsible for passing a valid BitVector with the size equivalent to
   /// the number of registers in the target.
