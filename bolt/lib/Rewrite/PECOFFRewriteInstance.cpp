@@ -250,17 +250,21 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   ArrayRef<uint8_t> XDataContents;
   uint64_t XDataRVA = 0;
   if (XDataSec) {
-    if (Error E = InputFile->getSectionContents(XDataSec, XDataContents))
+    if (Error E = InputFile->getSectionContents(XDataSec, XDataContents)) {
+      outs() << "BOLT-WARNING: cannot read .xdata section contents\n";
       consumeError(std::move(E));
-    else
+    } else {
       XDataRVA = XDataSec->VirtualAddress;
+    }
   }
   // Fall back to any section that contains the unwind RVA from the first
   // .pdata entry.  Many PE binaries store UNWIND_INFO in .rdata.
   if (XDataContents.empty()) {
     ArrayRef<uint8_t> PDataPeek;
-    if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek))
+    if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek)) {
+      outs() << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
       consumeError(std::move(E));
+    }
     if (PDataPeek.size() >= 12) {
       uint32_t FirstUnwindRVA = support::endian::read32le(PDataPeek.data() + 8);
       for (const object::SectionRef &Section : InputFile->sections()) {
@@ -268,10 +272,12 @@ void PECOFFRewriteInstance::readExceptionHandling() {
         uint32_t SecStart = CS->VirtualAddress;
         uint32_t SecEnd = SecStart + CS->VirtualSize;
         if (FirstUnwindRVA >= SecStart && FirstUnwindRVA < SecEnd) {
-          if (Error E = InputFile->getSectionContents(CS, XDataContents))
+          if (Error E = InputFile->getSectionContents(CS, XDataContents)) {
+            outs() << "BOLT-WARNING: cannot read unwind data section\n";
             consumeError(std::move(E));
-          else
+          } else {
             XDataRVA = CS->VirtualAddress;
+          }
           break;
         }
       }
@@ -638,11 +644,16 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
       const auto *CS = InputFile->getCOFFSection(Sec);
       if (FuncRVA32 >= CS->VirtualAddress &&
           FuncRVA32 < CS->VirtualAddress + CS->VirtualSize) {
-        uint64_t FileOff =
-            CS->PointerToRawData + (FuncRVA32 - CS->VirtualAddress);
-        if (FileOff + PrologSize <= InputFile->getData().size())
-          OrigData = reinterpret_cast<const uint8_t *>(
-              InputFile->getData().data() + FileOff);
+        uint32_t SecOffset = FuncRVA32 - CS->VirtualAddress;
+        // Ensure the prolog lies within the section's raw data on disk,
+        // not just the virtual range (VirtualSize > SizeOfRawData is
+        // legal — the loader zero-fills the gap).
+        if (SecOffset + PrologSize <= CS->SizeOfRawData) {
+          uint64_t FileOff = CS->PointerToRawData + SecOffset;
+          if (FileOff + PrologSize <= InputFile->getData().size())
+            OrigData = reinterpret_cast<const uint8_t *>(
+                InputFile->getData().data() + FileOff);
+        }
         break;
       }
     }
@@ -878,7 +889,12 @@ void PECOFFRewriteInstance::rewriteFile() {
   // SizeOfRawData to avoid returning offsets past the section's raw data
   // on disk (VirtualSize > SizeOfRawData is legal — the loader zero-fills).
   auto VAToFileOffset = [&](uint64_t VA) -> std::optional<uint64_t> {
-    uint32_t RVA = VA - ImageBase;
+    if (VA < ImageBase)
+      return std::nullopt;
+    uint64_t RVA64 = VA - ImageBase;
+    if (RVA64 > UINT32_MAX)
+      return std::nullopt;
+    uint32_t RVA = static_cast<uint32_t>(RVA64);
     for (const auto &S : SectionMap) {
       if (RVA >= S.VA && RVA < S.VA + S.VirtualSize) {
         uint32_t Offset = RVA - S.VA;
@@ -1040,8 +1056,10 @@ void PECOFFRewriteInstance::rewriteFile() {
 
       // PE header updates using offsetof to avoid magic numbers.
       using PEHdr = object::pe32plus_header;
+      using CoffHdr = object::coff_file_header;
       uint16_t NewNumSections = NumSections + 1;
-      OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2, CoffHdrOff + 2);
+      OS.pwrite(reinterpret_cast<char *>(&NewNumSections), 2,
+                CoffHdrOff + offsetof(CoffHdr, NumberOfSections));
       uint32_t NewSizeOfImage =
           alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
       uint32_t NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
@@ -1093,8 +1111,6 @@ void PECOFFRewriteInstance::rewriteFile() {
         }
 
         if (PDataFileOff > 0 && PDataFileOff + ExcSize <= FileData.size()) {
-          const uint32_t PatchSize = 5; // JMP rel32
-
           struct OOPInfo {
             uint32_t OrigRVA, BoltRVA, Size;
           };
@@ -1119,22 +1135,25 @@ void PECOFFRewriteInstance::rewriteFile() {
           for (const auto &O : OOPFuncs)
             OOPOrigRVAs.insert(O.OrigRVA);
 
-          // Copy original .pdata, shrink OOP entries to trampoline size.
+          // Copy original .pdata, removing entries for OOP functions.
+          // The original address now contains a leaf JMP trampoline that
+          // needs no unwind metadata.  Keeping the old UNWIND_INFO would
+          // describe a prolog that no longer exists, which could cause
+          // incorrect stack unwinding if the PC lands in the trampoline.
           auto *OrigEntries = reinterpret_cast<const RuntimeFunction *>(
               FileData.data() + PDataFileOff);
-          SmallVector<RuntimeFunction> Combined(OrigEntries,
-                                                OrigEntries + NumPdataEntries);
-
+          SmallVector<RuntimeFunction> Combined;
           DenseMap<uint32_t, uint32_t> UnwindMap;
-          for (auto &E : Combined) {
-            if (OOPOrigRVAs.count(E.BeginAddress)) {
-              UnwindMap[E.BeginAddress] = E.UnwindInfoAddress;
-              E.EndAddress = E.BeginAddress + PatchSize;
-            }
+          Combined.reserve(NumPdataEntries + OOPFuncs.size());
+          for (size_t Idx = 0; Idx < NumPdataEntries; ++Idx) {
+            if (OOPOrigRVAs.count(OrigEntries[Idx].BeginAddress))
+              UnwindMap[OrigEntries[Idx].BeginAddress] =
+                  OrigEntries[Idx].UnwindInfoAddress;
+            else
+              Combined.push_back(OrigEntries[Idx]);
           }
 
-          // Append entries for .bolt copies (highest RVAs, sort order
-          // preserved).
+          // Append entries for .bolt copies with the original UNWIND_INFO.
           for (const auto &O : OOPFuncs) {
             auto It = UnwindMap.find(O.OrigRVA);
             if (It == UnwindMap.end())
@@ -1165,9 +1184,10 @@ void PECOFFRewriteInstance::rewriteFile() {
           NewSecVSize = PDataOffset + CombinedBytes;
           NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
           if (NewSecRawSize > NewSecVSize) {
-            std::vector<uint8_t> Pad(NewSecRawSize - NewSecVSize, 0x00);
+            PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
             OS.seek(NewSecRawPtr + NewSecVSize);
-            OS.write(reinterpret_cast<const char *>(Pad.data()), Pad.size());
+            OS.write(reinterpret_cast<const char *>(PadBuf.data()),
+                     PadBuf.size());
           }
 
           NewSec.VirtualSize = NewSecVSize;

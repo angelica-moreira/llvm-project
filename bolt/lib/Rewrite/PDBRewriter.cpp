@@ -307,17 +307,17 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
           uint32_t Flags = support::endian::read32le(&C13Bytes[EntryPos + 4]);
           LineInfo LI(Flags);
 
-          // Remap through BB offset map.
+          // Remap through BB offset map using binary search.
+          // BBMap is sorted by old offset (first element of each pair).
           uint32_t NewOffset = OldOffset;
-          for (size_t J = 0; J < BBMap.size(); ++J) {
-            uint32_t BBOldStart = BBMap[J].first;
-            uint32_t BBNewStart = BBMap[J].second;
-            uint32_t BBOldEnd =
-                (J + 1 < BBMap.size()) ? BBMap[J + 1].first : UINT32_MAX;
-            if (OldOffset >= BBOldStart && OldOffset < BBOldEnd) {
-              NewOffset = BBNewStart + (OldOffset - BBOldStart);
-              break;
-            }
+          auto UB = std::upper_bound(
+              BBMap.begin(), BBMap.end(), OldOffset,
+              [](uint32_t Val, const std::pair<uint32_t, uint32_t> &P) {
+                return Val < P.first;
+              });
+          if (UB != BBMap.begin()) {
+            --UB;
+            NewOffset = UB->second + (OldOffset - UB->first);
           }
 
           if (OldOffset != NewOffset) {

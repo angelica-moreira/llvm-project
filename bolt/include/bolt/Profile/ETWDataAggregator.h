@@ -63,8 +63,8 @@ private:
   std::string findXperf() const;
   Error launchXperf();
 
-  /// Read the preferred ImageBase from the PE header.
-  uint64_t readPreferredBase() const;
+  /// Read the preferred ImageBase from the PE header (cached).
+  uint64_t readPreferredBase();
 
   /// Scan I-Start events to find the runtime load address (ASLR).
   void parseImageLoadEvents(StringRef Dump);
@@ -94,6 +94,10 @@ private:
 
   /// Runtime load address minus preferred ImageBase.
   int64_t ASLROffset{0};
+
+  /// Cached PE preferred ImageBase, read once from the binary header.
+  uint64_t CachedPreferredBase{0};
+  bool PreferredBaseRead{false};
 
   uint64_t TotalEvents{0};
   uint64_t MatchedSamples{0};

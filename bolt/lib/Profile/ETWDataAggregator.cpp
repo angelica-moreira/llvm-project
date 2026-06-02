@@ -207,7 +207,11 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
   return true;
 }
 
-uint64_t ETWDataAggregator::readPreferredBase() const {
+uint64_t ETWDataAggregator::readPreferredBase() {
+  if (PreferredBaseRead)
+    return CachedPreferredBase;
+  PreferredBaseRead = true;
+
   ErrorOr<std::unique_ptr<MemoryBuffer>> FileBuf =
       MemoryBuffer::getFile(BC->getFilename());
   if (!FileBuf)
@@ -219,8 +223,8 @@ uint64_t ETWDataAggregator::readPreferredBase() const {
     return 0;
   }
   if (auto *COFF = dyn_cast<object::COFFObjectFile>(ObjOrErr->get()))
-    return COFF->getImageBase();
-  return 0;
+    CachedPreferredBase = COFF->getImageBase();
+  return CachedPreferredBase;
 }
 
 void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
@@ -385,6 +389,14 @@ Error ETWDataAggregator::parseXperfOutput() {
   StringRef Remaining = Dump;
   uint64_t LinesProcessed = 0;
 
+  // Buffer inferred edges (from consecutive timer samples on the same
+  // thread).  These are only used as a fallback when no real LBR data
+  // is available — they must not contaminate a real branch profile.
+  struct InferredEdge {
+    uint64_t From, To;
+  };
+  SmallVector<InferredEdge, 0> DeferredInferred;
+
   while (!Remaining.empty()) {
     auto [Line, Rest] = Remaining.split('\n');
     Remaining = Rest;
@@ -476,17 +488,29 @@ Error ETWDataAggregator::parseXperfOutput() {
       BasicSamples[{Name, Offset}] += 1;
     }
 
-    // When LBR data is available, edges come from BranchTrace/LastBranch
-    // events above.  As a fallback, infer edges from consecutive timer
-    // samples on the same thread.  These are noisy (the timer fires ~1ms
-    // apart) but provide some signal when LBR is not available.
+    // Track consecutive samples per thread for edge inference.  Actual
+    // recording is deferred until after the main loop so that inferred
+    // edges are only used when no real LBR data is present — mixing them
+    // would contaminate the high-quality branch profile.
+    //
+    // Guard: stop buffering once LBR events have been seen.  This
+    // prevents unbounded memory growth for large traces where LBR
+    // and timer events are interleaved.
     if (ThreadID != 0) {
       auto &LastIP = LastIPPerThread[ThreadID];
-      if (LastIP != 0 && LastIP != IP) {
-        recordBranchEvent(LastIP, IP, 1, 0);
-        ++InferredBranches;
-      }
+      if (LastIP != 0 && LastIP != IP && MatchedLBRBranches == 0)
+        DeferredInferred.push_back({LastIP, IP});
       LastIP = IP;
+    }
+  }
+
+  // Replay inferred edges only when no real LBR data was found.
+  // Mixing noisy timer-inferred edges with high-quality LBR data
+  // would degrade the branch profile.
+  if (MatchedLBRBranches == 0) {
+    for (const auto &E : DeferredInferred) {
+      if (recordBranchEvent(E.From, E.To, 1, 0))
+        ++InferredBranches;
     }
   }
 

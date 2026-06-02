@@ -17,6 +17,7 @@
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 #include <map>
 #include <memory>
@@ -42,7 +43,7 @@ struct SEHUnwindInfo {
   uint8_t PrologSize = 0;
   uint8_t FrameRegister = 0;
   uint8_t FrameOffset = 0;
-  std::vector<uint16_t> UnwindCodes;
+  SmallVector<uint16_t, 8> UnwindCodes;
   uint32_t ExceptionHandlerRVA = 0;
   bool HasExceptionHandler = false;
   bool IsChained = false;
