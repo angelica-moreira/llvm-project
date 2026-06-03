@@ -89,7 +89,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   // Find the PDB file.
   std::string PDBPath = findPDBPath(InputExe);
   if (PDBPath.empty()) {
-    outs() << "BOLT-INFO: no PDB found, skipping debug info update\n";
+    BC.outs() << "BOLT-INFO: no PDB found, skipping debug info update\n";
     return;
   }
 
@@ -100,19 +100,19 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     if (sys::fs::exists(Adjacent)) {
       PDBPath = std::string(Adjacent);
     } else {
-      outs() << "BOLT-WARNING: PDB file " << PDBPath
+      BC.outs() << "BOLT-WARNING: PDB file " << PDBPath
              << " not found, debug info will be stale\n";
       return;
     }
   }
 
-  outs() << "BOLT-INFO: updating PDB " << PDBPath << "\n";
+  BC.outs() << "BOLT-INFO: updating PDB " << PDBPath << "\n";
 
   // Open the PDB.
   ErrorOr<std::unique_ptr<MemoryBuffer>> PDBBuf =
       MemoryBuffer::getFile(PDBPath);
   if (!PDBBuf) {
-    errs() << "BOLT-WARNING: cannot open PDB: " << PDBBuf.getError().message()
+    BC.errs() << "BOLT-WARNING: cannot open PDB: " << PDBBuf.getError().message()
            << "\n";
     return;
   }
@@ -122,12 +122,12 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
       std::move(*PDBBuf), llvm::endianness::little);
   pdb::PDBFile PDBFile(PDBPath, std::move(Stream), Alloc);
   if (Error E = PDBFile.parseFileHeaders()) {
-    errs() << "BOLT-WARNING: cannot parse PDB headers: "
+    BC.errs() << "BOLT-WARNING: cannot parse PDB headers: "
            << toString(std::move(E)) << "\n";
     return;
   }
   if (Error E = PDBFile.parseStreamData()) {
-    errs() << "BOLT-WARNING: cannot parse PDB streams: "
+    BC.errs() << "BOLT-WARNING: cannot parse PDB streams: "
            << toString(std::move(E)) << "\n";
     return;
   }
@@ -140,7 +140,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   // Read DBI stream to iterate modules and symbols.
   Expected<pdb::DbiStream &> DbiOrErr = PDBFile.getPDBDbiStream();
   if (!DbiOrErr) {
-    errs() << "BOLT-WARNING: cannot read DBI stream: "
+    BC.errs() << "BOLT-WARNING: cannot read DBI stream: "
            << toString(DbiOrErr.takeError()) << "\n";
     return;
   }
@@ -219,7 +219,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
                         << " at VA 0x" << Twine::utohexstr(FuncVA)
                         << " was rewritten\n");
       if (opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: function " << ProcOrErr->Name
+        BC.outs() << "BOLT-INFO: function " << ProcOrErr->Name
                << " was rewritten, line info may be inaccurate\n";
       ++UpdatedSymbols;
     }
@@ -343,7 +343,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
       AllPatches.push_back({ModiStream, P.StreamOffset, P.NewValue});
 
     if (!Patches.empty() && opts::Verbosity >= 1) {
-      outs() << "BOLT-INFO: " << Patches.size()
+      BC.outs() << "BOLT-INFO: " << Patches.size()
              << " line entries remapped for module " << I << "\n";
     }
   }
@@ -354,7 +354,7 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
 
   std::error_code CopyEC = sys::fs::copy_file(PDBPath, OutputPDB);
   if (CopyEC) {
-    errs() << "BOLT-WARNING: cannot copy PDB to " << OutputPDB << ": "
+    BC.errs() << "BOLT-WARNING: cannot copy PDB to " << OutputPDB << ": "
            << CopyEC.message() << "\n";
     return;
   }
@@ -405,14 +405,14 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
     }
   }
 
-  outs() << "BOLT-INFO: wrote PDB to " << OutputPDB << "\n";
+  BC.outs() << "BOLT-INFO: wrote PDB to " << OutputPDB << "\n";
   if (RemappedLines > 0)
-    outs() << "BOLT-INFO: patched " << RemappedLines
+    BC.outs() << "BOLT-INFO: patched " << RemappedLines
            << " line entries in PDB for " << UpdatedSymbols
            << " in-place rewritten functions\n";
   else if (UpdatedSymbols > 0)
-    outs() << "BOLT-INFO: " << UpdatedSymbols
+    BC.outs() << "BOLT-INFO: " << UpdatedSymbols
            << " rewritten functions found in PDB (no line remapping needed)\n";
   else
-    outs() << "BOLT-INFO: PDB unchanged (no rewritten functions found)\n";
+    BC.outs() << "BOLT-INFO: PDB unchanged (no rewritten functions found)\n";
 }

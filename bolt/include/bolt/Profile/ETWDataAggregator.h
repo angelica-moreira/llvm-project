@@ -20,6 +20,7 @@
 #define BOLT_PROFILE_ETW_DATA_AGGREGATOR_H
 
 #include "bolt/Profile/DataReader.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include <map>
@@ -86,7 +87,7 @@ private:
   std::error_code writeAggregatedFile(StringRef OutputFilename) const;
 
   /// Per-thread last IP, used to infer edges from consecutive samples.
-  std::map<uint64_t, uint64_t> LastIPPerThread;
+  DenseMap<uint64_t, uint64_t> LastIPPerThread;
 
   /// IP sample counts: maps (function_name, offset) to hit count.
   /// Used for no_lbr output when only timer samples are available.

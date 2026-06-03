@@ -214,8 +214,8 @@ void PECOFFRewriteInstance::readSpecialSections() {
   }
 
   if (opts::PrintSections) {
-    outs() << "BOLT-INFO: Sections from original binary:\n";
-    BC->printSections(outs());
+    BC->outs() << "BOLT-INFO: Sections from original binary:\n";
+    BC->printSections(BC->outs());
   }
 }
 
@@ -236,7 +236,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   }
 
   if (!PDataSec) {
-    outs() << "BOLT-WARNING: no .pdata section found\n";
+    BC->outs() << "BOLT-WARNING: no .pdata section found\n";
     return;
   }
 
@@ -246,7 +246,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   uint64_t XDataRVA = 0;
   if (XDataSec) {
     if (Error E = InputFile->getSectionContents(XDataSec, XDataContents)) {
-      outs() << "BOLT-WARNING: cannot read .xdata section contents\n";
+      BC->outs() << "BOLT-WARNING: cannot read .xdata section contents\n";
       consumeError(std::move(E));
     } else {
       XDataRVA = XDataSec->VirtualAddress;
@@ -257,7 +257,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   if (XDataContents.empty()) {
     ArrayRef<uint8_t> PDataPeek;
     if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek)) {
-      outs() << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
+      BC->outs() << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
       consumeError(std::move(E));
     }
     if (PDataPeek.size() >= 12) {
@@ -268,7 +268,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
         uint32_t SecEnd = SecStart + CS->VirtualSize;
         if (FirstUnwindRVA >= SecStart && FirstUnwindRVA < SecEnd) {
           if (Error E = InputFile->getSectionContents(CS, XDataContents)) {
-            outs() << "BOLT-WARNING: cannot read unwind data section\n";
+            BC->outs() << "BOLT-WARNING: cannot read unwind data section\n";
             consumeError(std::move(E));
           } else {
             XDataRVA = CS->VirtualAddress;
@@ -283,7 +283,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   ArrayRef<uint8_t> PDataContents;
   if (Error E = InputFile->getSectionContents(PDataSec, PDataContents)) {
     consumeError(std::move(E));
-    outs() << "BOLT-WARNING: cannot read .pdata section\n";
+    BC->outs() << "BOLT-WARNING: cannot read .pdata section\n";
     return;
   }
 
@@ -292,7 +292,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
       reinterpret_cast<const RuntimeFunction *>(PDataContents.data());
 
   // First pass: parse UNWIND_INFO and detect chained entries
-  std::map<uint32_t, uint32_t>
+  DenseMap<uint32_t, uint32_t>
       ChainToParent; // chained begin RVA -> parent begin RVA
 
   for (size_t I = 0; I < NumEntries; ++I) {
@@ -370,14 +370,14 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     ChainToParent[ChainedRVA] = Root;
   }
 
-  outs() << "BOLT-INFO: parsed " << FunctionSEHInfo.size()
+  BC->outs() << "BOLT-INFO: parsed " << FunctionSEHInfo.size()
          << " .pdata entries, " << ChainToParent.size() << " chained\n";
 }
 
 void PECOFFRewriteInstance::discoverFileObjects() {
 
   // Build address-to-name map from the COFF symbol table.
-  std::map<uint64_t, StringRef> AddressToName;
+  DenseMap<uint64_t, StringRef> AddressToName;
 
   for (const object::SymbolRef &Symbol : InputFile->symbols()) {
     Expected<object::SymbolRef::Type> TypeOrErr = Symbol.getType();
@@ -444,9 +444,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
 
   NumFuncsWithHandlers = FuncsSkippedHandler;
 
-  outs() << "BOLT-INFO: " << FuncsCreated
+  BC->outs() << "BOLT-INFO: " << FuncsCreated
          << " functions discovered from .pdata\n";
-  outs() << "BOLT-INFO: " << FuncsSkippedHandler
+  BC->outs() << "BOLT-INFO: " << FuncsSkippedHandler
          << " functions with exception handlers (skipped)\n";
 }
 
@@ -473,14 +473,14 @@ void PECOFFRewriteInstance::disassembleFunctions() {
     }
 
     if (opts::PrintDisasm)
-      Function.print(outs(), "after disassembly");
+      Function.print(BC->outs(), "after disassembly");
     ++DisasmCount;
   }
 
-  outs() << "BOLT-INFO: disassembled " << DisasmCount << " functions";
+  BC->outs() << "BOLT-INFO: disassembled " << DisasmCount << " functions";
   if (FailCount)
-    outs() << " (" << FailCount << " failed)";
-  outs() << "\n";
+    BC->outs() << " (" << FailCount << " failed)";
+  BC->outs() << "\n";
 }
 
 void PECOFFRewriteInstance::buildFunctionsCFG() {
@@ -501,10 +501,10 @@ void PECOFFRewriteInstance::buildFunctionsCFG() {
     ++CFGCount;
   }
 
-  outs() << "BOLT-INFO: built CFG for " << CFGCount << " functions";
+  BC->outs() << "BOLT-INFO: built CFG for " << CFGCount << " functions";
   if (FailCount)
-    outs() << " (" << FailCount << " failed)";
-  outs() << "\n";
+    BC->outs() << " (" << FailCount << " failed)";
+  BC->outs() << "\n";
 }
 
 void PECOFFRewriteInstance::postProcessFunctions() {
@@ -554,7 +554,7 @@ void PECOFFRewriteInstance::postProcessFunctions() {
     }
   }
   if (FTFixups)
-    outs() << "BOLT-INFO: added " << FTFixups
+    BC->outs() << "BOLT-INFO: added " << FTFixups
            << " cross-function fall-through fixups\n";
 
   for (auto &BFI : BC->getBinaryFunctions()) {
@@ -563,7 +563,7 @@ void PECOFFRewriteInstance::postProcessFunctions() {
       continue;
     Function.postProcessCFG();
     if (opts::PrintCFG)
-      Function.print(outs(), "after building cfg");
+      Function.print(BC->outs(), "after building cfg");
   }
 }
 
@@ -608,7 +608,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
     if (!BF.hasCFG() || !BF.isSimple())
       continue;
 
-    uint64_t FuncRVA = BF.getAddress() - ImageBase;
+    uint32_t FuncRVA = static_cast<uint32_t>(BF.getAddress() - ImageBase);
     auto SEHIt = FunctionSEHInfo.find(FuncRVA);
     if (SEHIt == FunctionSEHInfo.end())
       continue;
@@ -689,7 +689,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
   }
 
   if (FixedCount)
-    outs() << "BOLT-INFO: preserved REX prefix on " << FixedCount
+    BC->outs() << "BOLT-INFO: preserved REX prefix on " << FixedCount
            << " prolog instructions for SEH correctness\n";
 }
 
@@ -774,7 +774,7 @@ void PECOFFRewriteInstance::emitAndLink() {
   Streamer->finish();
 
   StringRef ObjContents = BOS->str();
-  outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
+  BC->outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
          << " bytes\n";
 
   std::unique_ptr<MemoryBuffer> ObjectMemBuffer =
@@ -832,7 +832,7 @@ void PECOFFRewriteInstance::rewriteFile() {
         CertDirOff = OptHdrOff + sizeof(object::pe32plus_header) +
                      COFF::CERTIFICATE_TABLE * sizeof(object::data_directory);
 
-        outs() << "BOLT-INFO: stripping " << CertSize
+        BC->outs() << "BOLT-INFO: stripping " << CertSize
                << "-byte Authenticode certificate table at file offset 0x"
                << Twine::utohexstr(CertFileOff) << "\n";
       }
@@ -943,7 +943,7 @@ void PECOFFRewriteInstance::rewriteFile() {
             LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
                               << " - prolog bytes changed by re-encoding\n");
             if (opts::Verbosity >= 1)
-              outs() << "BOLT-INFO: skipping " << Function.getPrintName()
+              BC->outs() << "BOLT-INFO: skipping " << Function.getPrintName()
                      << " - prolog re-encoded differently\n";
             return;
           }
@@ -1041,7 +1041,7 @@ void PECOFFRewriteInstance::rewriteFile() {
                                COFF::IMAGE_SCN_MEM_READ;
       OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec), SecTableEnd);
 
-      outs() << "BOLT-INFO: added .bolt section at VA 0x"
+      BC->outs() << "BOLT-INFO: added .bolt section at VA 0x"
              << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
              << " functions)\n";
 
@@ -1051,7 +1051,7 @@ void PECOFFRewriteInstance::rewriteFile() {
           OptHdrOff + sizeof(PEHdr) +
           COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
       if (ExcDirOff + 8 > FileData.size()) {
-        outs() << "BOLT-WARNING: exception directory offset out of bounds\n";
+        BC->outs() << "BOLT-WARNING: exception directory offset out of bounds\n";
       } else {
         uint32_t ExcRVA =
             support::endian::read32le(FileData.data() + ExcDirOff);
@@ -1164,7 +1164,7 @@ void PECOFFRewriteInstance::rewriteFile() {
           OS.pwrite(reinterpret_cast<char *>(&BoltPDataRVA), 4, ExcDirOff);
           OS.pwrite(reinterpret_cast<char *>(&CombinedBytes), 4, ExcDirOff + 4);
 
-          outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
+          BC->outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
                  << OOPFuncs.size() << " new) written to .bolt section\n";
         }
       } // ExcDirOff bounds check
@@ -1182,14 +1182,14 @@ void PECOFFRewriteInstance::rewriteFile() {
 
   Out->keep();
 
-  outs() << "BOLT-INFO: " << InPlaceCount << " functions rewritten in-place\n";
+  BC->outs() << "BOLT-INFO: " << InPlaceCount << " functions rewritten in-place\n";
   if (OOPWritten)
-    outs() << "BOLT-INFO: " << OOPWritten
+    BC->outs() << "BOLT-INFO: " << OOPWritten
            << " functions rewritten out-of-place (.bolt section)\n";
   if (OverflowCount)
-    outs() << "BOLT-INFO: " << OverflowCount
+    BC->outs() << "BOLT-INFO: " << OverflowCount
            << " functions could not be optimized\n";
-  outs() << "BOLT-INFO: output binary: " << opts::OutputFilename << "\n";
+  BC->outs() << "BOLT-INFO: output binary: " << opts::OutputFilename << "\n";
 }
 
 void PECOFFRewriteInstance::identityRewriteFile() {
@@ -1201,12 +1201,12 @@ void PECOFFRewriteInstance::identityRewriteFile() {
   Out->os() << InputFile->getData();
   Out->keep();
 
-  outs() << "BOLT-INFO: identity copy written to " << opts::OutputFilename
+  BC->outs() << "BOLT-INFO: identity copy written to " << opts::OutputFilename
          << "\n";
 }
 
 void PECOFFRewriteInstance::run() {
-  outs() << "BOLT-INFO: processing PE/COFF binary\n";
+  BC->outs() << "BOLT-INFO: processing PE/COFF binary\n";
 
   adjustCommandLineOptions();
 
@@ -1239,7 +1239,7 @@ void PECOFFRewriteInstance::run() {
       }
     }
     if (IsIncremental) {
-      errs() << "BOLT-ERROR: binary is incrementally linked (/INCREMENTAL). "
+      BC->errs() << "BOLT-ERROR: binary is incrementally linked (/INCREMENTAL). "
                 "Re-link with /INCREMENTAL:NO.\n";
       exit(1);
     }
@@ -1248,13 +1248,13 @@ void PECOFFRewriteInstance::run() {
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
       if (opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)\n";
+        BC->outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)\n";
     }
 
     // Code integrity requires a valid Authenticode signature.
     if (PE && (PE->DLLCharacteristics &
                COFF::IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)) {
-      errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK — rewriting "
+      BC->errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK — rewriting "
                 "invalidates the signature.\n";
       exit(1);
     }
@@ -1267,7 +1267,7 @@ void PECOFFRewriteInstance::run() {
       const object::data_directory *SecDir =
           InputFile->getDataDirectory(COFF::CERTIFICATE_TABLE);
       if (SecDir && SecDir->RelativeVirtualAddress != 0 && SecDir->Size != 0) {
-        errs() << "BOLT-WARNING: binary has an Authenticode signature — "
+        BC->errs() << "BOLT-WARNING: binary has an Authenticode signature — "
                   "rewriting will invalidate it.\n";
       }
     }
@@ -1286,7 +1286,7 @@ void PECOFFRewriteInstance::run() {
         }
       }
       if (HasCOMDAT && opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: binary has COMDAT sections (likely /LTCG)\n";
+        BC->outs() << "BOLT-INFO: binary has COMDAT sections (likely /LTCG)\n";
     }
   }
 
@@ -1308,7 +1308,7 @@ void PECOFFRewriteInstance::run() {
     return;
 
   if (!ProfileReader) {
-    outs() << "BOLT-INFO: no profile data, producing identity copy\n";
+    BC->outs() << "BOLT-INFO: no profile data, producing identity copy\n";
     identityRewriteFile();
     if (hasCodeViewDebugInfo(InputFile))
       PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
@@ -1360,7 +1360,7 @@ void PECOFFRewriteInstance::run() {
       ModifiedFunctions.insert(BF.getAddress());
   }
 
-  outs() << "BOLT-INFO: " << ModifiedFunctions.size()
+  BC->outs() << "BOLT-INFO: " << ModifiedFunctions.size()
          << " functions had layout modified\n";
 
   // Record BB offset translation for PDB line-table remapping.
@@ -1453,7 +1453,7 @@ void PECOFFRewriteInstance::run() {
 
     if (BF.getMaxSize() < PatchSize) {
       if (opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: " << BF << " too small for patch ("
+        BC->outs() << "BOLT-INFO: " << BF << " too small for patch ("
                << BF.getMaxSize() << " < " << PatchSize << ")\n";
       BF.setSimple(false);
       continue;
@@ -1503,12 +1503,12 @@ void PECOFFRewriteInstance::run() {
     ++OOPCount;
     OOPFunctions.insert(FuncVA);
     if (opts::Verbosity >= 1)
-      outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
+      BC->outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
              << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
              << " with entry patch\n";
   }
   if (OOPCount)
-    outs() << "BOLT-INFO: " << OOPCount
+    BC->outs() << "BOLT-INFO: " << OOPCount
            << " functions rewritten out-of-place (.bolt section)\n";
 
   // Drop PDB offset maps for OOP and skipped functions — their line

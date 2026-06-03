@@ -19,7 +19,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
-#include <map>
 #include <memory>
 
 namespace llvm {
@@ -78,7 +77,7 @@ class PECOFFRewriteInstance {
   std::unique_ptr<ProfileReaderBase> ProfileReader;
 
   /// SEH unwind info indexed by function begin RVA.
-  std::map<uint64_t, SEHUnwindInfo> FunctionSEHInfo;
+  DenseMap<uint32_t, SEHUnwindInfo> FunctionSEHInfo;
 
   /// Number of functions skipped due to exception handlers.
   uint64_t NumFuncsWithHandlers = 0;
