@@ -504,9 +504,7 @@ Error ETWDataAggregator::parseXperfOutput() {
     }
   }
 
-  // Replay inferred edges only when no real LBR data was found.
-  // Mixing noisy timer-inferred edges with high-quality LBR data
-  // would degrade the branch profile.
+  // Only use inferred edges when no LBR data is present.
   if (MatchedLBRBranches == 0) {
     for (const auto &E : DeferredInferred) {
       if (recordBranchEvent(E.From, E.To, 1, 0))

@@ -8,27 +8,15 @@
 //
 // Infer CFG edge counts from basic block execution counts.
 //
-// When profiling without branch records (no LBR/no brstack), BOLT has
-// per-block sample counts but no edge (branch) counts.  Block reordering
-// passes such as ext-tsp require edge weights.  This pass fills them in
-// by distributing each block's count across its outgoing edges in
-// proportion to successor block counts.
+// When profiling without branch records (no LBR), BOLT has per-block sample
+// counts but no edge weights.  This pass fills them in using the Wu-Larus
+// local frequency propagation algorithm [1], adapted for sample-based block
+// counts as described in VESPA [2].
 //
-// References:
-//
-//   [1] Y. Wu and J. R. Larus, "Static branch frequency and program
-//       profile analysis," in Proc. MICRO-27, 1994, pp. 1-11.
-//       https://doi.org/10.1145/192724.192725
-//
-//   [2] A. Moreira et al., "VESPA: Static Profiling for Binary
-//       Optimization," in Proc. ACM Program. Lang. (OOPSLA), 2021.
-//       https://doi.org/10.1145/3485521
-//
-// The local frequency propagation follows Section 4 of [1]: process
-// blocks in reverse postorder, scale loop headers by the cyclic
-// probability, and distribute to outgoing edges.  The adaptation for
-// sample-based block counts (rather than heuristic branch probabilities)
-// follows the approach used in VESPA [2].
+//   [1] Wu & Larus, "Static branch frequency and program profile analysis",
+//       MICRO-27, 1994.
+//   [2] Moreira et al., "VESPA: Static Profiling for Binary Optimization",
+//       OOPSLA 2021.
 //
 //===----------------------------------------------------------------------===//
 

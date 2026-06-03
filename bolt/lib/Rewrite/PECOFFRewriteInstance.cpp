@@ -97,9 +97,7 @@ PECOFFRewriteInstance::PECOFFRewriteInstance(object::COFFObjectFile *InputFile,
     : InputFile(InputFile), ToolPath(ToolPath) {
   ErrorAsOutParameter EAO(&Err);
 
-  // Build a proper triple for the PE/COFF input.
-  // ObjectFile::makeTriple() does not set the object format for COFF AMD64,
-  // so we must fix it here to ensure MCContext creates COFF-aware structures.
+  // ObjectFile::makeTriple() omits the object format for COFF AMD64.
   Triple TheTriple = InputFile->makeTriple();
   TheTriple.setObjectFormat(Triple::COFF);
   if (TheTriple.getOS() == Triple::UnknownOS)
@@ -139,7 +137,7 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
                                    inconvertibleErrorCode());
   }
 
-  // Choose the right reader based on the file type.
+  // PE/COFF profiles come in two flavors.
   if (ETWDataAggregator::checkETLMagic(Filename) ||
       Filename.ends_with_insensitive(".csv"))
     ProfileReader = std::make_unique<ETWDataAggregator>(Filename);
@@ -198,11 +196,8 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
     opts::AlignText = BC->PageAlign;
 }
 
-// PE/COFF uses a restricted pass pipeline.  ShortenInstructions and
-// RemoveNops are excluded because they alter byte offsets within functions,
-// which would corrupt UNWIND_INFO prolog sizes and unwind code offsets
-// in .xdata.  Unlike ELF where DWARF CFI can be regenerated, Windows
-// unwind data is preserved byte-for-byte in the original .xdata section.
+// ShortenInstructions and RemoveNops are excluded from the PE/COFF pipeline
+// because they change instruction sizes, corrupting UNWIND_INFO byte offsets.
 
 void PECOFFRewriteInstance::readSpecialSections() {
   for (const object::SectionRef &Section : InputFile->sections()) {
@@ -245,8 +240,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     return;
   }
 
-  // Get .xdata or .rdata contents for UNWIND_INFO parsing.
-  // Unwind data may reside in a dedicated .xdata section or in .rdata.
+  // Get .xdata contents for UNWIND_INFO parsing.  Unwind data may live in
+  // .xdata or .rdata.
   ArrayRef<uint8_t> XDataContents;
   uint64_t XDataRVA = 0;
   if (XDataSec) {
@@ -257,8 +252,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
       XDataRVA = XDataSec->VirtualAddress;
     }
   }
-  // Fall back to any section that contains the unwind RVA from the first
-  // .pdata entry.  Many PE binaries store UNWIND_INFO in .rdata.
+  // Fall back to whichever section contains the unwind RVA from the first
+  // .pdata entry.  Many PE binaries put UNWIND_INFO in .rdata.
   if (XDataContents.empty()) {
     ArrayRef<uint8_t> PDataPeek;
     if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek)) {
@@ -311,7 +306,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     SEHUnwindInfo Info;
     Info.EndRVA = EndRVA;
 
-    // Parse UNWIND_INFO from .xdata if available
+    // Parse UNWIND_INFO from .xdata
     if (!XDataContents.empty() && UnwindRVA >= XDataRVA) {
       uint32_t Offset = UnwindRVA - XDataRVA;
       if (Offset + 4 <= XDataContents.size()) {
@@ -406,8 +401,7 @@ void PECOFFRewriteInstance::discoverFileObjects() {
     AddressToName[*AddressOrErr] = *NameOrErr;
   }
 
-  // Enumerate functions from pre-parsed SEH data (populated by
-  // readExceptionHandling) instead of re-scanning .pdata raw bytes.
+  // Enumerate functions from .pdata SEH data.
   uint64_t FuncsCreated = 0;
   uint64_t FuncsSkippedHandler = 0;
 
@@ -514,15 +508,9 @@ void PECOFFRewriteInstance::buildFunctionsCFG() {
 }
 
 void PECOFFRewriteInstance::postProcessFunctions() {
-  // PE/COFF fix: detect basic blocks that fall through to code outside the
-  // function.  MSVC splits logical functions across multiple RUNTIME_FUNCTION
-  // entries, and the disassembler may not recognize all internal targets,
-  // leaving blocks with no terminator and no successors.  Without an explicit
-  // branch, FixupBranches would insert a RET, corrupting control flow.
-  //
-  // The robust approach: for every block that has no terminator and no
-  // successors, compute the fall-through address from the block's original
-  // offset and add a tail-call JMP there.
+  // MSVC splits logical functions across multiple RUNTIME_FUNCTION entries.
+  // Blocks at the end of one entry may fall through into the next.  Insert
+  // explicit tail-call JMPs to prevent FixupBranches from inserting a RET.
   uint64_t FTFixups = 0;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
@@ -538,24 +526,21 @@ void PECOFFRewriteInstance::postProcessFunctions() {
       if (BB.succ_size() > 0)
         continue;
 
-      // Compute the fall-through address: the byte after this block's
-      // last instruction in the original layout.
+      // Fall-through address: byte after this block's last instruction.
       uint64_t BlockEnd = 0;
 
-      // Try to get the block's original end from the offset annotation
-      // on the last instruction plus its size.
+      // Try offset annotation on last instruction.
       auto LastOff = BC->MIB->tryGetAnnotationAs<uint32_t>(Last, "Offset");
       if (LastOff) {
         uint32_t LastSize = BC->computeInstructionSize(Last);
         BlockEnd = Function.getAddress() + *LastOff + LastSize;
       }
 
-      // Fallback: use function end address (the common case for
-      // cross-function fall-throughs at the function boundary).
+      // Fallback: function end (common for boundary fall-throughs).
       if (BlockEnd == 0)
         BlockEnd = Function.getAddress() + Function.getMaxSize();
 
-      // Only add the fixup if the target is a valid code address.
+      // Only fixup if the target is a known code address.
       if (!BC->getBinaryFunctionContainingAddress(BlockEnd, false, true) &&
           FunctionSEHInfo.find(static_cast<uint32_t>(BlockEnd - ImageBase)) ==
               FunctionSEHInfo.end())
@@ -611,16 +596,10 @@ static bool originalHasREXPrefix(const uint8_t *Data, uint64_t Len) {
   return false;
 }
 
-/// Freeze prolog instructions so that their emitted encoding exactly matches
-/// the original binary.  MSVC often emits redundant REX prefixes (e.g.
-/// `40 55` for `push rbp`) that the LLVM MC encoder would normally drop.
-/// SEH UNWIND_INFO CodeOffset fields reference byte positions within the
-/// prolog, so every instruction must keep its original size.
-///
-/// Strategy: for each prolog instruction whose original encoding started
-/// with a (possibly redundant) REX prefix, set the X86 IP_USE_REX MCInst
-/// flag.  The MC encoder checks this flag and emits a REX prefix even when
-/// it would otherwise be unnecessary.
+/// Force REX prefixes on prolog instructions to match the original encoding.
+/// MSVC emits redundant REX bytes (e.g. `40 55` for `push rbp`) that LLVM MC
+/// would normally drop.  SEH UNWIND_INFO CodeOffset fields depend on exact
+/// byte positions, so every prolog instruction must keep its original size.
 void PECOFFRewriteInstance::freezePrologInstructions() {
   unsigned FixedCount = 0;
 
@@ -637,7 +616,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
     if (PrologSize == 0)
       continue;
 
-    // Locate the original function bytes in the input binary.
+    // Locate the function bytes in the input binary.
     uint32_t FuncRVA32 = static_cast<uint32_t>(FuncRVA);
     const uint8_t *OrigData = nullptr;
     for (const object::SectionRef &Sec : InputFile->sections()) {
@@ -645,9 +624,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
       if (FuncRVA32 >= CS->VirtualAddress &&
           FuncRVA32 < CS->VirtualAddress + CS->VirtualSize) {
         uint32_t SecOffset = FuncRVA32 - CS->VirtualAddress;
-        // Ensure the prolog lies within the section's raw data on disk,
-        // not just the virtual range (VirtualSize > SizeOfRawData is
-        // legal — the loader zero-fills the gap).
+        // Clamp to SizeOfRawData — VirtualSize can exceed it (zero-fill).
         if (SecOffset + PrologSize <= CS->SizeOfRawData) {
           uint64_t FileOff = CS->PointerToRawData + SecOffset;
           if (FileOff + PrologSize <= InputFile->getData().size())
@@ -664,7 +641,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
       if (OrigOffset >= PrologSize)
         break;
 
-      // Decode the original instruction to determine its size.
+      // Decode original instruction to get its size.
       uint64_t OrigInstSize = 0;
       if (OrigData) {
         MCInst TmpInst;
@@ -675,9 +652,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
           break; // Cannot decode — stop processing this prolog.
       }
 
-      // If the original encoding has a REX prefix, force the encoder to
-      // preserve it.  Check whether the current encoding is shorter
-      // (indicating the encoder would drop the prefix).
+      // Force REX prefix if the original had one and MC would drop it.
       if (OrigData && OrigInstSize > 0) {
         unsigned CurSize = BC->computeInstructionSize(Inst);
         if (CurSize < OrigInstSize &&
@@ -724,12 +699,8 @@ void PECOFFRewriteInstance::runOptimizationPasses() {
   BinaryFunctionPassManager Manager(*BC);
   Manager.registerPass(std::make_unique<NormalizeCFG>(opts::PrintNormalized));
 
-  // DO NOT register ShortenInstructions or RemoveNops.  These passes
-  // change instruction sizes (e.g. dropping REX prefixes), which shifts
-  // byte offsets within functions.  On PE/COFF, UNWIND_INFO contains
-  // hardcoded byte offsets for prolog operations.  Changing any
-  // instruction size corrupts these offsets and causes crashes during
-  // stack unwinding or exception handling.
+  // ShortenInstructions and RemoveNops would change instruction sizes,
+  // corrupting UNWIND_INFO byte offsets.  Do not register them.
 
   Manager.registerPass(std::make_unique<InferEdgeCounts>(opts::NeverPrint));
 
@@ -766,9 +737,7 @@ void PECOFFRewriteInstance::mapCodeSections(
     Function->setImageSize(FuncSection->getOutputSize());
   }
 
-  // Map jump table data sections to their original addresses so JITLink
-  // resolves the JT entry relocations correctly.  Track mapped sections
-  // to avoid redundant calls when multiple functions share a JT section.
+  // Map JT data sections so JITLink resolves JT entry relocations.
   DenseSet<uint64_t> MappedJTSections;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
@@ -885,9 +854,7 @@ void PECOFFRewriteInstance::rewriteFile() {
                           CS->SizeOfRawData, CS->PointerToRawData});
   }
 
-  // Map a VA to its file offset.  Uses the smaller of VirtualSize and
-  // SizeOfRawData to avoid returning offsets past the section's raw data
-  // on disk (VirtualSize > SizeOfRawData is legal — the loader zero-fills).
+  // Map VA to file offset, clamping to SizeOfRawData.
   auto VAToFileOffset = [&](uint64_t VA) -> std::optional<uint64_t> {
     if (VA < ImageBase)
       return std::nullopt;
@@ -959,11 +926,8 @@ void PECOFFRewriteInstance::rewriteFile() {
         return;
       }
 
-      // Verify the function prolog bytes match the original.  The MC
-      // re-encoder can drop redundant REX prefixes (e.g. 0x40 before
-      // push rsi), changing byte offsets in the prolog.  This corrupts
-      // UNWIND_INFO CodeOffset fields which use hardcoded byte positions.
-      // Skip any function whose prolog bytes differ from the original.
+      // Verify prolog bytes match the original — a mismatch means
+      // MC re-encoded differently and UNWIND_INFO would be wrong.
       auto SEHIt =
           FunctionSEHInfo.find(static_cast<uint32_t>(OrigAddr - ImageBase));
       if (SEHIt != FunctionSEHInfo.end() && SEHIt->second.PrologSize > 0) {
@@ -987,10 +951,7 @@ void PECOFFRewriteInstance::rewriteFile() {
       }
     }
 
-    // Use pwrite for in-place writes (within the original file).  For OOP
-    // writes into a new .bolt section beyond the original file end,
-    // raw_pwrite_stream asserts in debug builds because pwrite cannot
-    // extend the stream.  Use seek+write to grow the file naturally.
+    // pwrite for in-place; seek+write for OOP (pwrite asserts on extend).
     bool IsOOP = (OutputRVA >= NewSecVA && NewSecRawPtr > 0);
     if (IsOOP) {
       OS.seek(*FileOff);
@@ -1084,10 +1045,8 @@ void PECOFFRewriteInstance::rewriteFile() {
              << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
              << " functions)\n";
 
-      // Append .pdata for OOP functions into the .bolt section.
-      // Copy the entire original .pdata array, patch OOP entries to cover
-      // only the trampoline, and append new entries for .bolt functions.
-      // This avoids the slack-space limit of the original .pdata section.
+      // Append .pdata for OOP functions.  Copy original entries, remove
+      // OOP originals (now leaf JMP trampolines), add .bolt entries.
       uint32_t ExcDirOff =
           OptHdrOff + sizeof(PEHdr) +
           COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
@@ -1135,11 +1094,8 @@ void PECOFFRewriteInstance::rewriteFile() {
           for (const auto &O : OOPFuncs)
             OOPOrigRVAs.insert(O.OrigRVA);
 
-          // Copy original .pdata, removing entries for OOP functions.
-          // The original address now contains a leaf JMP trampoline that
-          // needs no unwind metadata.  Keeping the old UNWIND_INFO would
-          // describe a prolog that no longer exists, which could cause
-          // incorrect stack unwinding if the PC lands in the trampoline.
+          // Remove .pdata entries for OOP functions.  The original address
+          // now has a leaf JMP trampoline with no valid UNWIND_INFO.
           auto *OrigEntries = reinterpret_cast<const RuntimeFunction *>(
               FileData.data() + PDataFileOff);
           SmallVector<RuntimeFunction> Combined;
@@ -1254,21 +1210,16 @@ void PECOFFRewriteInstance::run() {
 
   adjustCommandLineOptions();
 
-  // Detect binary characteristics that affect rewriting correctness.
-  // BOLT's PE/COFF mode uses strict in-place patching: function bodies are
-  // overwritten at their original file offsets, no addresses change, no
-  // sections are added, and PE headers are untouched.  This means base
-  // relocations (.reloc) and ASLR (DYNAMIC_BASE) are safe — all RVAs in
-  // the relocation table remain valid.  However, several other features
-  // are incompatible with code rewriting.
+  // Detect binary features that affect rewriting.
+  // PE/COFF mode uses in-place patching: function bodies are overwritten at
+  // their original offsets, so base relocations and ASLR remain valid.
   {
     const object::pe32plus_header *PE = InputFile->getPE32PlusHeader();
 
     // --- Hard errors: binary MUST NOT be processed ---
 
-    // Incrementally linked binaries contain ILT padding (5-byte jmp
-    // thunks), fixup data, and .textbss BSS sections.  BOLT cannot
-    // distinguish thunks from real code and would corrupt the padding.
+    // Incrementally linked binaries contain ILT padding and fixup data.
+    // BOLT cannot distinguish thunks from real code.
     bool IsIncremental = false;
     for (const auto &Entry : InputFile->debug_directories()) {
       if (Entry.Type == COFF::IMAGE_DEBUG_TYPE_FIXUP) {
@@ -1288,57 +1239,41 @@ void PECOFFRewriteInstance::run() {
       }
     }
     if (IsIncremental) {
-      errs() << "BOLT-ERROR: binary appears to be incrementally linked "
-                "(/INCREMENTAL). Incremental link tables contain padding "
-                "and fixup data that would be corrupted by rewriting. "
+      errs() << "BOLT-ERROR: binary is incrementally linked (/INCREMENTAL). "
                 "Re-link with /INCREMENTAL:NO.\n";
       exit(1);
     }
 
-    // Control Flow Guard: the GFids table contains function entry RVAs.
-    // In-place patching preserves all entry points at their original
-    // addresses, so the table remains valid.  Intra-function indirect
-    // branches (jump tables) are not covered by CFG and are handled
-    // separately via JTS_MOVE.
+    // Control Flow Guard: entry RVAs unchanged, GFids table valid.
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
-      outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF). "
-                "Entry point RVAs are unchanged; GFids table is valid.\n";
+      if (opts::Verbosity >= 1)
+        outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)\n";
     }
 
-    // Code integrity enforcement requires a valid Authenticode signature.
-    // Any byte change invalidates it and the loader rejects the binary.
+    // Code integrity requires a valid Authenticode signature.
     if (PE && (PE->DLLCharacteristics &
                COFF::IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)) {
-      errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK. Rewriting "
-                "invalidates the Authenticode signature. Remove "
-                "/INTEGRITYCHECK from the linker flags.\n";
+      errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK — rewriting "
+                "invalidates the signature.\n";
       exit(1);
     }
 
     // --- Warnings: binary CAN be processed but results need care ---
 
-    // Authenticode signature without FORCE_INTEGRITY.  The binary is
-    // signed but the OS does not enforce the signature at load time
-    // (typical for user-mode EXEs).  Rewriting will invalidate the
-    // signature, which may cause warnings from antivirus or SmartScreen
-    // but will not prevent execution.
+    // Authenticode without FORCE_INTEGRITY: rewriting invalidates the
+    // signature but the OS does not enforce it at load time.
     if (PE) {
       const object::data_directory *SecDir =
           InputFile->getDataDirectory(COFF::CERTIFICATE_TABLE);
       if (SecDir && SecDir->RelativeVirtualAddress != 0 && SecDir->Size != 0) {
-        errs() << "BOLT-WARNING: binary has an Authenticode signature. "
-                  "Rewriting will invalidate it. The binary will still run "
-                  "but may trigger antivirus or SmartScreen warnings. "
-                  "Re-sign after optimization if needed.\n";
+        errs() << "BOLT-WARNING: binary has an Authenticode signature — "
+                  "rewriting will invalidate it.\n";
       }
     }
 
-    // LTCG (Link-Time Code Generation) uses COMDAT folding to merge
-    // identical functions.  With in-place patching this is usually safe
-    // since function addresses do not change, but COMDAT-folded aliases
-    // may share code that BOLT optimizes differently based on profile
-    // data for one alias.
+    // COMDAT: LTCG may have folded identical functions.  Profile-guided
+    // optimization uses whichever alias was profiled.
     {
       bool HasCOMDAT = false;
       for (const auto &Section : InputFile->sections()) {
@@ -1351,10 +1286,7 @@ void PECOFFRewriteInstance::run() {
         }
       }
       if (HasCOMDAT && opts::Verbosity >= 1)
-        outs() << "BOLT-INFO: binary has COMDAT sections (likely /LTCG). "
-                  "COMDAT-folded functions share code; profile-guided "
-                  "optimization will use the profile of whichever alias "
-                  "was profiled.\n";
+        outs() << "BOLT-INFO: binary has COMDAT sections (likely /LTCG)\n";
     }
   }
 
@@ -1385,11 +1317,8 @@ void PECOFFRewriteInstance::run() {
     return;
   }
 
-  // Save the basic block layout of every function before optimization.
-  // After the passes we compare against this snapshot to find which
-  // functions actually had their layout modified.  Only those get their
-  // bytes replaced in the output -- writing re-encoded bytes for unmodified
-  // functions would break the UNWIND_INFO byte offsets and base relocations.
+  // Snapshot block layout before optimization.  Only functions whose
+  // layout actually changes will have their bytes replaced in the output.
   DenseMap<uint64_t, std::vector<const BinaryBasicBlock *>> OrigLayouts;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
@@ -1434,11 +1363,7 @@ void PECOFFRewriteInstance::run() {
   outs() << "BOLT-INFO: " << ModifiedFunctions.size()
          << " functions had layout modified\n";
 
-  // Capture BB address translation before emit releases the CFG.
-  // For each rewritten function, record how each BB moved so the PDB
-  // rewriter can remap line tables.  We store pairs of
-  // {original_BB_offset, new_position_in_layout} since absolute output
-  // addresses are not available until after emission.
+  // Record BB offset translation for PDB line-table remapping.
   for (uint64_t FuncVA : ModifiedFunctions) {
     auto It = BC->getBinaryFunctions().find(FuncVA);
     if (It == BC->getBinaryFunctions().end())
@@ -1473,19 +1398,8 @@ void PECOFFRewriteInstance::run() {
     }
   }
 
-  // Handle oversized functions using the same approach as ELF's
-  // PatchEntries pass.  For each function that exceeds its original
-  // allocation:
-  //   1. Assign a new output address in a .bolt section
-  //   2. Create a patch function at the original address containing a
-  //      JMP to the function's symbol
-  //   3. Both go through emitAndLink() — JITLink resolves the JMP
-  //      target via symbol reference, not raw arithmetic
-  //
-  // This is robust because createInstructionPatch() and
-  // createLongTailCall() are the same BOLT APIs used on ELF, where
-  // they handle all edge cases (secondary entry points, symbol
-  // resolution, proper code section assignment).
+  // OOP functions: assign new addresses in a .bolt section and create
+  // JMP patches at original locations, same approach as ELF PatchEntries.
   const auto *PE = InputFile->getPE32PlusHeader();
   uint32_t BoltSecVA = 0;
   if (PE) {
@@ -1500,10 +1414,8 @@ void PECOFFRewriteInstance::run() {
     BoltSecVA = alignTo(LastEndVA, SecAlign);
   }
 
-  // Build a set of RVAs that are the end of some .pdata entry.  Functions
-  // whose begin RVA is in this set are part of a contiguous split group
-  // and must not be moved out-of-place (their predecessor may branch into
-  // them at mid-function offsets, not just the entry).
+  // Build set of end-RVAs to detect contiguous .pdata groups (MSVC split
+  // functions).  Functions in a group must not be moved OOP.
   DenseSet<uint32_t> SplitTargetRVAs;
   for (const auto &[RVA, Info] : FunctionSEHInfo)
     SplitTargetRVAs.insert(Info.EndRVA);
@@ -1547,17 +1459,14 @@ void PECOFFRewriteInstance::run() {
       continue;
     }
 
-    // Skip OOP for functions with jump tables.  PE/COFF JT data lives
-    // in .rdata which is not part of the emitted LinkGraph, so the
-    // section address mapping in mapCodeSections cannot resolve it.
+    // Skip OOP for functions with jump tables — JT data in .rdata is
+    // outside the emitted LinkGraph.
     if (BF.hasJumpTables()) {
       BF.setSimple(false);
       continue;
     }
 
-    // Skip OOP for functions in contiguous .pdata groups (MSVC split
-    // functions).  Blocks in one entry may branch into the next; moving
-    // one part to .bolt would invalidate those mid-function targets.
+    // Skip OOP for contiguous .pdata groups (MSVC split functions).
     uint32_t FuncRVA = static_cast<uint32_t>(BF.getAddress() - ImageBase);
     uint32_t FuncEndRVA = FuncRVA + BF.getMaxSize();
     if (FunctionSEHInfo.count(FuncEndRVA) || SplitTargetRVAs.count(FuncRVA)) {
@@ -1571,9 +1480,7 @@ void PECOFFRewriteInstance::run() {
     BF.setOutputAddress(NewVA);
     BoltCurOff += HotSize;
 
-    // Create a patch function at the original address, exactly like
-    // ELF's PatchEntries pass.  The patch contains a JMP to the
-    // function's symbol; JITLink resolves it during linking.
+    // Create a JMP patch at the original address.
     bool PatchOK = true;
     BF.forEachEntryPoint([&](uint64_t Offset, const MCSymbol *Symbol) {
       if (Offset + PatchSize > BF.getMaxSize()) {
@@ -1604,11 +1511,8 @@ void PECOFFRewriteInstance::run() {
     outs() << "BOLT-INFO: " << OOPCount
            << " functions rewritten out-of-place (.bolt section)\n";
 
-  // Clean up PDB offset maps: only keep functions actually rewritten in-place.
-  // Functions that went OOP have their code at a new address but PDB still
-  // references the original (JMP patch) — remapping their line offsets would
-  // be inconsistent.  Functions that were skipped (setSimple(false)) were
-  // never rewritten — remapping their lines would corrupt a correct PDB.
+  // Drop PDB offset maps for OOP and skipped functions — their line
+  // offsets should not be remapped.
   {
     SmallVector<uint64_t, 64> ToRemove;
     for (auto &Entry : FunctionOffsetMaps) {

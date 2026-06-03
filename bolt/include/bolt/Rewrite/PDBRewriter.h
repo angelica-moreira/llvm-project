@@ -26,21 +26,10 @@ namespace bolt {
 
 class BinaryContext;
 
-/// Rewrite PDB debug info to match the optimized binary layout.
-///
-/// Reads the original PDB, updates function offsets and line tables
-/// based on the address translation from block reordering, and writes
-/// a new PDB alongside the optimized binary.
+/// Rewrite PDB offsets and line tables after block reordering.
 class PDBRewriter {
 public:
-  /// Rewrite the PDB associated with the input binary.
-  /// \p InputExe is the original PE binary path (to find the PDB reference).
-  /// \p OutputExe is the optimized binary path (PDB will be written next to
-  /// it).
-  /// \p BC provides the address translation for rewritten functions.
-  /// \p ModifiedFunctions contains VAs of functions whose layout changed.
-  /// \p OffsetMaps maps function VA to old_offset->new_offset pairs for
-  ///    remapping line tables.
+  /// Patch the PDB to match the optimized binary.
   using OffsetMap = std::vector<std::pair<uint32_t, uint32_t>>;
   static void rewritePDB(StringRef InputExe, StringRef OutputExe,
                          const BinaryContext &BC, uint64_t ImageBase,

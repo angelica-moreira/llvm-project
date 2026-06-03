@@ -63,19 +63,19 @@ private:
   std::string findXperf() const;
   Error launchXperf();
 
-  /// Read the preferred ImageBase from the PE header (cached).
+  /// Return cached PE preferred ImageBase.
   uint64_t readPreferredBase();
 
-  /// Scan I-Start events to find the runtime load address (ASLR).
+  /// Derive runtime load address from I-Start events.
   void parseImageLoadEvents(StringRef Dump);
 
-  /// Infer ASLR offset from stack walk frames when no I-Start is available.
+  /// Infer ASLR offset from stack-walk sample frames.
   void detectASLRFromSamples(StringRef Dump);
 
-  /// Parse xperf dump text: SampledProfile events and LBR branch records.
+  /// Parse xperf dump: SampledProfile events and LBR branch records.
   Error parseXperfOutput();
 
-  /// Parse ETWAnalyzer -dump LBR -csv output.
+  /// Parse ETWAnalyzer CSV (LBR) output.
   Error parseETWAnalyzerCSV();
 
   /// Record a branch from absolute address From to To.  Resolves to

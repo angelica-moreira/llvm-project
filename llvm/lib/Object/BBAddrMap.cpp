@@ -214,12 +214,8 @@ llvm::object::decodeBBAddrMapPayload(AddressExtractor &Extractor,
   return FunctionEntries;
 }
 
-/// COFF-specific AddressExtractor that resolves relocations via a translation
-/// map. For relocatable objects, function addresses in the BBAddrMap section
-/// reference offsets that need to be resolved through relocations. If a
-/// relocation is not found for a given offset, the raw address is returned
-/// as a safe fallback (this handles the case where some entries may lack
-/// relocations in COFF .obj files).
+/// AddressExtractor for COFF that resolves relocations via a translation map.
+/// Falls back to the raw address when no relocation exists for a given offset.
 namespace {
 class COFFAddressExtractor : public AddressExtractor {
   const DenseMap<uint64_t, uint64_t> &Translations;
