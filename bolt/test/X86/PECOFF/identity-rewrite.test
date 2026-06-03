@@ -1,6 +1,5 @@
-## Test that llvm-bolt can produce an identity rewrite of a PE/COFF binary.
-## The output must be byte-identical to the input when no profile or
-## optimization flags are given.
+## Test that llvm-bolt produces a byte-identical identity rewrite of a
+## PE/COFF binary when no profile or optimization flags are given.
 
 # RUN: yaml2obj %p/Inputs/two-funcs.yaml -o %t.exe
 # RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s

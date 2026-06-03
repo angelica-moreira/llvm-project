@@ -1,6 +1,5 @@
-## Test that llvm-bolt processes PE/COFF binaries with CFG Guard enabled.
-## With in-place patching, function entry RVAs are preserved, so the
-## GFids table remains valid without patching.
+## Test that llvm-bolt handles PE/COFF binaries with CFG Guard (/GUARD:CF).
+## In-place patching preserves function entry RVAs, keeping the GFids table valid.
 
 # RUN: yaml2obj %p/Inputs/cfg-guard.yaml -o %t.exe
 # RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s

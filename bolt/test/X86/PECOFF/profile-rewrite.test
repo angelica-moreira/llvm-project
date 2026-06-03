@@ -1,6 +1,4 @@
 ## Test that llvm-bolt can optimize a PE/COFF binary with profile data.
-## This exercises the full pipeline: disassembly, CFG, profile loading,
-## optimization passes, direct relocation resolution, and in-place rewriting.
 
 # RUN: yaml2obj %p/Inputs/two-funcs.yaml -o %t.exe
 # RUN: printf "1 func_0x140001030 1b 1 func_0x140001000 0 0 100\n" > %t.fdata

@@ -1,12 +1,6 @@
 // matrix_mul.c -- Matrix multiplication for profiling.
 //
-// Multiplies two 256x256 matrices.  The triple-nested loop generates a
-// predictable call/branch pattern with cache pressure on the inner loop.
-// Inter-function edges (main -> multiply -> verify) exercise BOLT's
-// call graph profiling.
-//
 // Build:  clang-cl /O2 matrix_mul.c -o matrix_mul.exe
-// Profile: xperf -on PROC_THREAD+LOADER+PROFILE && matrix_mul.exe && xperf -d trace.etl
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,8 +29,6 @@ static void multiply(void) {
 }
 
 static int verify(void) {
-  // Check a few known cells to make sure the multiply ran correctly.
-  // For the given seeds, C[0][0] should be nonzero.
   if (C[0][0] == 0) {
     fprintf(stderr, "verification failed: C[0][0] is zero\n");
     return 1;

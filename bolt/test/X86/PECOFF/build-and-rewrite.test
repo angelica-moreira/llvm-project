@@ -1,5 +1,4 @@
-## Test the full etw2bolt pipeline: compile test program, run identity
-## rewrite through llvm-bolt, and verify the output is byte-identical.
+## Test identity rewrite and diff of a clang_cl-compiled PE/COFF binary.
 
 # REQUIRES: system-windows
 

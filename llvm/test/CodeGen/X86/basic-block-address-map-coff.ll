@@ -16,9 +16,9 @@ else:
 ; CHECK-LABEL: simple:
 ; CHECK:       .section .llvm_bb_addr_map
 ; CHECK-NEXT:  .byte 5
-; CHECK-NEXT:  .short 32
+; CHECK-NEXT:  .short 0
 
 ; CHECK-LABEL: branching:
 ; CHECK:       .section .llvm_bb_addr_map
 ; CHECK-NEXT:  .byte 5
-; CHECK-NEXT:  .short 32
+; CHECK-NEXT:  .short 0

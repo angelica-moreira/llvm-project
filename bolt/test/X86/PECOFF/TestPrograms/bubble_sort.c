@@ -1,12 +1,6 @@
 // bubble_sort.c -- Bubble sort on a large array for profiling.
 //
-// The hot inner loop generates many branch events that show up clearly
-// in ETW SampledProfile data.  The comparison branch is taken roughly
-// half the time on random data, making it a good target for block
-// reordering by BOLT.
-//
 // Build:  clang-cl /O2 bubble_sort.c -o bubble_sort.exe
-// Profile: xperf -on PROC_THREAD+LOADER+PROFILE && bubble_sort.exe && xperf -d trace.etl
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +30,7 @@ int main(void) {
     return 1;
   }
 
-  // Fill with pseudo-random data so the sort actually does work.
+  // Fill with pseudo-random data.
   unsigned seed = 12345;
   for (int i = 0; i < ARRAY_SIZE; i++) {
     seed = seed * 1103515245 + 12345;
