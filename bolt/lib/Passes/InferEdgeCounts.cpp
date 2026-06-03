@@ -59,9 +59,8 @@ void distributeToSuccessors(
   for (BinaryBasicBlock *Succ : BB.successors()) {
     auto It = Samples.find(Succ);
     uint64_t SuccSamples = (It != Samples.end()) ? It->second : 0;
-    uint64_t EdgeCount =
-        static_cast<uint64_t>(static_cast<double>(Count) * SuccSamples /
-                              TotalSucc);
+    uint64_t EdgeCount = static_cast<uint64_t>(static_cast<double>(Count) *
+                                               SuccSamples / TotalSucc);
     if (EdgeCount == 0 && SuccSamples > 0)
       EdgeCount = 1;
     if (EdgeCount > Remaining)
@@ -114,7 +113,8 @@ void propagateFunction(BinaryFunction &BF) {
           // CyclicProb = 1 - (InSum / expectedHeaderFreq).
           // Since we want headerFreq = InSum / (1 - cp), and cp is the
           // fraction of executions that come from back edges, estimate
-          // from samples: cp = (headerSamples - non-back-samples) / headerSamples.
+          // from samples: cp = (headerSamples - non-back-samples) /
+          // headerSamples.
           uint64_t NonBackSamples = 0;
           for (const BinaryBasicBlock *Pred : BB->predecessors()) {
             if (!isBackEdge(Pred, BB, LI))
@@ -122,8 +122,8 @@ void propagateFunction(BinaryFunction &BF) {
           }
           double CyclicProb = 0.0;
           if (NonBackSamples < HeaderSamples)
-            CyclicProb = 1.0 - static_cast<double>(NonBackSamples) /
-                                   HeaderSamples;
+            CyclicProb =
+                1.0 - static_cast<double>(NonBackSamples) / HeaderSamples;
           // Clamp to avoid division by zero or negative.
           if (CyclicProb >= 0.99)
             CyclicProb = 0.99;

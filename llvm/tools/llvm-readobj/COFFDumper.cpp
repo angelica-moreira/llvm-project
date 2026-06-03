@@ -42,16 +42,16 @@
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeStreamMerger.h"
 #include "llvm/DebugInfo/CodeView/TypeTableCollection.h"
-#include "llvm/Object/COFF.h"
 #include "llvm/Object/BBAddrMap.h"
+#include "llvm/Object/COFF.h"
 #include "llvm/Object/ELFTypes.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/WindowsResource.h"
 #include "llvm/Support/BinaryStreamReader.h"
-#include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertUTF.h"
+#include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -2520,8 +2520,7 @@ void COFFDumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
     llvm::sort(RelocEntries,
                [](const auto &A, const auto &B) { return A.first < B.first; });
 
-    StringRef Contents =
-        unwrapOrError(Obj->getFileName(), Sec.getContents());
+    StringRef Contents = unwrapOrError(Obj->getFileName(), Sec.getContents());
 
     unsigned AddrSize = Obj->getBytesInAddress();
     DataExtractor Data(Contents, /*IsLittleEndian=*/true, AddrSize);

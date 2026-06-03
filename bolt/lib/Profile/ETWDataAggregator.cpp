@@ -132,8 +132,8 @@ Error ETWDataAggregator::launchXperf() {
                              RC, ETLFilename.c_str());
 
   if (RC != 0)
-    BC->outs() << "ETW2BOLT: xperf warnings (exit " << RC << "), proceeding with "
-           << (FileSize / 1024) << " KB of data\n";
+    BC->outs() << "ETW2BOLT: xperf warnings (exit " << RC
+               << "), proceeding with " << (FileSize / 1024) << " KB of data\n";
 
   return Error::success();
 }
@@ -188,20 +188,19 @@ bool ETWDataAggregator::recordBranchEvent(uint64_t From, uint64_t To,
     StringRef FromName = FromFunc->getOneName();
     FuncBranchData &FBD = NamesToBranches[FromName];
     FBD.Name = FromName;
-    FBD.bumpCallCount(
-        FromOffset,
-        Location(ToFunc != nullptr, ToFunc ? ToFunc->getOneName() : "",
-                 ToOffset),
-        Count, Mispreds);
+    FBD.bumpCallCount(FromOffset,
+                      Location(ToFunc != nullptr,
+                               ToFunc ? ToFunc->getOneName() : "", ToOffset),
+                      Count, Mispreds);
   }
   if (ToFunc) {
     StringRef ToName = ToFunc->getOneName();
     FuncBranchData &FBD = NamesToBranches[ToName];
     FBD.Name = ToName;
-    FBD.bumpEntryCount(
-        Location(FromFunc != nullptr,
-                 FromFunc ? FromFunc->getOneName() : "", FromOffset),
-        ToOffset, Count, Mispreds);
+    FBD.bumpEntryCount(Location(FromFunc != nullptr,
+                                FromFunc ? FromFunc->getOneName() : "",
+                                FromOffset),
+                       ToOffset, Count, Mispreds);
   }
 
   return true;
@@ -233,8 +232,8 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
     PreferredBase =
         BC->getBinaryFunctions().begin()->second.getAddress() & ~0xFFFFFULL;
     BC->errs() << "ETW2BOLT: warning: cannot read PE ImageBase; derived 0x"
-           << Twine::utohexstr(PreferredBase)
-           << " -- ASLR adjustment may be wrong\n";
+               << Twine::utohexstr(PreferredBase)
+               << " -- ASLR adjustment may be wrong\n";
   }
 
   StringRef BinaryName = llvm::sys::path::filename(BC->getFilename());
@@ -272,16 +271,16 @@ void ETWDataAggregator::parseImageLoadEvents(StringRef Dump) {
     ASLROffset =
         static_cast<int64_t>(ActualBase) - static_cast<int64_t>(PreferredBase);
     BC->outs() << "ETW2BOLT: " << BinaryName << " loaded at 0x"
-           << Twine::utohexstr(ActualBase) << " (preferred 0x"
-           << Twine::utohexstr(PreferredBase) << ")\n";
+               << Twine::utohexstr(ActualBase) << " (preferred 0x"
+               << Twine::utohexstr(PreferredBase) << ")\n";
     if (ASLROffset != 0)
       BC->outs() << "ETW2BOLT: ASLR delta: " << (ASLROffset > 0 ? "+" : "")
-             << ASLROffset << "\n";
+                 << ASLROffset << "\n";
     return;
   }
 
   BC->outs() << "ETW2BOLT: no I-Start event for " << BinaryName
-         << ", assuming no ASLR\n";
+             << ", assuming no ASLR\n";
 }
 
 /// Infer the ASLR offset by probing stack walk frames in SampledProfile
@@ -327,9 +326,9 @@ void ETWDataAggregator::detectASLRFromSamples(StringRef Dump) {
         if (BC->getBinaryFunctionContainingAddress(Adjusted, false, true)) {
           ASLROffset = Candidate;
           BC->outs() << "ETW2BOLT: detected ASLR offset from stack sample: "
-                 << (ASLROffset > 0 ? "+" : "") << ASLROffset
-                 << " (runtime 0x" << Twine::utohexstr(RuntimeAddr)
-                 << " -> binary 0x" << Twine::utohexstr(Adjusted) << ")\n";
+                     << (ASLROffset > 0 ? "+" : "") << ASLROffset
+                     << " (runtime 0x" << Twine::utohexstr(RuntimeAddr)
+                     << " -> binary 0x" << Twine::utohexstr(Adjusted) << ")\n";
           return;
         }
       }
@@ -345,7 +344,8 @@ Error ETWDataAggregator::parseXperfOutput() {
                              DumpFilePath.c_str());
 
   uint64_t BufSize = (*BufOrErr)->getBufferSize();
-  BC->outs() << "ETW2BOLT: parsing " << (BufSize / 1024) << " KB xperf dump...\n";
+  BC->outs() << "ETW2BOLT: parsing " << (BufSize / 1024)
+             << " KB xperf dump...\n";
 
   StringRef RawBuf = (*BufOrErr)->getBuffer();
 
@@ -353,8 +353,7 @@ Error ETWDataAggregator::parseXperfOutput() {
   // to UTF-8 so the line parser works with normal ASCII comparisons.
   std::string UTF8Storage;
   StringRef Dump;
-  if (RawBuf.size() >= 2 &&
-      static_cast<uint8_t>(RawBuf[0]) == 0xFF &&
+  if (RawBuf.size() >= 2 && static_cast<uint8_t>(RawBuf[0]) == 0xFF &&
       static_cast<uint8_t>(RawBuf[1]) == 0xFE) {
     BC->outs() << "ETW2BOLT: converting UTF-16 LE dump to UTF-8...\n";
     ArrayRef<char> Src(RawBuf.data() + 2, RawBuf.size() - 2);
@@ -362,7 +361,7 @@ Error ETWDataAggregator::parseXperfOutput() {
       return createStringError(std::errc::illegal_byte_sequence,
                                "failed to convert UTF-16 xperf dump to UTF-8");
     BC->outs() << "ETW2BOLT: converted to " << (UTF8Storage.size() / 1024)
-           << " KB UTF-8\n";
+               << " KB UTF-8\n";
     Dump = StringRef(UTF8Storage);
   } else {
     Dump = RawBuf;
@@ -404,8 +403,8 @@ Error ETWDataAggregator::parseXperfOutput() {
 
     if ((LinesProcessed & 0xFFFFF) == 0)
       BC->outs() << "ETW2BOLT: " << (LinesProcessed / 1000000) << "M lines, "
-             << MatchedSamples << " samples, " << MatchedLBRBranches
-             << " LBR\r";
+                 << MatchedSamples << " samples, " << MatchedLBRBranches
+                 << " LBR\r";
 
     StringRef Trimmed = Line.ltrim();
     if (Trimmed.ends_with("\r"))
@@ -533,13 +532,13 @@ ETWDataAggregator::writeAggregatedFile(StringRef OutputFilename) const {
   uint64_t Written = 0;
   for (const auto &[Key, Count] : BasicSamples) {
     const auto &[FuncName, Offset] = Key;
-    OutFile << "1 " << FuncName << " "
-            << Twine::utohexstr(Offset) << " " << Count << "\n";
+    OutFile << "1 " << FuncName << " " << Twine::utohexstr(Offset) << " "
+            << Count << "\n";
     ++Written;
   }
 
-  BC->outs() << "BOLT-INFO: wrote " << Written
-         << " basic samples (no_lbr) to " << OutputFilename << "\n";
+  BC->outs() << "BOLT-INFO: wrote " << Written << " basic samples (no_lbr) to "
+             << OutputFilename << "\n";
   return std::error_code();
 }
 
@@ -577,8 +576,7 @@ Error ETWDataAggregator::parseETWAnalyzerCSV() {
       ToCol = I;
     else if (H.equals_insensitive("Count") ||
              H.equals_insensitive("SampleCount") ||
-             H.equals_insensitive("Samples") ||
-             H.equals_insensitive("Weight"))
+             H.equals_insensitive("Samples") || H.equals_insensitive("Weight"))
       CountCol = I;
     else if (H.equals_insensitive("Mispredicted") ||
              H.equals_insensitive("Mispred"))
@@ -618,16 +616,15 @@ Error ETWDataAggregator::parseETWAnalyzerCSV() {
           break;
         // Try with a guessed offset: sample is likely near ImageBase.
         uint64_t GuessBase = SampleAddr & ~0xFFFFFULL;
-        int64_t GuessOffset =
-            static_cast<int64_t>(GuessBase) -
-            static_cast<int64_t>(PreferredBase);
+        int64_t GuessOffset = static_cast<int64_t>(GuessBase) -
+                              static_cast<int64_t>(PreferredBase);
         uint64_t Adjusted = static_cast<uint64_t>(
             static_cast<int64_t>(SampleAddr) - GuessOffset);
         if (BC->getBinaryFunctionContainingAddress(Adjusted, false, true)) {
           ASLROffset = GuessOffset;
           BC->outs() << "ETW2BOLT: detected ASLR offset "
-                 << (ASLROffset > 0 ? "+" : "") << ASLROffset
-                 << " from CSV addresses\n";
+                     << (ASLROffset > 0 ? "+" : "") << ASLROffset
+                     << " from CSV addresses\n";
         }
         break;
       }
@@ -677,7 +674,7 @@ Error ETWDataAggregator::parseETWAnalyzerCSV() {
   }
 
   BC->outs() << "ETW2BOLT: " << RowsRead << " CSV rows, " << RowsMatched
-         << " matched (" << MatchedLBRBranches << " LBR branches)\n";
+             << " matched (" << MatchedLBRBranches << " LBR branches)\n";
 
   return Error::success();
 }
@@ -709,7 +706,7 @@ Error ETWDataAggregator::readProfile(BinaryContext &BC) {
   }
 
   BC.outs() << "ETW2BOLT: " << TotalEvents << " events, " << MatchedSamples
-         << " samples";
+            << " samples";
   if (MatchedLBRBranches > 0)
     BC.outs() << ", " << MatchedLBRBranches << " LBR branches";
   if (InferredBranches > 0)
@@ -718,10 +715,10 @@ Error ETWDataAggregator::readProfile(BinaryContext &BC) {
 
   if (MatchedLBRBranches == 0 && InferredBranches > 0)
     BC.outs() << "ETW2BOLT: no LBR data found.  For better results, capture "
-              "with:\n"
-              "  xperf -on PROC_THREAD+LOADER+PROFILE "
-              "-LastBranch PROFILE "
-              "conditionalbranches,nearrelativecalls,nearreturns\n";
+                 "with:\n"
+                 "  xperf -on PROC_THREAD+LOADER+PROFILE "
+                 "-LastBranch PROFILE "
+                 "conditionalbranches,nearrelativecalls,nearreturns\n";
 
   if (NamesToBranches.empty()) {
     BC.errs() << "ETW2BOLT: no profile data matched the binary\n";

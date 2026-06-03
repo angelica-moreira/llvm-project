@@ -2200,7 +2200,7 @@ Error Arm64XRelocRef::validate(const COFFObjectFile *Obj) const {
   return Error::success();
 }
 
-#define RETURN_IF_ERROR(Expr)\
+#define RETURN_IF_ERROR(Expr)                                                  \
   do {                                                                         \
     Error E = (Expr);                                                          \
     if (E)                                                                     \

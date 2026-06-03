@@ -257,7 +257,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   if (XDataContents.empty()) {
     ArrayRef<uint8_t> PDataPeek;
     if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek)) {
-      BC->outs() << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
+      BC->outs()
+          << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
       consumeError(std::move(E));
     }
     if (PDataPeek.size() >= 12) {
@@ -371,7 +372,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   }
 
   BC->outs() << "BOLT-INFO: parsed " << FunctionSEHInfo.size()
-         << " .pdata entries, " << ChainToParent.size() << " chained\n";
+             << " .pdata entries, " << ChainToParent.size() << " chained\n";
 }
 
 void PECOFFRewriteInstance::discoverFileObjects() {
@@ -445,9 +446,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
   NumFuncsWithHandlers = FuncsSkippedHandler;
 
   BC->outs() << "BOLT-INFO: " << FuncsCreated
-         << " functions discovered from .pdata\n";
+             << " functions discovered from .pdata\n";
   BC->outs() << "BOLT-INFO: " << FuncsSkippedHandler
-         << " functions with exception handlers (skipped)\n";
+             << " functions with exception handlers (skipped)\n";
 }
 
 void PECOFFRewriteInstance::disassembleFunctions() {
@@ -555,7 +556,7 @@ void PECOFFRewriteInstance::postProcessFunctions() {
   }
   if (FTFixups)
     BC->outs() << "BOLT-INFO: added " << FTFixups
-           << " cross-function fall-through fixups\n";
+               << " cross-function fall-through fixups\n";
 
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
@@ -571,8 +572,17 @@ void PECOFFRewriteInstance::postProcessFunctions() {
 /// size, segment, LOCK, REP).  These may appear before a REX prefix.
 static bool isLegacyPrefix(uint8_t Byte) {
   switch (Byte) {
-  case 0x66: case 0x67: case 0xF0: case 0xF2: case 0xF3:
-  case 0x26: case 0x2E: case 0x36: case 0x3E: case 0x64: case 0x65:
+  case 0x66:
+  case 0x67:
+  case 0xF0:
+  case 0xF2:
+  case 0xF3:
+  case 0x26:
+  case 0x2E:
+  case 0x36:
+  case 0x3E:
+  case 0x64:
+  case 0x65:
     return true;
   default:
     return false;
@@ -580,9 +590,7 @@ static bool isLegacyPrefix(uint8_t Byte) {
 }
 
 /// Returns true if \p Byte is an x86-64 REX prefix (0x40–0x4F).
-static bool isREXPrefix(uint8_t Byte) {
-  return Byte >= 0x40 && Byte <= 0x4F;
-}
+static bool isREXPrefix(uint8_t Byte) { return Byte >= 0x40 && Byte <= 0x4F; }
 
 /// Scan the first \p Len bytes starting at \p Data for a REX prefix,
 /// skipping any leading legacy prefixes.  Returns true if a REX byte
@@ -645,8 +653,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
       uint64_t OrigInstSize = 0;
       if (OrigData) {
         MCInst TmpInst;
-        ArrayRef<uint8_t> Bytes(OrigData + OrigOffset,
-                                PrologSize - OrigOffset);
+        ArrayRef<uint8_t> Bytes(OrigData + OrigOffset, PrologSize - OrigOffset);
         if (!BC->DisAsm->getInstruction(TmpInst, OrigInstSize, Bytes, 0,
                                         nulls()))
           break; // Cannot decode — stop processing this prolog.
@@ -664,11 +671,10 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
           } else {
             // Unexpected: IP_USE_REX didn't fully close the size gap.
             // Log and leave the flag set — it's still closer to correct.
-            LLVM_DEBUG(dbgs()
-                       << "BOLT-DEBUG: REX fix size mismatch for "
-                       << BF.getPrintName() << " prolog inst at +"
-                       << OrigOffset << ": orig=" << OrigInstSize
-                       << " new=" << NewSize << "\n");
+            LLVM_DEBUG(dbgs() << "BOLT-DEBUG: REX fix size mismatch for "
+                              << BF.getPrintName() << " prolog inst at +"
+                              << OrigOffset << ": orig=" << OrigInstSize
+                              << " new=" << NewSize << "\n");
           }
         }
         OrigOffset += OrigInstSize;
@@ -690,7 +696,7 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
 
   if (FixedCount)
     BC->outs() << "BOLT-INFO: preserved REX prefix on " << FixedCount
-           << " prolog instructions for SEH correctness\n";
+               << " prolog instructions for SEH correctness\n";
 }
 
 void PECOFFRewriteInstance::runOptimizationPasses() {
@@ -775,7 +781,7 @@ void PECOFFRewriteInstance::emitAndLink() {
 
   StringRef ObjContents = BOS->str();
   BC->outs() << "BOLT-INFO: emitted object size = " << ObjContents.size()
-         << " bytes\n";
+             << " bytes\n";
 
   std::unique_ptr<MemoryBuffer> ObjectMemBuffer =
       MemoryBuffer::getMemBuffer(ObjContents, "bolt-coff-object", false);
@@ -833,8 +839,8 @@ void PECOFFRewriteInstance::rewriteFile() {
                      COFF::CERTIFICATE_TABLE * sizeof(object::data_directory);
 
         BC->outs() << "BOLT-INFO: stripping " << CertSize
-               << "-byte Authenticode certificate table at file offset 0x"
-               << Twine::utohexstr(CertFileOff) << "\n";
+                   << "-byte Authenticode certificate table at file offset 0x"
+                   << Twine::utohexstr(CertFileOff) << "\n";
       }
     }
   }
@@ -937,14 +943,14 @@ void PECOFFRewriteInstance::rewriteFile() {
             *OrigFileOff + PrologSize <= FileData.size()) {
           const uint8_t *EmittedBytes =
               reinterpret_cast<const uint8_t *>(Function.getImageAddress());
-          const uint8_t *OrigBytes = reinterpret_cast<const uint8_t *>(
-              FileData.data() + *OrigFileOff);
+          const uint8_t *OrigBytes =
+              reinterpret_cast<const uint8_t *>(FileData.data() + *OrigFileOff);
           if (memcmp(EmittedBytes, OrigBytes, PrologSize) != 0) {
             LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
                               << " - prolog bytes changed by re-encoding\n");
             if (opts::Verbosity >= 1)
               BC->outs() << "BOLT-INFO: skipping " << Function.getPrintName()
-                     << " - prolog re-encoded differently\n";
+                         << " - prolog re-encoded differently\n";
             return;
           }
         }
@@ -1042,8 +1048,8 @@ void PECOFFRewriteInstance::rewriteFile() {
       OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec), SecTableEnd);
 
       BC->outs() << "BOLT-INFO: added .bolt section at VA 0x"
-             << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
-             << " functions)\n";
+                 << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
+                 << " functions)\n";
 
       // Append .pdata for OOP functions.  Copy original entries, remove
       // OOP originals (now leaf JMP trampolines), add .bolt entries.
@@ -1051,7 +1057,8 @@ void PECOFFRewriteInstance::rewriteFile() {
           OptHdrOff + sizeof(PEHdr) +
           COFF::EXCEPTION_TABLE * sizeof(object::data_directory);
       if (ExcDirOff + 8 > FileData.size()) {
-        BC->outs() << "BOLT-WARNING: exception directory offset out of bounds\n";
+        BC->outs()
+            << "BOLT-WARNING: exception directory offset out of bounds\n";
       } else {
         uint32_t ExcRVA =
             support::endian::read32le(FileData.data() + ExcDirOff);
@@ -1165,7 +1172,7 @@ void PECOFFRewriteInstance::rewriteFile() {
           OS.pwrite(reinterpret_cast<char *>(&CombinedBytes), 4, ExcDirOff + 4);
 
           BC->outs() << "BOLT-INFO: " << Combined.size() << " .pdata entries ("
-                 << OOPFuncs.size() << " new) written to .bolt section\n";
+                     << OOPFuncs.size() << " new) written to .bolt section\n";
         }
       } // ExcDirOff bounds check
     }
@@ -1176,19 +1183,20 @@ void PECOFFRewriteInstance::rewriteFile() {
   // Zero out the Security data directory if we truncated the cert table.
   if (CertDirOff > 0) {
     uint64_t Zero = 0;
-    OS.pwrite(reinterpret_cast<char *>(&Zero),
-              sizeof(object::data_directory), CertDirOff);
+    OS.pwrite(reinterpret_cast<char *>(&Zero), sizeof(object::data_directory),
+              CertDirOff);
   }
 
   Out->keep();
 
-  BC->outs() << "BOLT-INFO: " << InPlaceCount << " functions rewritten in-place\n";
+  BC->outs() << "BOLT-INFO: " << InPlaceCount
+             << " functions rewritten in-place\n";
   if (OOPWritten)
     BC->outs() << "BOLT-INFO: " << OOPWritten
-           << " functions rewritten out-of-place (.bolt section)\n";
+               << " functions rewritten out-of-place (.bolt section)\n";
   if (OverflowCount)
     BC->outs() << "BOLT-INFO: " << OverflowCount
-           << " functions could not be optimized\n";
+               << " functions could not be optimized\n";
   BC->outs() << "BOLT-INFO: output binary: " << opts::OutputFilename << "\n";
 }
 
@@ -1202,7 +1210,7 @@ void PECOFFRewriteInstance::identityRewriteFile() {
   Out->keep();
 
   BC->outs() << "BOLT-INFO: identity copy written to " << opts::OutputFilename
-         << "\n";
+             << "\n";
 }
 
 void PECOFFRewriteInstance::run() {
@@ -1239,8 +1247,9 @@ void PECOFFRewriteInstance::run() {
       }
     }
     if (IsIncremental) {
-      BC->errs() << "BOLT-ERROR: binary is incrementally linked (/INCREMENTAL). "
-                "Re-link with /INCREMENTAL:NO.\n";
+      BC->errs()
+          << "BOLT-ERROR: binary is incrementally linked (/INCREMENTAL). "
+             "Re-link with /INCREMENTAL:NO.\n";
       exit(1);
     }
 
@@ -1255,7 +1264,7 @@ void PECOFFRewriteInstance::run() {
     if (PE && (PE->DLLCharacteristics &
                COFF::IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)) {
       BC->errs() << "BOLT-ERROR: binary has /INTEGRITYCHECK — rewriting "
-                "invalidates the signature.\n";
+                    "invalidates the signature.\n";
       exit(1);
     }
 
@@ -1268,7 +1277,7 @@ void PECOFFRewriteInstance::run() {
           InputFile->getDataDirectory(COFF::CERTIFICATE_TABLE);
       if (SecDir && SecDir->RelativeVirtualAddress != 0 && SecDir->Size != 0) {
         BC->errs() << "BOLT-WARNING: binary has an Authenticode signature — "
-                  "rewriting will invalidate it.\n";
+                      "rewriting will invalidate it.\n";
       }
     }
 
@@ -1361,7 +1370,7 @@ void PECOFFRewriteInstance::run() {
   }
 
   BC->outs() << "BOLT-INFO: " << ModifiedFunctions.size()
-         << " functions had layout modified\n";
+             << " functions had layout modified\n";
 
   // Record BB offset translation for PDB line-table remapping.
   for (uint64_t FuncVA : ModifiedFunctions) {
@@ -1454,7 +1463,7 @@ void PECOFFRewriteInstance::run() {
     if (BF.getMaxSize() < PatchSize) {
       if (opts::Verbosity >= 1)
         BC->outs() << "BOLT-INFO: " << BF << " too small for patch ("
-               << BF.getMaxSize() << " < " << PatchSize << ")\n";
+                   << BF.getMaxSize() << " < " << PatchSize << ")\n";
       BF.setSimple(false);
       continue;
     }
@@ -1504,12 +1513,12 @@ void PECOFFRewriteInstance::run() {
     OOPFunctions.insert(FuncVA);
     if (opts::Verbosity >= 1)
       BC->outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
-             << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
-             << " with entry patch\n";
+                 << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
+                 << " with entry patch\n";
   }
   if (OOPCount)
     BC->outs() << "BOLT-INFO: " << OOPCount
-           << " functions rewritten out-of-place (.bolt section)\n";
+               << " functions rewritten out-of-place (.bolt section)\n";
 
   // Drop PDB offset maps for OOP and skipped functions — their line
   // offsets should not be remapped.

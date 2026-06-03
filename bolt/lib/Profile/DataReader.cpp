@@ -1349,8 +1349,7 @@ bool DataReader::hasLocalsWithFileName() const {
   return false;
 }
 
-std::error_code
-DataReader::writeBranchProfile(StringRef OutputFilename) const {
+std::error_code DataReader::writeBranchProfile(StringRef OutputFilename) const {
   std::error_code EC;
   raw_fd_ostream OutFile(OutputFilename, EC, sys::fs::OF_None);
   if (EC)

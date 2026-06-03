@@ -257,8 +257,7 @@ cl::opt<std::string> ETWData("etwdata", cl::desc("<ETL trace file>"),
                              cl::sub(cl::SubCommand::getAll()));
 
 static cl::alias ETWDataA("e", cl::desc("alias for -etwdata"),
-                           cl::aliasopt(ETWData),
-                           cl::cat(AggregatorCategory));
+                          cl::aliasopt(ETWData), cl::cat(AggregatorCategory));
 
 cl::opt<bool> PrintCacheMetrics(
     "print-cache-metrics",

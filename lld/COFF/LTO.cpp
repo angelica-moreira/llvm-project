@@ -107,8 +107,8 @@ lto::Config BitcodeCompiler::createConfig() {
       ErrorOr<std::unique_ptr<MemoryBuffer>> MBOrErr =
           MemoryBuffer::getFile(ctx.config.ltoBasicBlockSections.str());
       if (!MBOrErr)
-        Fatal(ctx) << "cannot open " << ctx.config.ltoBasicBlockSections
-                   << ": " << MBOrErr.getError().message();
+        Fatal(ctx) << "cannot open " << ctx.config.ltoBasicBlockSections << ": "
+                   << MBOrErr.getError().message();
       else
         c.Options.BBSectionsFuncListBuf = std::move(*MBOrErr);
       c.Options.BBSections = BasicBlockSection::List;

@@ -1306,8 +1306,7 @@ MCObjectFileInfo::getBBAddrMapSection(const MCSection &TextSec) const {
                            "support for COMDAT functions");
       Characteristics |= COFF::IMAGE_SCN_LNK_COMDAT;
       return Ctx->getCOFFSection(
-          Name, Characteristics,
-          CoffSec.getCOMDATSymbol()->getName(),
+          Name, Characteristics, CoffSec.getCOMDATSymbol()->getName(),
           COFF::IMAGE_COMDAT_SELECT_ASSOCIATIVE, CoffSec.getUniqueID());
     }
     return Ctx->getCOFFSection(Name, Characteristics, "", 0,
