@@ -1256,8 +1256,7 @@ void PECOFFRewriteInstance::run() {
     // Control Flow Guard: entry RVAs unchanged, GFids table valid.
     if (PE &&
         (PE->DLLCharacteristics & COFF::IMAGE_DLL_CHARACTERISTICS_GUARD_CF)) {
-      if (opts::Verbosity >= 1)
-        BC->outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)\n";
+      BC->outs() << "BOLT-INFO: binary has Control Flow Guard (/GUARD:CF)\n";
     }
 
     // Code integrity requires a valid Authenticode signature.
