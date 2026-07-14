@@ -963,16 +963,18 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
   });
 
   // Single pass over the address map: assign each mapped instruction to the
-  // candidate whose input range contains it.  Output IPs are recorded relative
-  // to the emitted function base, which preserves layout order (enough to
-  // verify the regenerated table without knowing the final placement).
+  // candidate whose input range contains it.  Output IPs are the final in-place
+  // RVAs (BeginRVA + offset within the emitted function), so the regenerated
+  // body entries share the image-relative coordinate system of the funclet
+  // entries and can be merged and sorted with them.
   for (const auto &[InAddr, OutAddr] : IOMap.entries()) {
     auto It = llvm::partition_point(
         Cands, [&](const Cand &C) { return C.InEnd <= InAddr; });
     if (It == Cands.end() || InAddr < It->InStart)
       continue;
     uint32_t Offset = static_cast<uint32_t>(InAddr - It->InStart);
-    uint32_t OutIP = static_cast<uint32_t>(OutAddr - It->OutBase);
+    uint32_t OutIP =
+        static_cast<uint32_t>(It->BeginRVA + (OutAddr - It->OutBase));
     int State = lookupEHState(FunctionCxxEHInfo[It->BeginRVA],
                               static_cast<uint32_t>(It->BeginRVA + Offset));
     It->BodyInsns.push_back({OutIP, State});
@@ -1022,10 +1024,15 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
                  return A.OutputIP < B.OutputIP;
                });
 
-    // Regenerate the body portion of the table (funclet entries are relocated
-    // separately in the write step and use image-relative RVAs).
-    SmallVector<WinEHFuncInfo::IPToStateEntry, 16> NewBody =
-        regenerateIPToState(C.BodyInsns, {});
+    // Regenerate the full table: body entries in output-layout order plus the
+    // funclet-region entries carried over unchanged (funclets are pinned in
+    // place, so their image-relative IP RVAs remain valid).
+    SmallVector<WinEHFuncInfo::IPToStateEntry, 16> FuncletEntries;
+    for (const WinEHFuncInfo::IPToStateEntry &E : FI.IPToStateMap)
+      if (!isInBodyIP(E.IP, C.BeginRVA, EndRVA))
+        FuncletEntries.push_back(E);
+    SmallVector<WinEHFuncInfo::IPToStateEntry, 16> NewTable =
+        regenerateIPToState(C.BodyInsns, FuncletEntries);
 
     size_t OrigBody = 0;
     for (const WinEHFuncInfo::IPToStateEntry &E : FI.IPToStateMap)
@@ -1033,10 +1040,12 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
         ++OrigBody;
 
     // Verify the regenerated table reproduces the original per-instruction
-    // state for every tracked body instruction (lossless compression).
+    // state for every tracked body instruction (lossless compression).  The
+    // appended funclet entries have higher RVAs than the body and do not affect
+    // body-IP lookups.
     bool VerifyOK = true;
     for (const OutputInsnState &Insn : C.BodyInsns)
-      if (stateInTable(NewBody, Insn.OutputIP) != Insn.State) {
+      if (stateInTable(NewTable, Insn.OutputIP) != Insn.State) {
         VerifyOK = false;
         break;
       }
@@ -1048,16 +1057,20 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
       if (opts::Verbosity >= 1)
         BC->outs() << "BOLT-INFO: EH relocation "
                    << (DryRun ? "(dry-run) " : "") << BF << ": body ip2state "
-                   << OrigBody << " -> " << NewBody.size()
-                   << " entries [verified]\n";
+                   << OrigBody << " -> " << (NewTable.size() - FuncletEntries.size())
+                   << " entries (" << NewTable.size()
+                   << " total) [verified]\n";
+      if (!DryRun)
+        RegeneratedEHTables[C.BeginRVA] = std::move(NewTable);
     } else {
       ++Failed;
       BC->outs() << "BOLT-WARNING: EH relocation verification failed for " << BF
                  << "; leaving unmodified\n";
     }
 
-    // The actual table write is a later step; for now (and on any failure) do
-    // not emit the reordered body so the original EH metadata stays correct.
+    // Revert (keep the original layout and metadata) on dry-run or on any
+    // verification failure.  Otherwise the function stays reordered and
+    // rewriteFile() emits the regenerated table.
     if (DryRun || !VerifyOK)
       revert(C.FuncVA);
   }
@@ -1157,6 +1170,12 @@ void PECOFFRewriteInstance::rewriteFile() {
   uint64_t OOPWritten = 0;
   uint64_t OverflowCount = 0;
 
+  // Begin RVAs of C++ EH candidates actually written in-place, in ascending
+  // order.  This is the authoritative gate for repointing FuncInfo: functions
+  // that overflow or whose prolog re-encodes differently are skipped here and
+  // keep their original layout and metadata.
+  SmallVector<uint32_t, 16> EHInPlaceWritten;
+
   uint32_t NewSecRawPtr = 0;
   uint32_t NewSecVA = 0;
   if (PE) {
@@ -1253,11 +1272,44 @@ void PECOFFRewriteInstance::rewriteFile() {
 
     if (Function.isPatch())
       return;
-    if (OutputAddr == OrigAddr)
+    if (OutputAddr == OrigAddr) {
       ++InPlaceCount;
-    else
+      uint32_t RVA = static_cast<uint32_t>(OrigAddr - ImageBase);
+      if (RegeneratedEHTables.count(RVA))
+        EHInPlaceWritten.push_back(RVA);
+    } else
       ++OOPWritten;
   };
+
+  // The regenerated C++ EH tables are written into the .bolt section by the
+  // out-of-place path below.  If that section will not be created (no
+  // out-of-place functions, or no room for another section header), the
+  // reordered EH bodies would be emitted without their new metadata, so revert
+  // them here to keep their original tables valid.
+  if (!RegeneratedEHTables.empty() && PE) {
+    bool WillCreateBolt = false;
+    for (BinaryFunction *F : BC->getAllBinaryFunctions())
+      if (F->isEmitted() && F->getImageSize() != 0 &&
+          F->getOutputAddress() != F->getAddress()) {
+        WillCreateBolt = true;
+        break;
+      }
+    const auto *COFFHdr = InputFile->getCOFFHeader();
+    uint32_t SecTableEnd = OptHdrOff + COFFHdr->SizeOfOptionalHeader +
+                           InputFile->getNumberOfSections() *
+                               sizeof(object::coff_section);
+    bool HeaderRoom =
+        SecTableEnd + sizeof(object::coff_section) <= PE->SizeOfHeaders;
+    if (!WillCreateBolt || !HeaderRoom) {
+      BC->outs() << "BOLT-WARNING: no .bolt section available for EH tables; "
+                    "reverting "
+                 << RegeneratedEHTables.size()
+                 << " reordered C++ EH functions\n";
+      for (const auto &KV : RegeneratedEHTables)
+        ModifiedFunctions.erase(ImageBase + KV.first);
+      RegeneratedEHTables.clear();
+    }
+  }
 
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &BF = BFI.second;
@@ -1449,6 +1501,75 @@ void PECOFFRewriteInstance::rewriteFile() {
                      << OOPFuncs.size() << " new) written to .bolt section\n";
         }
       } // ExcDirOff bounds check
+
+      // Append the regenerated C++ EH ip2state tables after the code/.pdata in
+      // the .bolt section and repoint each affected FuncInfo to its fresh
+      // table.  The entry count grows when reordering fragments state regions,
+      // so the table cannot be patched in place.  Only functions actually
+      // written in-place are repointed; any that overflowed or re-encoded keep
+      // their original layout and metadata.
+      if (!EHInPlaceWritten.empty()) {
+        constexpr uint32_t EHEntrySize = 8; // {uint32 Ip RVA, int32 State}
+        llvm::sort(EHInPlaceWritten);
+        uint32_t EHTablesWritten = 0, EHEntriesWritten = 0;
+        for (uint32_t BeginRVA : EHInPlaceWritten) {
+          auto TI = RegeneratedEHTables.find(BeginRVA);
+          if (TI == RegeneratedEHTables.end())
+            continue;
+          const auto &Table = TI->second;
+          uint32_t TableOffset = alignTo(NewSecVSize, 4);
+          uint32_t TableRVA = NewSecVA + TableOffset;
+
+          SmallVector<uint8_t, 256> TableBytes(Table.size() * EHEntrySize);
+          for (size_t Idx = 0; Idx < Table.size(); ++Idx) {
+            support::endian::write32le(TableBytes.data() + Idx * EHEntrySize,
+                                       Table[Idx].IP);
+            support::endian::write32le(
+                TableBytes.data() + Idx * EHEntrySize + 4,
+                static_cast<uint32_t>(Table[Idx].State));
+          }
+          OS.seek(NewSecRawPtr + TableOffset);
+          OS.write(reinterpret_cast<const char *>(TableBytes.data()),
+                   TableBytes.size());
+          NewSecVSize = TableOffset + TableBytes.size();
+
+          // Repoint FuncInfo: NumIPMapEntries (+20) and IPToStateMap RVA (+24).
+          uint32_t FIRVA = FunctionSEHInfo[BeginRVA].CxxFuncInfoRVA;
+          if (std::optional<uint64_t> FO = VAToFileOffset(ImageBase + FIRVA)) {
+            uint32_t Count = static_cast<uint32_t>(Table.size());
+            OS.pwrite(reinterpret_cast<char *>(&Count), 4, *FO + 20);
+            OS.pwrite(reinterpret_cast<char *>(&TableRVA), 4, *FO + 24);
+            ++EHTablesWritten;
+            EHEntriesWritten += Table.size();
+          }
+        }
+
+        // Re-pad and rewrite the section header / image sizes now that the EH
+        // tables have grown the section past what the .pdata path recorded.
+        NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
+        if (NewSecRawSize > NewSecVSize) {
+          PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
+          OS.seek(NewSecRawPtr + NewSecVSize);
+          OS.write(reinterpret_cast<const char *>(PadBuf.data()),
+                   PadBuf.size());
+        }
+        NewSec.VirtualSize = NewSecVSize;
+        NewSec.SizeOfRawData = NewSecRawSize;
+        NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
+                  SecTableEnd);
+        uint32_t FinalSizeOfImage =
+            alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
+        uint32_t FinalSizeOfCode = PE->SizeOfCode + NewSecRawSize;
+        OS.pwrite(reinterpret_cast<char *>(&FinalSizeOfCode), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfCode));
+        OS.pwrite(reinterpret_cast<char *>(&FinalSizeOfImage), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfImage));
+        if (EHTablesWritten)
+          BC->outs() << "BOLT-INFO: " << EHTablesWritten
+                     << " C++ EH ip2state tables (" << EHEntriesWritten
+                     << " entries) written to .bolt section\n";
+      }
     }
   }
 

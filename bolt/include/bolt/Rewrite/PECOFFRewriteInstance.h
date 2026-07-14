@@ -100,6 +100,13 @@ class PECOFFRewriteInstance {
   /// __CxxFrameHandler3 personality, no try blocks, non-empty IPToState map).
   DenseSet<uint32_t> CxxEHCandidateRVAs;
 
+  /// Regenerated, verified IPToState tables for reordered C++ EH functions,
+  /// keyed by function begin RVA.  Populated by relocateCxxEHTables() in the
+  /// non-dry-run path; entries hold image-relative IP RVAs and are written to a
+  /// fresh table during rewriteFile(), which repoints the FuncInfo.
+  DenseMap<uint32_t, SmallVector<WinEHFuncInfo::IPToStateEntry, 16>>
+      RegeneratedEHTables;
+
   /// Number of functions skipped due to exception handlers.
   uint64_t NumFuncsWithHandlers = 0;
 
@@ -129,7 +136,9 @@ class PECOFFRewriteInstance {
   /// are available via the IO address map. When \p DryRun is true, the
   /// regenerated table is verified and reported but nothing is written to the
   /// output binary, and the affected functions are reverted to their original
-  /// layout so their EH metadata stays valid.
+  /// layout so their EH metadata stays valid. When \p DryRun is false, each
+  /// verified table is retained in RegeneratedEHTables for rewriteFile() to
+  /// emit and repoint the FuncInfo, and the function is left reordered.
   void relocateCxxEHTables(bool DryRun);
 
   void mapCodeSections(BOLTLinker::SectionMapper MapSection);
