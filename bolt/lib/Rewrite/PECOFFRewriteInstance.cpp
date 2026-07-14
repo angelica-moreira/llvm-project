@@ -71,6 +71,13 @@ cl::opt<bool> PECOFFRelocateEHDryRun(
              "metadata but do not modify the output binary"),
     cl::init(true));
 
+cl::opt<bool> PECOFFRelocateEHOOP(
+    "pecoff-relocate-eh-oop",
+    cl::desc("With --pecoff-relocate-eh, allow C++ EH functions that no longer "
+             "fit their original slot to be relocated out-of-place into .bolt "
+             "(experimental)"),
+    cl::init(false));
+
 } // namespace opts
 
 namespace llvm {
@@ -392,6 +399,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
             Info.ChainedBeginRVA = Chain->BeginAddress;
             Info.ChainedEndRVA = Chain->EndAddress;
             Info.ChainedUnwindRVA = Chain->UnwindInfoAddress;
+            Info.ChainedEntryRVA = XDataRVA + HandlerDataOffset;
             ChainToParent[BeginRVA] = Chain->BeginAddress;
           }
         } else if (Info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) {
@@ -941,7 +949,9 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
   // from the input->output address map rather than from basic blocks.
   struct Cand {
     uint32_t BeginRVA;
-    uint64_t InStart, InEnd, OutBase, FuncVA;
+    uint64_t InStart, InEnd, OutputRVA, FuncVA;
+    uint64_t EmittedBase = ~0ULL;
+    SmallVector<std::pair<uint64_t, int>, 64> Raw; // (raw output addr, state)
     SmallVector<OutputInsnState, 64> BodyInsns;
     DenseSet<uint32_t> TrackedOffsets;
   };
@@ -954,32 +964,44 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
     BinaryFunction &BF = BFI->second;
     if (!BF.isEmitted() || !ModifiedFunctions.count(FuncVA))
       continue;
-    Cands.push_back({BeginRVA, BF.getAddress(),
-                     BF.getAddress() + BF.getMaxSize(), BF.getOutputAddress(),
-                     FuncVA, {}, {}});
+    Cand C;
+    C.BeginRVA = BeginRVA;
+    C.InStart = BF.getAddress();
+    C.InEnd = BF.getAddress() + BF.getMaxSize();
+    C.OutputRVA = BF.getOutputAddress() - ImageBase;
+    C.FuncVA = FuncVA;
+    Cands.push_back(std::move(C));
   }
   llvm::sort(Cands, [](const Cand &A, const Cand &B) {
     return A.InStart < B.InStart;
   });
 
   // Single pass over the address map: assign each mapped instruction to the
-  // candidate whose input range contains it.  Output IPs are the final in-place
-  // RVAs (BeginRVA + offset within the emitted function), so the regenerated
-  // body entries share the image-relative coordinate system of the funclet
-  // entries and can be merged and sorted with them.
+  // candidate whose input range contains it, recording its raw linked output
+  // address and the EH state at the corresponding input instruction.  The
+  // emitted base (smallest output address, i.e. the entry) is tracked so the
+  // final IP RVA can be computed relative to the function's final placement,
+  // which works whether it is rewritten in-place or moved to .bolt.
   for (const auto &[InAddr, OutAddr] : IOMap.entries()) {
+    uint64_t In = InAddr, Out = OutAddr;
     auto It = llvm::partition_point(
-        Cands, [&](const Cand &C) { return C.InEnd <= InAddr; });
-    if (It == Cands.end() || InAddr < It->InStart)
+        Cands, [&](const Cand &C) { return C.InEnd <= In; });
+    if (It == Cands.end() || In < It->InStart)
       continue;
-    uint32_t Offset = static_cast<uint32_t>(InAddr - It->InStart);
-    uint32_t OutIP =
-        static_cast<uint32_t>(It->BeginRVA + (OutAddr - It->OutBase));
+    uint32_t Offset = static_cast<uint32_t>(In - It->InStart);
     int State = lookupEHState(FunctionCxxEHInfo[It->BeginRVA],
                               static_cast<uint32_t>(It->BeginRVA + Offset));
-    It->BodyInsns.push_back({OutIP, State});
+    It->Raw.push_back({Out, State});
+    It->EmittedBase = std::min(It->EmittedBase, Out);
     It->TrackedOffsets.insert(Offset);
   }
+
+  // Resolve each instruction's final IP RVA now that the emitted base and the
+  // final output RVA are known.
+  for (Cand &C : Cands)
+    for (const auto &[Raw, State] : C.Raw)
+      C.BodyInsns.push_back(
+          {static_cast<uint32_t>(C.OutputRVA + (Raw - C.EmittedBase)), State});
 
   uint64_t Verified = 0, Failed = 0;
   for (Cand &C : Cands) {
@@ -1176,6 +1198,13 @@ void PECOFFRewriteInstance::rewriteFile() {
   // keep their original layout and metadata.
   SmallVector<uint32_t, 16> EHInPlaceWritten;
 
+  // Begin RVAs of C++ EH candidates written out-of-place to .bolt, mapped to
+  // their final .bolt RVA.  Their regenerated ip2state table uses .bolt body
+  // IPs and their FuncInfo is repointed just like the in-place set, but their
+  // funclet chained-unwind records must additionally be repointed to the new
+  // .bolt parent range.
+  SmallVector<std::pair<uint32_t, uint32_t>, 16> EHOOPWritten;
+
   uint32_t NewSecRawPtr = 0;
   uint32_t NewSecVA = 0;
   if (PE) {
@@ -1277,8 +1306,12 @@ void PECOFFRewriteInstance::rewriteFile() {
       uint32_t RVA = static_cast<uint32_t>(OrigAddr - ImageBase);
       if (RegeneratedEHTables.count(RVA))
         EHInPlaceWritten.push_back(RVA);
-    } else
+    } else {
       ++OOPWritten;
+      uint32_t RVA = static_cast<uint32_t>(OrigAddr - ImageBase);
+      if (RegeneratedEHTables.count(RVA))
+        EHOOPWritten.push_back({RVA, static_cast<uint32_t>(OutputRVA)});
+    }
   };
 
   // The regenerated C++ EH tables are written into the .bolt section by the
@@ -1508,11 +1541,25 @@ void PECOFFRewriteInstance::rewriteFile() {
       // so the table cannot be patched in place.  Only functions actually
       // written in-place are repointed; any that overflowed or re-encoded keep
       // their original layout and metadata.
-      if (!EHInPlaceWritten.empty()) {
+      if (!EHInPlaceWritten.empty() || !EHOOPWritten.empty()) {
         constexpr uint32_t EHEntrySize = 8; // {uint32 Ip RVA, int32 State}
-        llvm::sort(EHInPlaceWritten);
+
+        // Repoint every relocated candidate's FuncInfo, whether it was written
+        // in place or moved out-of-place; both share the same regenerated-table
+        // machinery.  Out-of-place candidates additionally need their funclet
+        // chained-unwind records repointed to the new .bolt parent range.
+        DenseMap<uint32_t, uint32_t> OOPBolt;
+        for (const auto &[OrigRVA, BoltRVA] : EHOOPWritten)
+          OOPBolt[OrigRVA] = BoltRVA;
+
+        SmallVector<uint32_t, 16> EHWritten(EHInPlaceWritten.begin(),
+                                            EHInPlaceWritten.end());
+        for (const auto &[OrigRVA, BoltRVA] : EHOOPWritten)
+          EHWritten.push_back(OrigRVA);
+        llvm::sort(EHWritten);
+
         uint32_t EHTablesWritten = 0, EHEntriesWritten = 0;
-        for (uint32_t BeginRVA : EHInPlaceWritten) {
+        for (uint32_t BeginRVA : EHWritten) {
           auto TI = RegeneratedEHTables.find(BeginRVA);
           if (TI == RegeneratedEHTables.end())
             continue;
@@ -1544,8 +1591,34 @@ void PECOFFRewriteInstance::rewriteFile() {
           }
         }
 
-        // Re-pad and rewrite the section header / image sizes now that the EH
-        // tables have grown the section past what the .pdata path recorded.
+        // Repoint funclet chained-unwind records for out-of-place parents.  A
+        // catch/cleanup funclet with UNW_FLAG_CHAININFO embeds a
+        // RUNTIME_FUNCTION pointing at its primary function's original range;
+        // once the primary moves to .bolt that BeginAddress/EndAddress is stale
+        // and must track the new .bolt .pdata entry.  UnwindInfoAddress is left
+        // untouched (the parent's UNWIND_INFO stays in .xdata, unchanged).
+        uint32_t ChainsPatched = 0;
+        for (const auto &[OrigRVA, BoltRVA] : EHOOPWritten) {
+          auto BFI = BC->getBinaryFunctions().find(ImageBase + OrigRVA);
+          if (BFI == BC->getBinaryFunctions().end())
+            continue;
+          uint32_t BoltEnd =
+              BoltRVA + static_cast<uint32_t>(BFI->second.getImageSize());
+          for (const auto &[FuncletRVA, Info] : FunctionSEHInfo) {
+            if (!Info.IsChained || Info.ChainedBeginRVA != OrigRVA ||
+                !Info.ChainedEntryRVA)
+              continue;
+            if (std::optional<uint64_t> FO =
+                    VAToFileOffset(ImageBase + Info.ChainedEntryRVA)) {
+              OS.pwrite(reinterpret_cast<const char *>(&BoltRVA), 4, *FO);
+              OS.pwrite(reinterpret_cast<const char *>(&BoltEnd), 4, *FO + 4);
+              ++ChainsPatched;
+            }
+          }
+        }
+        if (ChainsPatched)
+          BC->outs() << "BOLT-INFO: " << ChainsPatched
+                     << " funclet chained-unwind records repointed to .bolt\n";
         NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
         if (NewSecRawSize > NewSecVSize) {
           PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
@@ -1843,12 +1916,13 @@ void PECOFFRewriteInstance::run() {
     if (!BF.isSimple())
       continue;
 
-    // C++ EH reordering (experimental) only supports in-place rewriting: an
+    // C++ EH reordering (experimental) defaults to in-place rewriting: an
     // out-of-place copy would leave the function's .pdata/.xdata (and the
-    // regenerated ip2state table) describing the original address range.  Keep
-    // EH candidates in place so a non-fitting one simply overflows and is left
-    // untouched rather than being moved.
-    if (opts::PECOFFRelocateEH &&
+    // regenerated ip2state table) describing the original address range.  With
+    // --pecoff-relocate-eh-oop the out-of-place path also repoints those, so
+    // EH candidates are allowed to move; otherwise keep them in place so a
+    // non-fitting one simply overflows and is left untouched.
+    if (opts::PECOFFRelocateEH && !opts::PECOFFRelocateEHOOP &&
         CxxEHCandidateRVAs.count(static_cast<uint32_t>(FuncVA - ImageBase)))
       continue;
 

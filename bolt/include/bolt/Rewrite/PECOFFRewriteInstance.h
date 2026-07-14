@@ -57,6 +57,10 @@ struct SEHUnwindInfo {
   uint32_t ChainedBeginRVA = 0;
   uint32_t ChainedEndRVA = 0;
   uint32_t ChainedUnwindRVA = 0;
+  /// RVA of the chained RUNTIME_FUNCTION record itself (inside .xdata), i.e.
+  /// where ChainedBeginRVA/ChainedEndRVA are stored.  Used to repoint a
+  /// funclet's chain when its primary function is moved out-of-place.
+  uint32_t ChainedEntryRVA = 0;
 };
 
 class PECOFFRewriteInstance {
