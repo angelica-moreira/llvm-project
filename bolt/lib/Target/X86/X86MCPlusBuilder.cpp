@@ -79,10 +79,16 @@ static InstructionListType createIncMemory(const MCSymbol *Target,
   return Insts;
 }
 
+// The generated operand-type tables define an OpTypes enum whose members (e.g.
+// GR16) collide with the X86 register-class enumerators of the same name.  Keep
+// them in a named namespace so the two do not clash, and so the generated
+// `namespace llvm::X86` does not leak an ambiguous `llvm` into the global scope.
+namespace x86_operand_types {
 #define GET_INSTRINFO_OPERAND_TYPES_ENUM
 #define GET_INSTRINFO_OPERAND_TYPE
 #define GET_INSTRINFO_MEM_OPERAND_SIZE
 #include "X86GenInstrInfo.inc"
+} // namespace x86_operand_types
 
 class X86MCPlusBuilder : public MCPlusBuilder {
 public:
@@ -899,7 +905,7 @@ public:
   }
 
   static uint8_t getMemDataSize(const MCInst &Inst, int MemOpNo) {
-    using namespace llvm::X86;
+    using namespace x86_operand_types::llvm::X86;
     int OpType = getOperandType(Inst.getOpcode(), MemOpNo);
     return getMemOperandSize(OpType) / 8;
   }
