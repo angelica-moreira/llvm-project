@@ -1655,6 +1655,39 @@ void PECOFFRewriteInstance::rewriteFile() {
               CertDirOff);
   }
 
+  // Recompute the PE image checksum.  BOLT patches the file in place after
+  // copying it, so the inherited checksum is stale.  The loader ignores it for
+  // ordinary user-mode modules, but drivers, protected processes and integrity
+  // tools verify it, so keep it correct.
+  if (PE) {
+    OS.flush();
+    if (ErrorOr<std::unique_ptr<MemoryBuffer>> MB = MemoryBuffer::getFile(
+            opts::OutputFilename, /*IsText=*/false,
+            /*RequiresNullTerminator=*/false, /*IsVolatile=*/true)) {
+      StringRef Buf = (*MB)->getBuffer();
+      const uint64_t CksOff =
+          OptHdrOff + offsetof(object::pe32plus_header, CheckSum);
+      const auto *D = reinterpret_cast<const uint8_t *>(Buf.data());
+      const size_t N = Buf.size();
+      uint64_t Sum = 0;
+      for (size_t I = 0; I + 1 < N; I += 2) {
+        uint16_t W = (I >= CksOff && I < CksOff + 4)
+                         ? 0
+                         : static_cast<uint16_t>(D[I] | (D[I + 1] << 8));
+        Sum += W;
+        Sum = (Sum & 0xffff) + (Sum >> 16);
+      }
+      if (N & 1) {
+        Sum += D[N - 1];
+        Sum = (Sum & 0xffff) + (Sum >> 16);
+      }
+      Sum = (Sum & 0xffff) + (Sum >> 16);
+      uint32_t Checksum =
+          static_cast<uint32_t>(Sum & 0xffff) + static_cast<uint32_t>(N);
+      OS.pwrite(reinterpret_cast<char *>(&Checksum), sizeof(Checksum), CksOff);
+    }
+  }
+
   Out->keep();
 
   BC->outs() << "BOLT-INFO: " << InPlaceCount
