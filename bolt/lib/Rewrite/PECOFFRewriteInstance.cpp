@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bolt/Rewrite/PECOFFRewriteInstance.h"
+#include "bolt/Core/AddressMap.h"
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryEmitter.h"
 #include "bolt/Core/BinaryFunction.h"
@@ -58,6 +59,18 @@ cl::opt<bool> PECOFFInplaceOnly(
     cl::desc("Skip out-of-place emission; only rewrite functions that fit"),
     cl::init(false));
 
+cl::opt<bool> PECOFFRelocateEH(
+    "pecoff-relocate-eh",
+    cl::desc("Reorder functions with C++ exception handlers, regenerating "
+             "their MSVC EH metadata (experimental)"),
+    cl::init(false));
+
+cl::opt<bool> PECOFFRelocateEHDryRun(
+    "pecoff-relocate-eh-dryrun",
+    cl::desc("With --pecoff-relocate-eh, verify and report the regenerated EH "
+             "metadata but do not modify the output binary"),
+    cl::init(true));
+
 } // namespace opts
 
 namespace llvm {
@@ -80,6 +93,24 @@ struct RuntimeFunction {
 constexpr uint8_t UNW_FLAG_EHANDLER = 0x01;
 constexpr uint8_t UNW_FLAG_UHANDLER = 0x02;
 constexpr uint8_t UNW_FLAG_CHAININFO = 0x04;
+
+// Populate \p Reader so it can resolve any RVA in the image; the C++ EH
+// FuncInfo and its sub-tables are typically spread across .rdata/.xdata.
+static void populateImageReader(object::COFFObjectFile &InputFile,
+                                WinEHImageReader &Reader) {
+  for (const object::SectionRef &Section : InputFile.sections()) {
+    const object::coff_section *CS = InputFile.getCOFFSection(Section);
+    if (!CS || CS->VirtualSize == 0)
+      continue;
+    ArrayRef<uint8_t> Contents;
+    if (Error E = InputFile.getSectionContents(CS, Contents)) {
+      consumeError(std::move(E));
+      continue;
+    }
+    if (!Contents.empty())
+      Reader.addSection(CS->VirtualAddress, Contents);
+  }
+}
 
 Expected<std::unique_ptr<PECOFFRewriteInstance>>
 PECOFFRewriteInstance::create(object::COFFObjectFile *InputFile,
@@ -194,6 +225,18 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
 
   if (!opts::AlignText.getNumOccurrences())
     opts::AlignText = BC->PageAlign;
+
+  // Relocating C++ EH functions requires a precise per-instruction
+  // input->output offset map.  BOLT already produces one via its address
+  // translation machinery; enable it so location symbols are emitted for the
+  // functions we intend to rewrite.  PE/COFF never writes a BAT section, so
+  // this only turns on the per-instruction tracking we consume internally.
+  if (opts::PECOFFRelocateEH && !opts::EnableBAT)
+    opts::EnableBAT = true;
+  // EnableBAT alone only tracks calls/branches; ip2state boundaries may land on
+  // any instruction, so retain offsets on all of them.
+  if (opts::PECOFFRelocateEH)
+    BC->KeepAllOffsets = true;
 }
 
 // ShortenInstructions and RemoveNops are excluded from the PE/COFF pipeline
@@ -296,6 +339,11 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   DenseMap<uint32_t, uint32_t>
       ChainToParent; // chained begin RVA -> parent begin RVA
 
+  // Reader over all sections, used to decode C++ EH FuncInfo referenced from
+  // the handler data.
+  WinEHImageReader ImageReader;
+  populateImageReader(*InputFile, ImageReader);
+
   for (size_t I = 0; I < NumEntries; ++I) {
     uint32_t BeginRVA = Entries[I].BeginAddress;
     uint32_t EndRVA = Entries[I].EndAddress;
@@ -352,6 +400,37 @@ void PECOFFRewriteInstance::readExceptionHandling() {
             Info.ExceptionHandlerRVA = support::endian::read32le(
                 XDataContents.data() + HandlerDataOffset);
           }
+          // For __CxxFrameHandler3 the personality RVA is followed by a single
+          // RVA pointing at the FuncInfo structure.  A successful parse both
+          // recovers the metadata and confirms the personality (the compressed
+          // __CxxFrameHandler4 format does not match the FuncInfo magic).
+          if (HandlerDataOffset + 8 <= XDataContents.size()) {
+            uint32_t FuncInfoRVA = support::endian::read32le(
+                XDataContents.data() + HandlerDataOffset + 4);
+            if (Expected<WinEHFuncInfo> FI =
+                    parseWinEHFuncInfo(ImageReader, FuncInfoRVA)) {
+              Info.IsCxxEH = true;
+              Info.CxxFuncInfoRVA = FuncInfoRVA;
+              // Record the cleanup/catch funclet entry points so they can be
+              // pinned in place; their RVAs are referenced by the EH metadata.
+              for (const WinEHFuncInfo::UnwindMapEntry &UM : FI->UnwindMap)
+                if (UM.Action)
+                  CxxEHFuncletRVAs.insert(UM.Action);
+              for (const WinEHFuncInfo::TryBlock &TB : FI->TryBlocks)
+                for (const WinEHFuncInfo::HandlerType &HT : TB.Handlers)
+                  if (HT.Handler)
+                    CxxEHFuncletRVAs.insert(HT.Handler);
+              FunctionCxxEHInfo[BeginRVA] = std::move(*FI);
+              ++NumCxxEHFuncs;
+              // A first-cut reordering candidate: classic personality, no try
+              // blocks (simplest shape), and a non-empty state map to relocate.
+              if (FunctionCxxEHInfo[BeginRVA].TryBlocks.empty() &&
+                  !FunctionCxxEHInfo[BeginRVA].IPToStateMap.empty())
+                CxxEHCandidateRVAs.insert(static_cast<uint32_t>(BeginRVA));
+            } else {
+              consumeError(FI.takeError());
+            }
+          }
         }
       }
     }
@@ -373,6 +452,10 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
   BC->outs() << "BOLT-INFO: parsed " << FunctionSEHInfo.size()
              << " .pdata entries, " << ChainToParent.size() << " chained\n";
+  BC->outs() << "BOLT-INFO: parsed " << NumCxxEHFuncs
+             << " C++ (__CxxFrameHandler3) EH tables\n";
+  BC->outs() << "BOLT-INFO: " << CxxEHFuncletRVAs.size()
+             << " C++ EH funclets to pin\n";
 }
 
 void PECOFFRewriteInstance::discoverFileObjects() {
@@ -436,9 +519,22 @@ void PECOFFRewriteInstance::discoverFileObjects() {
     BF->setOutputAddress(BF->getAddress());
 
     if (Info.HasExceptionHandler) {
-      BF->setSimple(false);
-      ++FuncsSkippedHandler;
+      // With EH relocation enabled, leave reordering candidates simple so they
+      // can be optimized; their EH metadata is regenerated after emission.
+      bool IsCandidate =
+          opts::PECOFFRelocateEH &&
+          CxxEHCandidateRVAs.count(static_cast<uint32_t>(BeginRVA)) &&
+          !CxxEHFuncletRVAs.count(static_cast<uint32_t>(BeginRVA));
+      if (!IsCandidate) {
+        BF->setSimple(false);
+        ++FuncsSkippedHandler;
+      }
     }
+
+    // Pin catch/cleanup funclets: their entry RVAs are referenced by EH
+    // metadata and must not move when a parent function is reordered.
+    if (CxxEHFuncletRVAs.count(static_cast<uint32_t>(BeginRVA)))
+      BF->setSimple(false);
 
     ++FuncsCreated;
   }
@@ -777,6 +873,11 @@ void PECOFFRewriteInstance::emitAndLink() {
   auto Streamer = BC->createStreamer(*OS);
 
   emitBinaryContext(*Streamer, *BC, getOrgSecPrefix());
+  // Emit the input->output address map so we can recover precise
+  // per-instruction offsets after linking (used to regenerate C++ EH tables).
+  // BinaryEmitter only emits this automatically for ELF, so do it explicitly.
+  if (opts::PECOFFRelocateEH)
+    AddressMap::emit(*Streamer, *BC);
   Streamer->finish();
 
   StringRef ObjContents = BOS->str();
@@ -793,6 +894,179 @@ void PECOFFRewriteInstance::emitAndLink() {
   Linker = std::make_unique<JITLinkLinker>(*BC, std::move(EFMM));
   Linker->loadObject(ObjectMemBuffer->getMemBufferRef(),
                      [this](auto MapSection) { mapCodeSections(MapSection); });
+
+  // Recover the linked per-instruction address map for EH table regeneration.
+  if (opts::PECOFFRelocateEH) {
+    if (std::optional<AddressMap> Map = AddressMap::parse(*BC)) {
+      BC->setIOAddressMap(std::move(*Map));
+      BC->outs() << "BOLT-INFO: address map available for EH relocation\n";
+    } else {
+      BC->outs() << "BOLT-WARNING: no address map parsed; EH relocation "
+                    "disabled for this run\n";
+    }
+  }
+}
+
+void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
+  if (!opts::PECOFFRelocateEH || CxxEHCandidateRVAs.empty())
+    return;
+  if (!BC->hasIOAddressMap()) {
+    BC->outs() << "BOLT-WARNING: no IO address map; skipping EH relocation\n";
+    return;
+  }
+  const AddressMap &IOMap = BC->getIOAddressMap();
+
+  // State active at output IP \p IP according to a regenerated table: the last
+  // entry with IP <= query, or the null state.
+  auto stateInTable =
+      [](ArrayRef<WinEHFuncInfo::IPToStateEntry> Table, uint32_t IP) -> int {
+    int State = WinEHNullState;
+    for (const WinEHFuncInfo::IPToStateEntry &E : Table) {
+      if (E.IP > IP)
+        break;
+      State = E.State;
+    }
+    return State;
+  };
+
+  // Revert a candidate to its original layout so the untouched EH metadata
+  // stays valid (used on dry-run and on any verification failure).
+  auto revert = [&](uint64_t FuncVA) {
+    ModifiedFunctions.erase(FuncVA);
+    FunctionOffsetMaps.erase(FuncVA);
+  };
+
+  // Reordered candidates, in ascending input-address order.  The CFG has been
+  // released by the time this runs, so per-instruction offsets are recovered
+  // from the input->output address map rather than from basic blocks.
+  struct Cand {
+    uint32_t BeginRVA;
+    uint64_t InStart, InEnd, OutBase, FuncVA;
+    SmallVector<OutputInsnState, 64> BodyInsns;
+    DenseSet<uint32_t> TrackedOffsets;
+  };
+  SmallVector<Cand, 16> Cands;
+  for (uint32_t BeginRVA : CxxEHCandidateRVAs) {
+    uint64_t FuncVA = ImageBase + BeginRVA;
+    auto BFI = BC->getBinaryFunctions().find(FuncVA);
+    if (BFI == BC->getBinaryFunctions().end())
+      continue;
+    BinaryFunction &BF = BFI->second;
+    if (!BF.isEmitted() || !ModifiedFunctions.count(FuncVA))
+      continue;
+    Cands.push_back({BeginRVA, BF.getAddress(),
+                     BF.getAddress() + BF.getMaxSize(), BF.getOutputAddress(),
+                     FuncVA, {}, {}});
+  }
+  llvm::sort(Cands, [](const Cand &A, const Cand &B) {
+    return A.InStart < B.InStart;
+  });
+
+  // Single pass over the address map: assign each mapped instruction to the
+  // candidate whose input range contains it.  Output IPs are recorded relative
+  // to the emitted function base, which preserves layout order (enough to
+  // verify the regenerated table without knowing the final placement).
+  for (const auto &[InAddr, OutAddr] : IOMap.entries()) {
+    auto It = llvm::partition_point(
+        Cands, [&](const Cand &C) { return C.InEnd <= InAddr; });
+    if (It == Cands.end() || InAddr < It->InStart)
+      continue;
+    uint32_t Offset = static_cast<uint32_t>(InAddr - It->InStart);
+    uint32_t OutIP = static_cast<uint32_t>(OutAddr - It->OutBase);
+    int State = lookupEHState(FunctionCxxEHInfo[It->BeginRVA],
+                              static_cast<uint32_t>(It->BeginRVA + Offset));
+    It->BodyInsns.push_back({OutIP, State});
+    It->TrackedOffsets.insert(Offset);
+  }
+
+  uint64_t Verified = 0, Failed = 0;
+  for (Cand &C : Cands) {
+    const WinEHFuncInfo &FI = FunctionCxxEHInfo[C.BeginRVA];
+    const uint32_t EndRVA = FunctionSEHInfo[C.BeginRVA].EndRVA;
+
+    // Fail closed: every in-body ip2state boundary must map to a tracked
+    // instruction, otherwise the regenerated table cannot be guaranteed.
+    bool CoverageOK = !C.BodyInsns.empty();
+    if (CoverageOK)
+      for (const WinEHFuncInfo::IPToStateEntry &E : FI.IPToStateMap) {
+        if (isInBodyIP(E.IP, C.BeginRVA, EndRVA) &&
+            !C.TrackedOffsets.count(E.IP - C.BeginRVA)) {
+          CoverageOK = false;
+          break;
+        }
+      }
+
+    if (!CoverageOK) {
+      ++Failed;
+      if (opts::Verbosity >= 1) {
+        uint32_t Missing = 0, InBody = 0;
+        for (const WinEHFuncInfo::IPToStateEntry &E : FI.IPToStateMap)
+          if (isInBodyIP(E.IP, C.BeginRVA, EndRVA)) {
+            ++InBody;
+            if (!C.TrackedOffsets.count(E.IP - C.BeginRVA) && !Missing)
+              Missing = E.IP - C.BeginRVA;
+          }
+        BC->outs() << "BOLT-INFO: EH relocation: incomplete offset coverage "
+                      "for RVA 0x"
+                   << Twine::utohexstr(C.BeginRVA) << " (" << InBody
+                   << " in-body entries, first uncovered offset 0x"
+                   << Twine::utohexstr(Missing)
+                   << "); leaving unmodified\n";
+      }
+      revert(C.FuncVA);
+      continue;
+    }
+
+    llvm::sort(C.BodyInsns,
+               [](const OutputInsnState &A, const OutputInsnState &B) {
+                 return A.OutputIP < B.OutputIP;
+               });
+
+    // Regenerate the body portion of the table (funclet entries are relocated
+    // separately in the write step and use image-relative RVAs).
+    SmallVector<WinEHFuncInfo::IPToStateEntry, 16> NewBody =
+        regenerateIPToState(C.BodyInsns, {});
+
+    size_t OrigBody = 0;
+    for (const WinEHFuncInfo::IPToStateEntry &E : FI.IPToStateMap)
+      if (isInBodyIP(E.IP, C.BeginRVA, EndRVA))
+        ++OrigBody;
+
+    // Verify the regenerated table reproduces the original per-instruction
+    // state for every tracked body instruction (lossless compression).
+    bool VerifyOK = true;
+    for (const OutputInsnState &Insn : C.BodyInsns)
+      if (stateInTable(NewBody, Insn.OutputIP) != Insn.State) {
+        VerifyOK = false;
+        break;
+      }
+
+    auto BFI = BC->getBinaryFunctions().find(C.FuncVA);
+    BinaryFunction &BF = BFI->second;
+    if (VerifyOK) {
+      ++Verified;
+      if (opts::Verbosity >= 1)
+        BC->outs() << "BOLT-INFO: EH relocation "
+                   << (DryRun ? "(dry-run) " : "") << BF << ": body ip2state "
+                   << OrigBody << " -> " << NewBody.size()
+                   << " entries [verified]\n";
+    } else {
+      ++Failed;
+      BC->outs() << "BOLT-WARNING: EH relocation verification failed for " << BF
+                 << "; leaving unmodified\n";
+    }
+
+    // The actual table write is a later step; for now (and on any failure) do
+    // not emit the reordered body so the original EH metadata stays correct.
+    if (DryRun || !VerifyOK)
+      revert(C.FuncVA);
+  }
+
+  BC->outs() << "BOLT-INFO: EH relocation candidates: "
+             << CxxEHCandidateRVAs.size() << " total, " << Cands.size()
+             << " reordered\n";
+  BC->outs() << "BOLT-INFO: EH relocation summary: " << Verified
+             << " verified, " << Failed << " failed\n";
 }
 
 void PECOFFRewriteInstance::rewriteFile() {
@@ -1447,6 +1721,16 @@ void PECOFFRewriteInstance::run() {
     BinaryFunction &BF = It->second;
     if (!BF.isSimple())
       continue;
+
+    // C++ EH reordering (experimental) only supports in-place rewriting: an
+    // out-of-place copy would leave the function's .pdata/.xdata (and the
+    // regenerated ip2state table) describing the original address range.  Keep
+    // EH candidates in place so a non-fitting one simply overflows and is left
+    // untouched rather than being moved.
+    if (opts::PECOFFRelocateEH &&
+        CxxEHCandidateRVAs.count(static_cast<uint32_t>(FuncVA - ImageBase)))
+      continue;
+
     uint64_t HotSize, ColdSize;
     std::tie(HotSize, ColdSize) =
         BC->calculateEmittedSize(BF, /*FixBranches=*/false);
@@ -1542,6 +1826,7 @@ void PECOFFRewriteInstance::run() {
                     << " unmodified functions\n");
 
   emitAndLink();
+  relocateCxxEHTables(opts::PECOFFRelocateEHDryRun);
   rewriteFile();
 
   if (hasCodeViewDebugInfo(InputFile))

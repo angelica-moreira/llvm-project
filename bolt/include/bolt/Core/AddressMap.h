@@ -70,6 +70,10 @@ public:
   lookupAll(uint64_t InputAddress) const {
     return Address2AddressMap.equal_range(InputAddress);
   }
+
+  /// Direct access to the input->output entries, e.g. to enumerate all mapped
+  /// instructions of a function by input-address range.
+  const Addr2AddrMapTy &entries() const { return Address2AddressMap; }
 };
 
 } // namespace bolt

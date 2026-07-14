@@ -712,6 +712,12 @@ public:
   /// Indicates if relocations are available for usage.
   bool HasRelocations{false};
 
+  /// When set, retain an offset annotation on every disassembled instruction,
+  /// not just calls/branches/returns.  Needed by the PE/COFF C++ EH relocator,
+  /// which requires per-instruction input->output address translation to
+  /// regenerate MSVC ip2state tables after reordering.
+  bool KeepAllOffsets{false};
+
   /// Indicates if the binary is stripped
   bool IsStripped{false};
 
@@ -1483,8 +1489,9 @@ public:
   /// Return true if instruction \p Inst requires an offset for further
   /// processing (e.g. assigning a profile).
   bool keepOffsetForInstruction(const MCInst &Inst) const {
-    if (MIB->isCall(Inst) || MIB->isBranch(Inst) || MIB->isReturn(Inst) ||
-        MIB->isPrefix(Inst) || MIB->isIndirectBranch(Inst)) {
+    if (KeepAllOffsets || MIB->isCall(Inst) || MIB->isBranch(Inst) ||
+        MIB->isReturn(Inst) || MIB->isPrefix(Inst) ||
+        MIB->isIndirectBranch(Inst)) {
       return true;
     }
     return false;

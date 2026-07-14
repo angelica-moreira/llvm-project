@@ -31,6 +31,7 @@ add_llvm_library(LLVMBOLTRewrite
   RSeqRewriter.cpp
   SDTRewriter.cpp
   GNUPropertyRewriter.cpp
+  WinEHFuncInfoReader.cpp
 
   NO_EXPORT
   DISABLE_LLVM_LINK_LLVM_DYLIB

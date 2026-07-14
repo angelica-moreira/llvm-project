@@ -14,6 +14,7 @@
 #define BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
 
 #include "bolt/Core/Linker.h"
+#include "bolt/Rewrite/WinEHFuncInfoReader.h"
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -45,6 +46,13 @@ struct SEHUnwindInfo {
   SmallVector<uint16_t, 8> UnwindCodes;
   uint32_t ExceptionHandlerRVA = 0;
   bool HasExceptionHandler = false;
+  /// RVA of the MSVC C++ FuncInfo structure when the personality routine is
+  /// __CxxFrameHandler3 (i.e. \c IsCxxEH is set), otherwise 0.
+  uint32_t CxxFuncInfoRVA = 0;
+  /// True when the handler data decodes as a classic __CxxFrameHandler3
+  /// FuncInfo (recognized magic number).  __CxxFrameHandler4's compressed
+  /// format does not match and leaves this false.
+  bool IsCxxEH = false;
   bool IsChained = false;
   uint32_t ChainedBeginRVA = 0;
   uint32_t ChainedEndRVA = 0;
@@ -79,8 +87,24 @@ class PECOFFRewriteInstance {
   /// SEH unwind info indexed by function begin RVA.
   DenseMap<uint32_t, SEHUnwindInfo> FunctionSEHInfo;
 
+  /// Parsed MSVC C++ FuncInfo indexed by function begin RVA, populated for
+  /// functions whose personality is __CxxFrameHandler3.
+  DenseMap<uint32_t, WinEHFuncInfo> FunctionCxxEHInfo;
+
+  /// RVAs of out-of-line catch/cleanup funclets referenced by C++ EH FuncInfo.
+  /// These are pinned in place so that funclet RVAs in the EH metadata stay
+  /// valid when a parent function is reordered.
+  DenseSet<uint32_t> CxxEHFuncletRVAs;
+
+  /// RVAs of C++ EH functions eligible for reordering (currently: parsed
+  /// __CxxFrameHandler3 personality, no try blocks, non-empty IPToState map).
+  DenseSet<uint32_t> CxxEHCandidateRVAs;
+
   /// Number of functions skipped due to exception handlers.
   uint64_t NumFuncsWithHandlers = 0;
+
+  /// Number of functions with a successfully parsed C++ FuncInfo.
+  uint64_t NumCxxEHFuncs = 0;
 
   /// Number of functions skipped due to size overflow after optimization.
   uint64_t NumFuncsOverflow = 0;
@@ -99,6 +123,15 @@ class PECOFFRewriteInstance {
   void runOptimizationPasses();
   void freezePrologInstructions();
   void emitAndLink();
+
+  /// Regenerate the C++ EH IPToState table for reordered in-place functions
+  /// (Phase 2). Runs after emitAndLink() so per-instruction output addresses
+  /// are available via the IO address map. When \p DryRun is true, the
+  /// regenerated table is verified and reported but nothing is written to the
+  /// output binary, and the affected functions are reverted to their original
+  /// layout so their EH metadata stays valid.
+  void relocateCxxEHTables(bool DryRun);
+
   void mapCodeSections(BOLTLinker::SectionMapper MapSection);
   void rewriteFile();
   void identityRewriteFile();
