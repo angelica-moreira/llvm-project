@@ -114,6 +114,12 @@ inline bool isInBodyIP(uint32_t IP, uint32_t FuncBeginRVA,
 /// IPToState entry.
 constexpr int WinEHNullState = -1;
 
+/// Return the EH state in effect at IP RVA \p IP for an IPToState table: the
+/// state of the last entry with IP <= \p IP, or WinEHNullState if none precedes
+/// it.  \p Table must be sorted by ascending IP, as emitted by MSVC (see
+/// WinException.cpp).
+int stateAtIP(ArrayRef<WinEHFuncInfo::IPToStateEntry> Table, uint32_t IP);
+
 /// Return the EH state in effect at the original IP RVA \p IP: the state of the
 /// last IPToState entry with IP <= \p IP, or WinEHNullState if none precedes
 /// it.  \c FI.IPToStateMap must be sorted by ascending IP, as emitted by MSVC

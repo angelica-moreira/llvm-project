@@ -224,16 +224,20 @@ Expected<WinEHFuncInfo> parseWinEHFuncInfo(const WinEHImageReader &Reader,
   return FI;
 }
 
-int lookupEHState(const WinEHFuncInfo &FI, uint32_t IP) {
-  // FI.IPToStateMap is sorted by ascending IP; find the last entry whose IP is
-  // <= the query.
+int stateAtIP(ArrayRef<WinEHFuncInfo::IPToStateEntry> Table, uint32_t IP) {
+  // Table is sorted by ascending IP; find the last entry whose IP is <= the
+  // query.
   int State = WinEHNullState;
-  for (const WinEHFuncInfo::IPToStateEntry &Entry : FI.IPToStateMap) {
+  for (const WinEHFuncInfo::IPToStateEntry &Entry : Table) {
     if (Entry.IP > IP)
       break;
     State = Entry.State;
   }
   return State;
+}
+
+int lookupEHState(const WinEHFuncInfo &FI, uint32_t IP) {
+  return stateAtIP(FI.IPToStateMap, IP);
 }
 
 SmallVector<WinEHFuncInfo::IPToStateEntry, 16>

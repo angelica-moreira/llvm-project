@@ -924,19 +924,6 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
   }
   const AddressMap &IOMap = BC->getIOAddressMap();
 
-  // State active at output IP \p IP according to a regenerated table: the last
-  // entry with IP <= query, or the null state.
-  auto stateInTable =
-      [](ArrayRef<WinEHFuncInfo::IPToStateEntry> Table, uint32_t IP) -> int {
-    int State = WinEHNullState;
-    for (const WinEHFuncInfo::IPToStateEntry &E : Table) {
-      if (E.IP > IP)
-        break;
-      State = E.State;
-    }
-    return State;
-  };
-
   // Revert a candidate to its original layout so the untouched EH metadata
   // stays valid (used on dry-run and on any verification failure).
   auto revert = [&](uint64_t FuncVA) {
@@ -1067,7 +1054,7 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
     // body-IP lookups.
     bool VerifyOK = true;
     for (const OutputInsnState &Insn : C.BodyInsns)
-      if (stateInTable(NewTable, Insn.OutputIP) != Insn.State) {
+      if (stateAtIP(NewTable, Insn.OutputIP) != Insn.State) {
         VerifyOK = false;
         break;
       }
@@ -1410,6 +1397,32 @@ void PECOFFRewriteInstance::rewriteFile() {
                  << Twine::utohexstr(NewSecVA) << " (" << OOPWritten
                  << " functions)\n";
 
+      // Pad the .bolt section to FileAlignment and rewrite its section-table
+      // header plus the image's SizeOfCode/SizeOfImage.  Invoked after each
+      // block that appends to the section (.pdata, then the EH tables), since
+      // every append can grow NewSecVSize.
+      auto finalizeBoltSection = [&]() {
+        NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
+        if (NewSecRawSize > NewSecVSize) {
+          PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
+          OS.seek(NewSecRawPtr + NewSecVSize);
+          OS.write(reinterpret_cast<const char *>(PadBuf.data()),
+                   PadBuf.size());
+        }
+        NewSec.VirtualSize = NewSecVSize;
+        NewSec.SizeOfRawData = NewSecRawSize;
+        NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
+                  SecTableEnd);
+        uint32_t SizeOfImage =
+            alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
+        uint32_t SizeOfCode = PE->SizeOfCode + NewSecRawSize;
+        OS.pwrite(reinterpret_cast<char *>(&SizeOfCode), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfCode));
+        OS.pwrite(reinterpret_cast<char *>(&SizeOfImage), 4,
+                  OptHdrOff + offsetof(PEHdr, SizeOfImage));
+      };
+
       // Append .pdata for OOP functions.  Copy original entries, remove
       // OOP originals (now leaf JMP trampolines), add .bolt entries.
       uint32_t ExcDirOff =
@@ -1504,27 +1517,7 @@ void PECOFFRewriteInstance::rewriteFile() {
 
           // Recompute section sizes now that .pdata is included.
           NewSecVSize = PDataOffset + CombinedBytes;
-          NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
-          if (NewSecRawSize > NewSecVSize) {
-            PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
-            OS.seek(NewSecRawPtr + NewSecVSize);
-            OS.write(reinterpret_cast<const char *>(PadBuf.data()),
-                     PadBuf.size());
-          }
-
-          NewSec.VirtualSize = NewSecVSize;
-          NewSec.SizeOfRawData = NewSecRawSize;
-          NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
-          OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
-                    SecTableEnd);
-
-          NewSizeOfImage =
-              alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
-          NewSizeOfCode = PE->SizeOfCode + NewSecRawSize;
-          OS.pwrite(reinterpret_cast<char *>(&NewSizeOfCode), 4,
-                    OptHdrOff + offsetof(PEHdr, SizeOfCode));
-          OS.pwrite(reinterpret_cast<char *>(&NewSizeOfImage), 4,
-                    OptHdrOff + offsetof(PEHdr, SizeOfImage));
+          finalizeBoltSection();
 
           // Redirect exception directory to the .bolt copy.
           OS.pwrite(reinterpret_cast<char *>(&BoltPDataRVA), 4, ExcDirOff);
@@ -1548,10 +1541,6 @@ void PECOFFRewriteInstance::rewriteFile() {
         // in place or moved out-of-place; both share the same regenerated-table
         // machinery.  Out-of-place candidates additionally need their funclet
         // chained-unwind records repointed to the new .bolt parent range.
-        DenseMap<uint32_t, uint32_t> OOPBolt;
-        for (const auto &[OrigRVA, BoltRVA] : EHOOPWritten)
-          OOPBolt[OrigRVA] = BoltRVA;
-
         SmallVector<uint32_t, 16> EHWritten(EHInPlaceWritten.begin(),
                                             EHInPlaceWritten.end());
         for (const auto &[OrigRVA, BoltRVA] : EHOOPWritten)
@@ -1619,25 +1608,7 @@ void PECOFFRewriteInstance::rewriteFile() {
         if (ChainsPatched)
           BC->outs() << "BOLT-INFO: " << ChainsPatched
                      << " funclet chained-unwind records repointed to .bolt\n";
-        NewSecRawSize = alignTo(NewSecVSize, PE->FileAlignment);
-        if (NewSecRawSize > NewSecVSize) {
-          PadBuf.assign(NewSecRawSize - NewSecVSize, 0x00);
-          OS.seek(NewSecRawPtr + NewSecVSize);
-          OS.write(reinterpret_cast<const char *>(PadBuf.data()),
-                   PadBuf.size());
-        }
-        NewSec.VirtualSize = NewSecVSize;
-        NewSec.SizeOfRawData = NewSecRawSize;
-        NewSec.Characteristics |= COFF::IMAGE_SCN_CNT_INITIALIZED_DATA;
-        OS.pwrite(reinterpret_cast<char *>(&NewSec), sizeof(NewSec),
-                  SecTableEnd);
-        uint32_t FinalSizeOfImage =
-            alignTo(NewSecVA + NewSecVSize, PE->SectionAlignment);
-        uint32_t FinalSizeOfCode = PE->SizeOfCode + NewSecRawSize;
-        OS.pwrite(reinterpret_cast<char *>(&FinalSizeOfCode), 4,
-                  OptHdrOff + offsetof(PEHdr, SizeOfCode));
-        OS.pwrite(reinterpret_cast<char *>(&FinalSizeOfImage), 4,
-                  OptHdrOff + offsetof(PEHdr, SizeOfImage));
+        finalizeBoltSection();
         if (EHTablesWritten)
           BC->outs() << "BOLT-INFO: " << EHTablesWritten
                      << " C++ EH ip2state tables (" << EHEntriesWritten
