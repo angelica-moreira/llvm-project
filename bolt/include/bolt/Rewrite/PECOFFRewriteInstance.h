@@ -14,6 +14,7 @@
 #define BOLT_REWRITE_PECOFF_REWRITE_INSTANCE_H
 
 #include "bolt/Core/Linker.h"
+#include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Rewrite/WinEHFuncInfoReader.h"
 #include "bolt/Utils/NameResolver.h"
 #include "llvm/ADT/DenseMap.h"
@@ -86,6 +87,14 @@ class PECOFFRewriteInstance {
   using OffsetMap = std::vector<std::pair<uint32_t, uint32_t>>;
   DenseMap<uint64_t, OffsetMap> FunctionOffsetMaps;
 
+  /// Functions relocated out-of-place into the .bolt section, in ascending
+  /// original-RVA order.  Used to build PDB OMAP address-translation tables.
+  std::vector<BoltRelocatedFunc> RelocatedFuncs;
+
+  /// RVA and byte size of the emitted .bolt section (0 if none was created).
+  uint32_t BoltSectionRVA = 0;
+  uint32_t BoltSectionSize = 0;
+
   std::unique_ptr<ProfileReaderBase> ProfileReader;
 
   /// SEH unwind info indexed by function begin RVA.
@@ -128,6 +137,13 @@ class PECOFFRewriteInstance {
   void readSpecialSections();
   void readExceptionHandling();
   void discoverFileObjects();
+
+  /// In lite mode, mark cold (non-profiled) functions as ignored so the
+  /// disassembly/CFG/optimization front-end skips them.  Profiled and C++ EH
+  /// candidate functions are kept.  PE/COFF counterpart of
+  /// RewriteInstance::selectFunctionsToProcess.
+  void selectFunctionsToProcess();
+
   void disassembleFunctions();
   void buildFunctionsCFG();
   void postProcessFunctions();

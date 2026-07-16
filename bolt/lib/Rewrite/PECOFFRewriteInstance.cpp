@@ -13,6 +13,7 @@
 #include "bolt/Core/BinaryFunction.h"
 #include "bolt/Core/JumpTable.h"
 #include "bolt/Core/MCPlusBuilder.h"
+#include "bolt/Core/ParallelUtilities.h"
 #include "bolt/Passes/BinaryPasses.h"
 #include "bolt/Passes/InferEdgeCounts.h"
 #include "bolt/Profile/DataReader.h"
@@ -29,6 +30,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include <memory>
 
@@ -52,6 +54,8 @@ extern cl::opt<bool> PrintReordered;
 extern cl::opt<bool> PrintSections;
 extern cl::opt<bool> PrintDisasm;
 extern cl::opt<bool> PrintCFG;
+extern cl::opt<bool> PrintAll;
+extern cl::opt<bool> TimeRewrite;
 extern cl::opt<unsigned> Verbosity;
 
 cl::opt<bool> PECOFFInplaceOnly(
@@ -222,10 +226,14 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
   // correct entries after block reordering.  Same as MachO.
   opts::JumpTables = JTS_MOVE;
 
-  // Lite mode skips cold functions which does not work well for PE/COFF
-  // in-place patching.  Force full processing.
+  // Lite mode restricts the disassembly/CFG front-end to profiled and
+  // EH-candidate functions, leaving cold code byte-for-byte in place.  This is
+  // safe for the out-of-place model (cold code and its .pdata/.xdata are
+  // untouched) and is the difference between processing the profiled working
+  // set and every function in a large binary.  Default on when a profile is
+  // present; without one the output is an identity copy, so it is a no-op.
   if (!opts::Lite.getNumOccurrences())
-    opts::Lite = false;
+    opts::Lite = (ProfileReader != nullptr);
 
   // PE section alignment is typically 4KB (0x1000).
   BC->PageAlign = 0x1000;
@@ -555,7 +563,56 @@ void PECOFFRewriteInstance::discoverFileObjects() {
              << " functions with exception handlers (skipped)\n";
 }
 
+void PECOFFRewriteInstance::selectFunctionsToProcess() {
+  // Only meaningful in lite mode with a profile: without a profile every
+  // function is left in place (identity copy) so there is nothing to skip.
+  if (!opts::Lite || !ProfileReader)
+    return;
+
+  auto shouldKeep = [&](const BinaryFunction &Function) {
+    // Keep only functions the profile actually names.  C++ EH candidates are
+    // no exception: relocateCxxEHTables() regenerates a candidate's metadata
+    // only when the function is reordered, which cannot happen without profile
+    // data, so an unprofiled candidate is left untouched in place regardless.
+    // Keeping every candidate would defeat lite mode on EH-heavy binaries
+    // (tens of thousands of candidates), where the emit/link phase is
+    // superlinear in the number of processed functions.
+    return ProfileReader->mayHaveProfileData(Function);
+  };
+
+  // Some profile readers (e.g. ETW) only associate samples with functions in
+  // readProfile(), after CFG construction, so mayHaveProfileData() answers
+  // false for everything here.  Skipping every function would drop all
+  // optimization, so bail out and process the whole binary in that case.
+  bool AnyProfiled =
+      llvm::any_of(BC->getBinaryFunctions(), [&](const auto &BFI) {
+        return !BFI.second.isPseudo() &&
+               ProfileReader->mayHaveProfileData(BFI.second);
+      });
+  if (!AnyProfiled)
+    return;
+
+  uint64_t NumKept = 0;
+  uint64_t NumIgnored = 0;
+  for (auto &BFI : BC->getBinaryFunctions()) {
+    BinaryFunction &Function = BFI.second;
+    if (Function.isPseudo())
+      continue;
+    if (shouldKeep(Function)) {
+      ++NumKept;
+      continue;
+    }
+    Function.setIgnored();
+    ++NumIgnored;
+  }
+
+  BC->outs() << "BOLT-INFO: lite mode: processing " << NumKept
+             << " functions, skipping " << NumIgnored << " cold functions\n";
+}
+
 void PECOFFRewriteInstance::disassembleFunctions() {
+  NamedRegionTimer T("disassembleFunctions", "disassemble functions", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
   uint64_t DisasmCount = 0;
   uint64_t FailCount = 0;
   uint64_t TotalSimple = 0;
@@ -566,7 +623,7 @@ void PECOFFRewriteInstance::disassembleFunctions() {
 
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
-    if (!Function.isSimple())
+    if (!Function.isSimple() || Function.isIgnored())
       continue;
 
     if (Error E = Function.disassemble()) {
@@ -589,22 +646,39 @@ void PECOFFRewriteInstance::disassembleFunctions() {
 }
 
 void PECOFFRewriteInstance::buildFunctionsCFG() {
-  uint64_t CFGCount = 0;
-  uint64_t FailCount = 0;
+  NamedRegionTimer T("buildCFG", "build CFG", "rewrite", "Rewrite passes",
+                     opts::TimeRewrite);
+  // Annotations are created while building the CFG.  Register the indices up
+  // front so the parallel tasks (each with its own annotation allocator) do
+  // not race to create them.  Mirrors RewriteInstance::buildFunctionsCFG.
+  BC->MIB->getOrCreateAnnotationIndex("JTIndexReg");
+  BC->MIB->getOrCreateAnnotationIndex("NOP");
 
-  for (auto &BFI : BC->getBinaryFunctions()) {
-    BinaryFunction &Function = BFI.second;
-    if (!Function.isSimple())
-      continue;
+  std::atomic<uint64_t> CFGCount{0};
+  std::atomic<uint64_t> FailCount{0};
 
-    if (Error E = Function.buildCFG(/*AllocId*/ 0)) {
-      consumeError(std::move(E));
-      Function.setSimple(false);
-      ++FailCount;
-      continue;
-    }
-    ++CFGCount;
-  }
+  ParallelUtilities::WorkFuncWithAllocTy WorkFun =
+      [&](BinaryFunction &Function, MCPlusBuilder::AllocatorIdTy AllocId) {
+        if (Error E = Function.buildCFG(AllocId)) {
+          // Non-fatal for PE/COFF: a function whose CFG cannot be recovered is
+          // left in place (byte-for-byte) rather than aborting the run.
+          consumeError(std::move(E));
+          Function.setSimple(false);
+          ++FailCount;
+          return;
+        }
+        ++CFGCount;
+      };
+
+  ParallelUtilities::PredicateTy SkipPredicate =
+      [](const BinaryFunction &Function) {
+        return !Function.isSimple() || Function.isIgnored();
+      };
+
+  ParallelUtilities::runOnEachFunctionWithUniqueAllocId(
+      *BC, ParallelUtilities::SchedulingPolicy::SP_INST_LINEAR, WorkFun,
+      SkipPredicate, "buildFunctionsCFG",
+      /*ForceSequential*/ opts::PrintAll);
 
   BC->outs() << "BOLT-INFO: built CFG for " << CFGCount << " functions";
   if (FailCount)
@@ -619,7 +693,7 @@ void PECOFFRewriteInstance::postProcessFunctions() {
   uint64_t FTFixups = 0;
   for (auto &BFI : BC->getBinaryFunctions()) {
     BinaryFunction &Function = BFI.second;
-    if (!Function.hasCFG() || !Function.isSimple())
+    if (!Function.hasCFG() || !Function.isSimple() || Function.isIgnored())
       continue;
 
     for (BinaryBasicBlock &BB : Function) {
@@ -804,6 +878,8 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
 }
 
 void PECOFFRewriteInstance::runOptimizationPasses() {
+  NamedRegionTimer T("runOptimizationPasses", "run optimization passes",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
   freezePrologInstructions();
 
   BinaryFunctionPassManager Manager(*BC);
@@ -856,7 +932,10 @@ void PECOFFRewriteInstance::mapCodeSections(
     for (const auto &JTKV : BF.jumpTables()) {
       uint64_t JTVA = JTKV.second->getAddress();
       ErrorOr<BinarySection &> JTSection = BC->getSectionForAddress(JTVA);
-      if (JTSection &&
+      // A jump table kept at its original location has no section emitted into
+      // the object (and thus no valid section ID); its entry relocations are
+      // resolved through symbol lookup, so there is nothing to remap here.
+      if (JTSection && JTSection->hasValidSectionID() &&
           MappedJTSections.insert(JTSection->getAddress()).second) {
         JTSection->setOutputAddress(JTSection->getAddress());
         MapSection(*JTSection, JTSection->getAddress());
@@ -866,6 +945,8 @@ void PECOFFRewriteInstance::mapCodeSections(
 }
 
 void PECOFFRewriteInstance::emitAndLink() {
+  NamedRegionTimer T("emitAndLink", "emit and link", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
   std::error_code EC;
   std::unique_ptr<::llvm::ToolOutputFile> TempOut =
       std::make_unique<::llvm::ToolOutputFile>(opts::OutputFilename + ".bolt.o",
@@ -1092,6 +1173,8 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
 }
 
 void PECOFFRewriteInstance::rewriteFile() {
+  NamedRegionTimer T("rewriteFile", "rewrite file", "rewrite", "Rewrite passes",
+                     opts::TimeRewrite);
   std::error_code EC;
   Out = std::make_unique<ToolOutputFile>(opts::OutputFilename, EC,
                                          sys::fs::OF_None);
@@ -1421,6 +1504,10 @@ void PECOFFRewriteInstance::rewriteFile() {
                   OptHdrOff + offsetof(PEHdr, SizeOfCode));
         OS.pwrite(reinterpret_cast<char *>(&SizeOfImage), 4,
                   OptHdrOff + offsetof(PEHdr, SizeOfImage));
+        // Keep the members used for the PDB OMAP .bolt section header in sync
+        // with the final section extent (grows as .pdata / EH tables append).
+        BoltSectionRVA = NewSecVA;
+        BoltSectionSize = NewSecVSize;
       };
 
       // Append .pdata for OOP functions.  Copy original entries, remove
@@ -1775,6 +1862,7 @@ void PECOFFRewriteInstance::run() {
   discoverFileObjects();
 
   preprocessProfileData();
+  selectFunctionsToProcess();
 
   disassembleFunctions();
   processProfileDataPreCFG();
@@ -1793,7 +1881,8 @@ void PECOFFRewriteInstance::run() {
     if (hasCodeViewDebugInfo(InputFile))
       PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
                               *BC, ImageBase, ModifiedFunctions,
-                              FunctionOffsetMaps);
+                              FunctionOffsetMaps, RelocatedFuncs,
+                              BoltSectionRVA, BoltSectionSize);
     return;
   }
 
@@ -1993,14 +2082,20 @@ void PECOFFRewriteInstance::run() {
 
     ++OOPCount;
     OOPFunctions.insert(FuncVA);
+    RelocatedFuncs.push_back({FuncRVA, static_cast<uint32_t>(BF.getMaxSize()),
+                              static_cast<uint32_t>(NewVA - ImageBase),
+                              static_cast<uint32_t>(HotSize)});
     if (opts::Verbosity >= 1)
       BC->outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
                  << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
                  << " with entry patch\n";
   }
-  if (OOPCount)
+  if (OOPCount) {
     BC->outs() << "BOLT-INFO: " << OOPCount
                << " functions rewritten out-of-place (.bolt section)\n";
+    BoltSectionRVA = BoltSecVA;
+    BoltSectionSize = BoltCurOff;
+  }
 
   // Drop PDB offset maps for OOP and skipped functions — their line
   // offsets should not be remapped.
@@ -2025,12 +2120,20 @@ void PECOFFRewriteInstance::run() {
                     << " unmodified functions\n");
 
   emitAndLink();
-  relocateCxxEHTables(opts::PECOFFRelocateEHDryRun);
+  {
+    NamedRegionTimer T("relocateEH", "relocate C++ EH tables", "rewrite",
+                       "Rewrite passes", opts::TimeRewrite);
+    relocateCxxEHTables(opts::PECOFFRelocateEHDryRun);
+  }
   rewriteFile();
 
-  if (hasCodeViewDebugInfo(InputFile))
+  if (hasCodeViewDebugInfo(InputFile)) {
+    NamedRegionTimer T("rewritePDB", "rewrite PDB", "rewrite", "Rewrite passes",
+                       opts::TimeRewrite);
     PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
-                            ImageBase, ModifiedFunctions, FunctionOffsetMaps);
+                            ImageBase, ModifiedFunctions, FunctionOffsetMaps,
+                            RelocatedFuncs, BoltSectionRVA, BoltSectionSize);
+  }
 }
 
 } // namespace bolt

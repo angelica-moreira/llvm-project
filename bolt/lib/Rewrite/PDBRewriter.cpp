@@ -16,20 +16,25 @@
 #include "llvm/DebugInfo/CodeView/Line.h"
 #include "llvm/DebugInfo/CodeView/SymbolDeserializer.h"
 #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+#include "llvm/DebugInfo/MSF/MSFBuilder.h"
+#include "llvm/DebugInfo/MSF/MSFCommon.h"
 #include "llvm/DebugInfo/MSF/MappedBlockStream.h"
 #include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptor.h"
 #include "llvm/DebugInfo/PDB/Native/DbiStream.h"
 #include "llvm/DebugInfo/PDB/Native/InfoStream.h"
 #include "llvm/DebugInfo/PDB/Native/ModuleDebugStream.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFile.h"
+#include "llvm/DebugInfo/PDB/Native/RawConstants.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/BinaryByteStream.h"
 #include "llvm/Support/BinaryStreamReader.h"
+#include "llvm/Support/BinaryStreamWriter.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include <map>
 
 #define DEBUG_TYPE "bolt-pdb"
 
@@ -79,12 +84,382 @@ std::string findPDBPath(StringRef ExePath) {
   return {};
 }
 
+/// A pending 32-bit patch to a PDB stream (used for line-offset remapping).
+struct PDBPatch {
+  uint16_t StreamIndex;
+  uint64_t StreamOffset;
+  uint32_t NewValue;
+};
+
+/// Rebuild the PDB with OMAP address-translation tables so functions moved
+/// out-of-place into the .bolt section resolve back to their original
+/// symbols.  Copies every input stream verbatim, applies the in-place line
+/// patches, extends the DBI optional-debug-header to reference three new
+/// streams (OmapToSrc, OmapFromSrc, and a section-header stream that includes
+/// .bolt), and writes the result to \p OutputPDB.  Returns true on success.
+bool rebuildPDBWithOmap(pdb::PDBFile &File, pdb::DbiStream &Dbi,
+                        StringRef OutputPDB, const BinaryContext &BC,
+                        ArrayRef<PDBPatch> LinePatches,
+                        ArrayRef<BoltRelocatedFunc> RelocatedFuncs,
+                        uint32_t BoltSectionRVA, uint32_t BoltSectionSize) {
+  using namespace llvm::msf;
+  const uint32_t BlockSize = File.getBlockSize();
+  const uint32_t N = File.getNumStreams();
+  const uint32_t StreamDBI = uint32_t(pdb::StreamDBI); // == 3
+  // Diagnostic: BOLT_OMAP_DIAG=copyonly rebuilds the PDB via MSFBuilder but
+  // WITHOUT adding OMAP streams / patching the DBI debug header, to isolate
+  // whether the MSF copy itself or the OMAP wiring affects symbol resolution.
+  const char *DiagEnv = std::getenv("BOLT_OMAP_DIAG");
+  const bool CopyOnly = DiagEnv && StringRef(DiagEnv) == "copyonly";
+
+  // To keep peak memory bounded on multi-GB PDBs, streams are not all buffered
+  // up front.  Only modified streams are materialized (the DBI stream and any
+  // line-patched module streams); every other stream is copied straight from
+  // the input to the output one at a time at write time.
+  auto readStreamBytes = [&](uint32_t I, std::vector<uint8_t> &Out) -> bool {
+    Out.clear();
+    uint32_t Size = File.getStreamByteSize(I);
+    if (Size == UINT32_MAX || Size == 0)
+      return true;
+    auto S = File.createIndexedStream(I);
+    if (!S)
+      return false;
+    BinaryStreamReader R(*S);
+    ArrayRef<uint8_t> Bytes;
+    if (Error E = R.readBytes(Bytes, Size)) {
+      consumeError(std::move(E));
+      return false;
+    }
+    Out.assign(Bytes.begin(), Bytes.end());
+    return true;
+  };
+
+  // Modified stream buffers.
+  std::vector<uint8_t> DbiBuf;
+  if (StreamDBI >= N || !readStreamBytes(StreamDBI, DbiBuf) ||
+      DbiBuf.size() < 64) {
+    BC.errs() << "BOLT-WARNING: PDB has no DBI stream; skipping OMAP\n";
+    return false;
+  }
+
+  // Stream 0 is the old MSF directory and references stale block numbers.
+  // MSFBuilder writes a fresh directory, so lld (and we) emit it empty;
+  // dbghelp mis-resolves symbols if the stale one is copied verbatim.
+  auto streamSize = [&](uint32_t I) -> uint32_t {
+    if (I == 0)
+      return 0;
+    if (I == StreamDBI)
+      return uint32_t(DbiBuf.size());
+    uint32_t S = File.getStreamByteSize(I);
+    return S == UINT32_MAX ? 0 : S;
+  };
+
+  // Values produced by the OMAP construction below (skipped in copy-only diag).
+  std::vector<uint8_t> NewSH, OmapFromBytes, OmapToBytes;
+  uint32_t NewSectionHdrIdx = N, OmapToIdx = N + 1, OmapFromIdx = N + 2;
+
+  if (!CopyOnly) {
+  // 2. Locate the optional debug header (last substream of the DBI stream).
+  auto rd32 = [&](size_t Off) {
+    return support::endian::read32le(&DbiBuf[Off]);
+  };
+  const uint64_t ModiSize = rd32(24);
+  const uint64_t SecContrSize = rd32(28);
+  const uint64_t SecMapSize = rd32(32);
+  const uint64_t FileInfoSize = rd32(36);
+  const uint64_t TypeServerSize = rd32(40);
+  uint64_t OptDbgSize = rd32(48);
+  const uint64_t ECSize = rd32(52);
+  const uint64_t OptDbgOff = 64 + ModiSize + SecContrSize + SecMapSize +
+                             FileInfoSize + TypeServerSize + ECSize;
+  if (OptDbgOff + OptDbgSize != DbiBuf.size()) {
+    BC.errs() << "BOLT-WARNING: unexpected DBI layout; skipping OMAP\n";
+    return false;
+  }
+
+  // Ensure the optional debug header has entries through SectionHdrOrig (10).
+  const uint32_t NeedEntries =
+      uint32_t(pdb::DbgHeaderType::SectionHdrOrig) + 1; // 11
+  uint32_t NumDbg = uint32_t(OptDbgSize / 2);
+  if (NumDbg < NeedEntries) {
+    // The optional debug header is the final substream, so appending new
+    // 0xFFFF (absent) entries at the end assigns them the next indices.
+    DbiBuf.insert(DbiBuf.end(), (NeedEntries - NumDbg) * 2, 0xFF);
+    OptDbgSize += (NeedEntries - NumDbg) * 2;
+    support::endian::write32le(&DbiBuf[48], uint32_t(OptDbgSize));
+    NumDbg = NeedEntries;
+  }
+
+  auto dbgSlot = [&](pdb::DbgHeaderType T) -> size_t {
+    return OptDbgOff + size_t(T) * 2;
+  };
+  uint16_t OldSectionHdrIdx =
+      support::endian::read16le(&DbiBuf[dbgSlot(pdb::DbgHeaderType::SectionHdr)]);
+  if (OldSectionHdrIdx == 0xFFFF || OldSectionHdrIdx >= N) {
+    BC.errs() << "BOLT-WARNING: PDB has no section-header stream; skipping "
+                 "OMAP\n";
+    return false;
+  }
+
+  // New streams are appended after the existing N streams, in this order.
+  NewSectionHdrIdx = N;
+  OmapToIdx = N + 1;
+  OmapFromIdx = N + 2;
+  auto setDbg = [&](pdb::DbgHeaderType T, uint16_t V) {
+    support::endian::write16le(&DbiBuf[dbgSlot(T)], V);
+  };
+  setDbg(pdb::DbgHeaderType::OmapToSrc, uint16_t(OmapToIdx));
+  setDbg(pdb::DbgHeaderType::OmapFromSrc, uint16_t(OmapFromIdx));
+  setDbg(pdb::DbgHeaderType::SectionHdr, uint16_t(NewSectionHdrIdx));
+  setDbg(pdb::DbgHeaderType::SectionHdrOrig, OldSectionHdrIdx);
+
+  // 3. New section-header stream = original headers + a .bolt entry.
+  if (!readStreamBytes(OldSectionHdrIdx, NewSH)) {
+    BC.errs() << "BOLT-WARNING: cannot read section-header stream; skipping "
+                 "OMAP\n";
+    return false;
+  }
+  {
+    uint8_t Sec[40] = {};
+    std::memcpy(Sec, ".bolt\0\0\0", 8);
+    support::endian::write32le(Sec + 8, BoltSectionSize);      // VirtualSize
+    support::endian::write32le(Sec + 12, BoltSectionRVA);      // VirtualAddress
+    support::endian::write32le(Sec + 16, alignTo(BoltSectionSize, 512u));
+    support::endian::write32le(Sec + 36, 0x60000020); // CODE|EXECUTE|READ
+    NewSH.insert(NewSH.end(), Sec, Sec + 40);
+  }
+
+  // 4. Build OMAP tables.  Identity anchor at the lowest section RVA so that
+  //    unchanged/in-place code maps to itself (rvaTo==0 means "unmapped").
+  uint32_t AnchorRVA = UINT32_MAX;
+  for (const object::coff_section &Hdr : Dbi.getSectionHeaders())
+    AnchorRVA = std::min(AnchorRVA, uint32_t(Hdr.VirtualAddress));
+  if (AnchorRVA == UINT32_MAX)
+    AnchorRVA = 0x1000;
+
+  std::map<uint32_t, uint32_t> From; // original RVA -> new RVA
+  std::map<uint32_t, uint32_t> To;   // new RVA -> original RVA
+  From[AnchorRVA] = AnchorRVA;
+  To[AnchorRVA] = AnchorRVA;
+  for (const BoltRelocatedFunc &F : RelocatedFuncs) {
+    From[F.OrigRVA] = F.NewRVA;
+    From.emplace(F.OrigRVA + F.OrigSize, F.OrigRVA + F.OrigSize);
+    To[F.NewRVA] = F.OrigRVA;
+    To.emplace(F.NewRVA + F.NewSize, 0u); // padding after moved body: unmapped
+  }
+  // Dense identity anchors: dbghelp only keeps a symbol under OMAP if the
+  // From/To tables anchor its RVA.  Sparse tables (moved funcs only) drop
+  // unmoved symbols that fall in identity gaps -- public-only CRT symbols, EH
+  // funclets and leaf procs without .pdata (e.g. `dynamic atexit destructor').
+  // Seed an identity entry at every proc symbol RVA recorded in the PDB.
+  //
+  // The anchors are collected into a flat vector and merged with the small
+  // From/To maps at serialization time rather than inserted one-by-one, which
+  // matters when a large PDB has millions of proc symbols.  The merge is
+  // equivalent to emplace: a map entry always wins; an anchor only fills a gap.
+  std::vector<uint32_t> AnchorRVAs;
+  {
+    SmallVector<uint32_t, 16> SectionRVAs;
+    for (const object::coff_section &Hdr : Dbi.getSectionHeaders())
+      SectionRVAs.push_back(Hdr.VirtualAddress);
+    const auto &Modules = Dbi.modules();
+    for (uint32_t I = 0; I < Modules.getModuleCount(); ++I) {
+      auto Desc = Modules.getModuleDescriptor(I);
+      uint16_t ModiStream = Desc.getModuleStreamIndex();
+      if (ModiStream == pdb::kInvalidStreamIndex)
+        continue;
+      auto StreamPtr = File.createIndexedStream(ModiStream);
+      if (!StreamPtr)
+        continue;
+      pdb::ModuleDebugStreamRef ModStream(Desc, std::move(StreamPtr));
+      if (Error E = ModStream.reload()) {
+        consumeError(std::move(E));
+        continue;
+      }
+      bool HadError = false;
+      for (const CVSymbol &Sym : ModStream.symbols(&HadError)) {
+        if (Sym.kind() != SymbolKind::S_GPROC32 &&
+            Sym.kind() != SymbolKind::S_LPROC32)
+          continue;
+        Expected<ProcSym> ProcOrErr =
+            SymbolDeserializer::deserializeAs<ProcSym>(Sym);
+        if (!ProcOrErr) {
+          consumeError(ProcOrErr.takeError());
+          continue;
+        }
+        uint16_t Seg = ProcOrErr->Segment;
+        if (Seg == 0 || Seg > SectionRVAs.size())
+          continue;
+        AnchorRVAs.push_back(SectionRVAs[Seg - 1] + ProcOrErr->CodeOffset);
+      }
+      if (HadError)
+        continue;
+    }
+    llvm::sort(AnchorRVAs);
+    AnchorRVAs.erase(llvm::unique(AnchorRVAs), AnchorRVAs.end());
+  }
+  // Merge-serialize the sorted map with the sorted-unique identity anchors.
+  auto serialize = [](const std::map<uint32_t, uint32_t> &M,
+                      ArrayRef<uint32_t> Anchors) {
+    std::vector<uint8_t> B;
+    B.reserve((M.size() + Anchors.size()) * 8);
+    auto put = [&](uint32_t K, uint32_t V) {
+      uint8_t E[8];
+      support::endian::write32le(E, K);
+      support::endian::write32le(E + 4, V);
+      B.insert(B.end(), E, E + 8);
+    };
+    auto MI = M.begin();
+    size_t AI = 0;
+    while (MI != M.end() || AI < Anchors.size()) {
+      if (MI != M.end() && (AI >= Anchors.size() || MI->first < Anchors[AI])) {
+        put(MI->first, MI->second);
+        ++MI;
+      } else if (AI < Anchors.size() &&
+                 (MI == M.end() || Anchors[AI] < MI->first)) {
+        put(Anchors[AI], Anchors[AI]); // identity anchor
+        ++AI;
+      } else { // equal keys: the map entry wins, drop the identity anchor
+        put(MI->first, MI->second);
+        ++MI;
+        ++AI;
+      }
+    }
+    return B;
+  };
+  OmapFromBytes = serialize(From, AnchorRVAs);
+  OmapToBytes = serialize(To, AnchorRVAs);
+  } // end if (!CopyOnly)
+
+  // 5. Apply in-place line patches.  Each patch mutates a module stream; load
+  // just those streams into an overrides map (on-demand), leaving all other
+  // streams to be copied lazily at write time.
+  std::map<uint32_t, std::vector<uint8_t>> Modified;
+  bool ReadFailed = false;
+  auto getModified = [&](uint32_t I) -> std::vector<uint8_t> & {
+    auto It = Modified.find(I);
+    if (It == Modified.end()) {
+      std::vector<uint8_t> Buf;
+      if (!readStreamBytes(I, Buf))
+        ReadFailed = true;
+      It = Modified.emplace(I, std::move(Buf)).first;
+    }
+    return It->second;
+  };
+  for (const PDBPatch &P : LinePatches) {
+    if (P.StreamIndex >= N || P.StreamIndex == 0 || P.StreamIndex == StreamDBI)
+      continue;
+    std::vector<uint8_t> &Buf = getModified(P.StreamIndex);
+    if (P.StreamOffset + 4 <= Buf.size())
+      support::endian::write32le(&Buf[P.StreamOffset], P.NewValue);
+  }
+  if (ReadFailed) {
+    BC.errs() << "BOLT-WARNING: cannot read patched PDB stream; skipping OMAP\n";
+    return false;
+  }
+
+  // 6. Lay out and write the new MSF file.
+  BumpPtrAllocator Alloc;
+  auto MsfOrErr = MSFBuilder::create(Alloc, BlockSize);
+  if (!MsfOrErr) {
+    consumeError(MsfOrErr.takeError());
+    BC.errs() << "BOLT-WARNING: cannot create MSF builder; skipping OMAP\n";
+    return false;
+  }
+  MSFBuilder &Msf = *MsfOrErr;
+  auto addStream = [&](uint32_t Size) -> bool {
+    auto E = Msf.addStream(Size);
+    if (!E) {
+      consumeError(E.takeError());
+      return false;
+    }
+    return true;
+  };
+  bool Ok = true;
+  for (uint32_t I = 0; I < N && Ok; ++I)
+    Ok = addStream(streamSize(I));
+  if (!CopyOnly)
+    Ok = Ok && addStream(uint32_t(NewSH.size())) &&
+         addStream(uint32_t(OmapToBytes.size())) &&
+         addStream(uint32_t(OmapFromBytes.size()));
+  if (!Ok) {
+    BC.errs() << "BOLT-WARNING: cannot add PDB streams; skipping OMAP\n";
+    return false;
+  }
+
+  auto LayoutOrErr = Msf.generateLayout();
+  if (!LayoutOrErr) {
+    consumeError(LayoutOrErr.takeError());
+    BC.errs() << "BOLT-WARNING: cannot generate MSF layout; skipping OMAP\n";
+    return false;
+  }
+  MSFLayout Layout = std::move(*LayoutOrErr);
+  auto BufOrErr = Msf.commit(OutputPDB, Layout);
+  if (!BufOrErr) {
+    consumeError(BufOrErr.takeError());
+    BC.errs() << "BOLT-WARNING: cannot commit MSF file; skipping OMAP\n";
+    return false;
+  }
+  FileBufferByteStream Buffer = std::move(*BufOrErr);
+
+  auto writeStream = [&](uint32_t Idx, ArrayRef<uint8_t> Data) -> bool {
+    if (Data.empty())
+      return true;
+    auto WS = WritableMappedBlockStream::createIndexedStream(Layout, Buffer, Idx,
+                                                             Alloc);
+    BinaryStreamWriter W(*WS);
+    if (Error E = W.writeBytes(Data)) {
+      consumeError(std::move(E));
+      return false;
+    }
+    return true;
+  };
+  // Copy stream data into the committed file.  Modified streams write from
+  // their buffers; every other stream is streamed from the input one at a
+  // time and then released.  A read failure would leave a stream zero-filled,
+  // so abort rather than emit a corrupt PDB.
+  std::vector<uint8_t> Tmp;
+  for (uint32_t I = 0; I < N; ++I) {
+    if (I == 0)
+      continue;
+    if (I == StreamDBI) {
+      writeStream(I, DbiBuf);
+      continue;
+    }
+    auto MIt = Modified.find(I);
+    if (MIt != Modified.end()) {
+      writeStream(I, MIt->second);
+      continue;
+    }
+    if (!readStreamBytes(I, Tmp)) {
+      BC.errs() << "BOLT-WARNING: cannot read PDB stream " << I
+                << "; skipping OMAP\n";
+      return false;
+    }
+    writeStream(I, Tmp);
+  }
+  if (!CopyOnly) {
+    writeStream(NewSectionHdrIdx, NewSH);
+    writeStream(OmapToIdx, OmapToBytes);
+    writeStream(OmapFromIdx, OmapFromBytes);
+  }
+
+  if (Error E = Buffer.commit()) {
+    consumeError(std::move(E));
+    BC.errs() << "BOLT-WARNING: cannot flush rebuilt PDB\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
                              const BinaryContext &BC, uint64_t ImageBase,
                              const DenseSet<uint64_t> &ModifiedFunctions,
-                             const DenseMap<uint64_t, OffsetMap> &OffsetMaps) {
+                             const DenseMap<uint64_t, OffsetMap> &OffsetMaps,
+                             ArrayRef<BoltRelocatedFunc> RelocatedFuncs,
+                             uint32_t BoltSectionRVA, uint32_t BoltSectionSize) {
 
   // Find the PDB file.
   std::string PDBPath = findPDBPath(InputExe);
@@ -162,11 +537,6 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   };
 
   // Collect all patches: {stream_index, stream_offset, new_value}.
-  struct PDBPatch {
-    uint16_t StreamIndex;
-    uint64_t StreamOffset;
-    uint32_t NewValue;
-  };
   SmallVector<PDBPatch, 16> AllPatches;
 
   uint32_t UpdatedSymbols = 0;
@@ -351,6 +721,22 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   // Copy the PDB, then apply line patches via MSF block arithmetic.
   SmallString<256> OutputPDB(OutputExe);
   sys::path::replace_extension(OutputPDB, ".pdb");
+
+  // When functions have been relocated out-of-place into .bolt, rebuild the
+  // PDB with OMAP address-translation tables so their moved code still
+  // resolves back to the original symbols.
+  if (!RelocatedFuncs.empty()) {
+    if (rebuildPDBWithOmap(PDBFile, Dbi, OutputPDB, BC, AllPatches,
+                           RelocatedFuncs, BoltSectionRVA, BoltSectionSize)) {
+      BC.outs() << "BOLT-INFO: wrote PDB with OMAP tables to " << OutputPDB
+                << " (" << RelocatedFuncs.size()
+                << " relocated functions, " << AllPatches.size()
+                << " line patches)\n";
+      return;
+    }
+    BC.errs() << "BOLT-WARNING: OMAP rebuild failed; falling back to "
+                 "copy+patch (OOP symbols will be stale)\n";
+  }
 
   std::error_code CopyEC = sys::fs::copy_file(PDBPath, OutputPDB);
   if (CopyEC) {

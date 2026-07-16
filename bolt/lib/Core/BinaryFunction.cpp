@@ -2451,11 +2451,16 @@ Error BinaryFunction::buildCFG(MCPlusBuilder::AllocatorIdTy AllocatorId) {
     BinaryBasicBlock *FromBB = getBasicBlockContainingOffset(Branch.first);
     BinaryBasicBlock *ToBB = getBasicBlockAtOffset(Branch.second);
     if (!FromBB || !ToBB) {
-      if (!FromBB)
-        BC.errs() << "BOLT-ERROR: cannot find BB containing the branch.\n";
-      if (!ToBB)
-        BC.errs()
-            << "BOLT-ERROR: cannot find BB containing branch destination.\n";
+      {
+        // Serialize diagnostics: buildCFG runs in parallel (ELF and PE/COFF),
+        // so unguarded writes to the shared error stream would race.
+        auto L = BC.scopeLock();
+        if (!FromBB)
+          BC.errs() << "BOLT-ERROR: cannot find BB containing the branch.\n";
+        if (!ToBB)
+          BC.errs()
+              << "BOLT-ERROR: cannot find BB containing branch destination.\n";
+      }
       return createFatalBOLTError(BC.generateBugReportMessage(
           "disassembly failed - inconsistent branch found.", *this));
     }
