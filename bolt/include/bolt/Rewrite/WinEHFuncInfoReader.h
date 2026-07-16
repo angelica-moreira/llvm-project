@@ -21,11 +21,9 @@
 #define BOLT_REWRITE_WINEH_FUNCINFO_READER_H
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
-#include <optional>
 
 namespace llvm {
 namespace bolt {
@@ -90,17 +88,23 @@ struct WinEHFuncInfo {
   int32_t UnwindHelp = 0;
   uint32_t ESTypeListRVA = 0;
   int32_t EHFlags = 0;
+  uint32_t IPToStateMapRVA = 0;
+  uint32_t NumIPToStateEntries = 0;
+  bool HasParsedIPToStateMap = false;
 
   SmallVector<UnwindMapEntry, 4> UnwindMap;
   SmallVector<TryBlock, 2> TryBlocks;
   SmallVector<IPToStateEntry, 8> IPToStateMap;
 };
 
-/// Decode the FuncInfo at \p FuncInfoRVA using \p Reader.  Returns an error if
-/// the magic number is not a recognized __CxxFrameHandler3/4 value or if any
-/// sub-table is out of bounds or implausibly sized.
+/// Decode the FuncInfo at \p FuncInfoRVA using \p Reader.
+/// Defer the IPToState table when \p ParseIPToStateMap is false.
 Expected<WinEHFuncInfo> parseWinEHFuncInfo(const WinEHImageReader &Reader,
-                                           uint32_t FuncInfoRVA);
+                                           uint32_t FuncInfoRVA,
+                                           bool ParseIPToStateMap = true);
+
+/// Decode the deferred IPToState table in \p FI.
+Error parseWinEHIPToStateMap(const WinEHImageReader &Reader, WinEHFuncInfo &FI);
 
 /// Return true when \p IP lies inside the primary function body
 /// [\p FuncBeginRVA, \p FuncEndRVA).  IPToState entries outside this range

@@ -202,6 +202,68 @@ TEST(WinEHFuncInfoReaderTest, ParsesNoTryBlocks) {
   EXPECT_EQ(FI.IPToStateMap[0].IP, 0x156e0u);
 }
 
+TEST(WinEHFuncInfoReaderTest, DefersIPToStateMap) {
+  const uint32_t Base = 0x4000;
+  ImageBuilder Img(Base);
+  Img.u32(0x19930522);
+  Img.i32(0);
+  Img.u32(0);
+  Img.u32(0);
+  Img.u32(0);
+  Img.u32(1);
+  Img.u32(Base + FuncInfoSize);
+  Img.i32(0);
+  Img.u32(0);
+  Img.i32(0);
+  Img.u32(0x4010);
+  Img.i32(2);
+
+  WinEHImageReader R = Img.reader();
+  auto FIOrErr = parseWinEHFuncInfo(R, Base, false);
+  ASSERT_THAT_EXPECTED(FIOrErr, Succeeded());
+  WinEHFuncInfo &FI = *FIOrErr;
+  EXPECT_EQ(FI.NumIPToStateEntries, 1u);
+  EXPECT_EQ(FI.IPToStateMapRVA, Base + FuncInfoSize);
+  EXPECT_FALSE(FI.HasParsedIPToStateMap);
+  EXPECT_TRUE(FI.IPToStateMap.empty());
+
+  EXPECT_THAT_ERROR(parseWinEHIPToStateMap(R, FI), Succeeded());
+  EXPECT_TRUE(FI.HasParsedIPToStateMap);
+  ASSERT_EQ(FI.IPToStateMap.size(), 1u);
+  EXPECT_EQ(FI.IPToStateMap[0].IP, 0x4010u);
+  EXPECT_EQ(FI.IPToStateMap[0].State, 2);
+
+  EXPECT_THAT_ERROR(parseWinEHIPToStateMap(R, FI), Succeeded());
+  EXPECT_EQ(FI.IPToStateMap.size(), 1u);
+}
+
+TEST(WinEHFuncInfoReaderTest, DeferredIPToStateMapRejectsOutOfBounds) {
+  const uint32_t Base = 0x5000;
+  ImageBuilder Img(Base);
+  Img.u32(0x19930522);
+  Img.i32(0);
+  Img.u32(0);
+  Img.u32(0);
+  Img.u32(0);
+  Img.u32(2);
+  Img.u32(Base + FuncInfoSize);
+  Img.i32(0);
+  Img.u32(0);
+  Img.i32(0);
+  Img.u32(0x5010);
+  Img.i32(1);
+  Img.u32(0x5020);
+
+  WinEHImageReader R = Img.reader();
+  auto FIOrErr = parseWinEHFuncInfo(R, Base, false);
+  ASSERT_THAT_EXPECTED(FIOrErr, Succeeded());
+  WinEHFuncInfo &FI = *FIOrErr;
+
+  EXPECT_THAT_ERROR(parseWinEHIPToStateMap(R, FI), Failed());
+  EXPECT_FALSE(FI.HasParsedIPToStateMap);
+  EXPECT_TRUE(FI.IPToStateMap.empty());
+}
+
 // lookupEHState returns the state of the last entry with IP <= query.
 TEST(WinEHFuncInfoReaderTest, LookupEHState) {
   WinEHFuncInfo FI;

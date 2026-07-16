@@ -20,7 +20,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include <cstdint>
-#include <string>
+#include <utility>
+#include <vector>
 
 namespace llvm {
 namespace bolt {
@@ -59,6 +60,15 @@ public:
                          uint32_t BoltSectionRVA = 0,
                          uint32_t BoltSectionSize = 0);
 };
+
+namespace pdb_detail {
+
+/// Rewrite one DEBUG_S_LINES subsection without changing its size.
+bool rewriteLineSubsection(ArrayRef<uint8_t> Contents,
+                           ArrayRef<std::pair<uint32_t, uint32_t>> OffsetMap,
+                           std::vector<uint8_t> &Output, uint32_t &NumRemapped);
+
+} // namespace pdb_detail
 
 } // namespace bolt
 } // namespace llvm

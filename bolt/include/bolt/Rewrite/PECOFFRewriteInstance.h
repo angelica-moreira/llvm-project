@@ -104,6 +104,9 @@ class PECOFFRewriteInstance {
   /// functions whose personality is __CxxFrameHandler3.
   DenseMap<uint32_t, WinEHFuncInfo> FunctionCxxEHInfo;
 
+  /// Image sections retained for deferred C++ EH parsing.
+  WinEHImageReader CxxEHImageReader;
+
   /// RVAs of out-of-line catch/cleanup funclets referenced by C++ EH FuncInfo.
   /// These are pinned in place so that funclet RVAs in the EH metadata stay
   /// valid when a parent function is reordered.
@@ -136,12 +139,10 @@ class PECOFFRewriteInstance {
   void adjustCommandLineOptions();
   void readSpecialSections();
   void readExceptionHandling();
+  void readCxxEHIPToStateMaps();
   void discoverFileObjects();
 
-  /// In lite mode, mark cold (non-profiled) functions as ignored so the
-  /// disassembly/CFG/optimization front-end skips them.  Profiled and C++ EH
-  /// candidate functions are kept.  PE/COFF counterpart of
-  /// RewriteInstance::selectFunctionsToProcess.
+  /// In lite mode, ignore functions without profile data before disassembly.
   void selectFunctionsToProcess();
 
   void disassembleFunctions();

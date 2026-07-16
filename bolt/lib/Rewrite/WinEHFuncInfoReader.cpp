@@ -9,6 +9,7 @@
 #include "bolt/Rewrite/WinEHFuncInfoReader.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Endian.h"
+#include <utility>
 
 namespace llvm {
 namespace bolt {
@@ -54,7 +55,7 @@ Expected<int32_t> WinEHImageReader::readI32(uint32_t RVA) const {
 }
 
 // Sizes of the on-disk x86_64 sub-table records (see WinException.cpp).
-static constexpr uint32_t UnwindMapEntrySize = 8;   // ToState, Action
+static constexpr uint32_t UnwindMapEntrySize = 8;    // ToState, Action
 static constexpr uint32_t TryBlockMapEntrySize = 20; // 5 * i32
 static constexpr uint32_t HandlerTypeSize = 20;      // 5 * i32
 static constexpr uint32_t IPToStateEntrySize = 8;    // Ip, State
@@ -137,8 +138,10 @@ static Error parseTryBlockMap(const WinEHImageReader &Reader, uint32_t RVA,
   return Error::success();
 }
 
-static Error parseIPToStateMap(const WinEHImageReader &Reader, uint32_t RVA,
-                               uint32_t Count, WinEHFuncInfo &FI) {
+static Expected<SmallVector<WinEHFuncInfo::IPToStateEntry, 8>>
+readIPToStateMap(const WinEHImageReader &Reader, uint32_t RVA,
+                 uint32_t Count) {
+  SmallVector<WinEHFuncInfo::IPToStateEntry, 8> Entries;
   for (uint32_t I = 0; I < Count; ++I) {
     uint32_t Base = RVA + I * IPToStateEntrySize;
     Expected<uint32_t> IP = Reader.readU32(Base);
@@ -147,13 +150,31 @@ static Error parseIPToStateMap(const WinEHImageReader &Reader, uint32_t RVA,
     Expected<int32_t> State = Reader.readI32(Base + 4);
     if (!State)
       return State.takeError();
-    FI.IPToStateMap.push_back({*IP, *State});
+    Entries.push_back({*IP, *State});
   }
+  return Entries;
+}
+
+Error parseWinEHIPToStateMap(const WinEHImageReader &Reader,
+                             WinEHFuncInfo &FI) {
+  if (FI.HasParsedIPToStateMap)
+    return Error::success();
+
+  if (FI.NumIPToStateEntries > 0 && FI.IPToStateMapRVA) {
+    Expected<SmallVector<WinEHFuncInfo::IPToStateEntry, 8>> Entries =
+        readIPToStateMap(Reader, FI.IPToStateMapRVA, FI.NumIPToStateEntries);
+    if (!Entries)
+      return Entries.takeError();
+    FI.IPToStateMap = std::move(*Entries);
+  }
+
+  FI.HasParsedIPToStateMap = true;
   return Error::success();
 }
 
 Expected<WinEHFuncInfo> parseWinEHFuncInfo(const WinEHImageReader &Reader,
-                                           uint32_t FuncInfoRVA) {
+                                           uint32_t FuncInfoRVA,
+                                           bool ParseIPToStateMap) {
   WinEHFuncInfo FI;
 
   Expected<uint32_t> Magic = Reader.readU32(FuncInfoRVA);
@@ -198,27 +219,29 @@ Expected<WinEHFuncInfo> parseWinEHFuncInfo(const WinEHImageReader &Reader,
                              "implausible MaxState %d", *MaxState);
   if (*NumTryBlocks > MaxTryBlocks)
     return createStringError(std::errc::invalid_argument,
-                             "implausible NumTryBlocks %" PRIu32, *NumTryBlocks);
+                             "implausible NumTryBlocks %" PRIu32,
+                             *NumTryBlocks);
   if (*NumIPEntries > MaxIPEntries)
     return createStringError(std::errc::invalid_argument,
-                             "implausible NumIPEntries %" PRIu32, *NumIPEntries);
+                             "implausible NumIPEntries %" PRIu32,
+                             *NumIPEntries);
 
   FI.MaxState = *MaxState;
   FI.UnwindHelp = *UnwindHelp;
   FI.ESTypeListRVA = *ESTypeList;
   FI.EHFlags = *EHFlags;
+  FI.IPToStateMapRVA = *IPToStateRVA;
+  FI.NumIPToStateEntries = *NumIPEntries;
 
   if (*MaxState > 0 && *UnwindMapRVA)
     if (Error E = parseUnwindMap(Reader, *UnwindMapRVA,
                                  static_cast<uint32_t>(*MaxState), FI))
       return std::move(E);
   if (*NumTryBlocks > 0 && *TryBlockMapRVA)
-    if (Error E =
-            parseTryBlockMap(Reader, *TryBlockMapRVA, *NumTryBlocks, FI))
+    if (Error E = parseTryBlockMap(Reader, *TryBlockMapRVA, *NumTryBlocks, FI))
       return std::move(E);
-  if (*NumIPEntries > 0 && *IPToStateRVA)
-    if (Error E =
-            parseIPToStateMap(Reader, *IPToStateRVA, *NumIPEntries, FI))
+  if (ParseIPToStateMap)
+    if (Error E = parseWinEHIPToStateMap(Reader, FI))
       return std::move(E);
 
   return FI;

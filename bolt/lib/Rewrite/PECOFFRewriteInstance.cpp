@@ -190,6 +190,8 @@ Error PECOFFRewriteInstance::setProfile(StringRef Filename) {
 }
 
 void PECOFFRewriteInstance::preprocessProfileData() {
+  NamedRegionTimer T("preprocessProfile", "pre-process profile data", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
   if (!ProfileReader)
     return;
   if (Error E = ProfileReader->preprocessProfile(*BC))
@@ -197,6 +199,8 @@ void PECOFFRewriteInstance::preprocessProfileData() {
 }
 
 void PECOFFRewriteInstance::processProfileDataPreCFG() {
+  NamedRegionTimer T("processProfilePreCFG", "process profile data pre-CFG",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
   if (!ProfileReader)
     return;
   if (Error E = ProfileReader->readProfilePreCFG(*BC))
@@ -204,6 +208,8 @@ void PECOFFRewriteInstance::processProfileDataPreCFG() {
 }
 
 void PECOFFRewriteInstance::processProfileData() {
+  NamedRegionTimer T("processProfile", "process profile data", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
   if (!ProfileReader)
     return;
   if (Error E = ProfileReader->readProfile(*BC))
@@ -258,6 +264,8 @@ void PECOFFRewriteInstance::adjustCommandLineOptions() {
 // because they change instruction sizes, corrupting UNWIND_INFO byte offsets.
 
 void PECOFFRewriteInstance::readSpecialSections() {
+  NamedRegionTimer T("readSpecialSections", "read special sections", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
   for (const object::SectionRef &Section : InputFile->sections()) {
     Expected<StringRef> SectionName = Section.getName();
     check_error(SectionName.takeError(), "cannot get section name");
@@ -278,6 +286,8 @@ void PECOFFRewriteInstance::readSpecialSections() {
 }
 
 void PECOFFRewriteInstance::readExceptionHandling() {
+  NamedRegionTimer T("readExceptionHandling", "read exception handling",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
   const object::coff_section *PDataSec = nullptr;
   const object::coff_section *XDataSec = nullptr;
 
@@ -356,8 +366,7 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
   // Reader over all sections, used to decode C++ EH FuncInfo referenced from
   // the handler data.
-  WinEHImageReader ImageReader;
-  populateImageReader(*InputFile, ImageReader);
+  populateImageReader(*InputFile, CxxEHImageReader);
 
   for (size_t I = 0; I < NumEntries; ++I) {
     uint32_t BeginRVA = Entries[I].BeginAddress;
@@ -424,7 +433,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
             uint32_t FuncInfoRVA = support::endian::read32le(
                 XDataContents.data() + HandlerDataOffset + 4);
             if (Expected<WinEHFuncInfo> FI =
-                    parseWinEHFuncInfo(ImageReader, FuncInfoRVA)) {
+                    parseWinEHFuncInfo(CxxEHImageReader, FuncInfoRVA,
+                                       /*ParseIPToStateMap=*/false)) {
               Info.IsCxxEH = true;
               Info.CxxFuncInfoRVA = FuncInfoRVA;
               // Record the cleanup/catch funclet entry points so they can be
@@ -441,7 +451,8 @@ void PECOFFRewriteInstance::readExceptionHandling() {
               // A first-cut reordering candidate: classic personality, no try
               // blocks (simplest shape), and a non-empty state map to relocate.
               if (FunctionCxxEHInfo[BeginRVA].TryBlocks.empty() &&
-                  !FunctionCxxEHInfo[BeginRVA].IPToStateMap.empty())
+                  FunctionCxxEHInfo[BeginRVA].NumIPToStateEntries > 0 &&
+                  FunctionCxxEHInfo[BeginRVA].IPToStateMapRVA)
                 CxxEHCandidateRVAs.insert(static_cast<uint32_t>(BeginRVA));
             } else {
               consumeError(FI.takeError());
@@ -474,7 +485,37 @@ void PECOFFRewriteInstance::readExceptionHandling() {
              << " C++ EH funclets to pin\n";
 }
 
+void PECOFFRewriteInstance::readCxxEHIPToStateMaps() {
+  NamedRegionTimer T("readCxxEHIPToStateMaps", "read C++ EH IP-to-state maps",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
+  if (!opts::PECOFFRelocateEH)
+    return;
+
+  SmallVector<uint32_t, 16> InvalidCandidates;
+  for (uint32_t BeginRVA : CxxEHCandidateRVAs) {
+    uint64_t FuncVA = ImageBase + BeginRVA;
+    auto BFI = BC->getBinaryFunctions().find(FuncVA);
+    if (BFI == BC->getBinaryFunctions().end() || BFI->second.isIgnored() ||
+        !BFI->second.isSimple())
+      continue;
+
+    auto FI = FunctionCxxEHInfo.find(BeginRVA);
+    if (FI == FunctionCxxEHInfo.end())
+      continue;
+    if (Error E = parseWinEHIPToStateMap(CxxEHImageReader, FI->second)) {
+      consumeError(std::move(E));
+      BFI->second.setSimple(false);
+      InvalidCandidates.push_back(BeginRVA);
+    }
+  }
+
+  for (uint32_t BeginRVA : InvalidCandidates)
+    CxxEHCandidateRVAs.erase(BeginRVA);
+}
+
 void PECOFFRewriteInstance::discoverFileObjects() {
+  NamedRegionTimer T("discoverFileObjects", "discover file objects", "rewrite",
+                     "Rewrite passes", opts::TimeRewrite);
 
   // Build address-to-name map from the COFF symbol table.
   DenseMap<uint64_t, StringRef> AddressToName;
@@ -564,26 +605,13 @@ void PECOFFRewriteInstance::discoverFileObjects() {
 }
 
 void PECOFFRewriteInstance::selectFunctionsToProcess() {
-  // Only meaningful in lite mode with a profile: without a profile every
-  // function is left in place (identity copy) so there is nothing to skip.
+  NamedRegionTimer T("selectFunctions", "select functions to process",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
+  // Function filtering applies only to profiled lite mode.
   if (!opts::Lite || !ProfileReader)
     return;
 
-  auto shouldKeep = [&](const BinaryFunction &Function) {
-    // Keep only functions the profile actually names.  C++ EH candidates are
-    // no exception: relocateCxxEHTables() regenerates a candidate's metadata
-    // only when the function is reordered, which cannot happen without profile
-    // data, so an unprofiled candidate is left untouched in place regardless.
-    // Keeping every candidate would defeat lite mode on EH-heavy binaries
-    // (tens of thousands of candidates), where the emit/link phase is
-    // superlinear in the number of processed functions.
-    return ProfileReader->mayHaveProfileData(Function);
-  };
-
-  // Some profile readers (e.g. ETW) only associate samples with functions in
-  // readProfile(), after CFG construction, so mayHaveProfileData() answers
-  // false for everything here.  Skipping every function would drop all
-  // optimization, so bail out and process the whole binary in that case.
+  // Some readers associate profiles only after CFG construction.
   bool AnyProfiled =
       llvm::any_of(BC->getBinaryFunctions(), [&](const auto &BFI) {
         return !BFI.second.isPseudo() &&
@@ -598,7 +626,7 @@ void PECOFFRewriteInstance::selectFunctionsToProcess() {
     BinaryFunction &Function = BFI.second;
     if (Function.isPseudo())
       continue;
-    if (shouldKeep(Function)) {
+    if (ProfileReader->mayHaveProfileData(Function)) {
       ++NumKept;
       continue;
     }
@@ -687,6 +715,8 @@ void PECOFFRewriteInstance::buildFunctionsCFG() {
 }
 
 void PECOFFRewriteInstance::postProcessFunctions() {
+  NamedRegionTimer T("postProcessFunctions", "post-process functions",
+                     "rewrite", "Rewrite passes", opts::TimeRewrite);
   // MSVC splits logical functions across multiple RUNTIME_FUNCTION entries.
   // Blocks at the end of one entry may fall through into the next.  Insert
   // explicit tail-call JMPs to prevent FixupBranches from inserting a RET.
@@ -1032,6 +1062,14 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
     BinaryFunction &BF = BFI->second;
     if (!BF.isEmitted() || !ModifiedFunctions.count(FuncVA))
       continue;
+    auto FI = FunctionCxxEHInfo.find(BeginRVA);
+    if (FI == FunctionCxxEHInfo.end() ||
+        !FI->second.HasParsedIPToStateMap) {
+      BC->errs() << "BOLT-WARNING: missing C++ EH IP-to-state map for RVA 0x"
+                 << Twine::utohexstr(BeginRVA) << "; leaving unmodified\n";
+      revert(FuncVA);
+      continue;
+    }
     Cand C;
     C.BeginRVA = BeginRVA;
     C.InStart = BF.getAddress();
@@ -1102,8 +1140,7 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
                       "for RVA 0x"
                    << Twine::utohexstr(C.BeginRVA) << " (" << InBody
                    << " in-body entries, first uncovered offset 0x"
-                   << Twine::utohexstr(Missing)
-                   << "); leaving unmodified\n";
+                   << Twine::utohexstr(Missing) << "); leaving unmodified\n";
       }
       revert(C.FuncVA);
       continue;
@@ -1147,9 +1184,9 @@ void PECOFFRewriteInstance::relocateCxxEHTables(bool DryRun) {
       if (opts::Verbosity >= 1)
         BC->outs() << "BOLT-INFO: EH relocation "
                    << (DryRun ? "(dry-run) " : "") << BF << ": body ip2state "
-                   << OrigBody << " -> " << (NewTable.size() - FuncletEntries.size())
-                   << " entries (" << NewTable.size()
-                   << " total) [verified]\n";
+                   << OrigBody << " -> "
+                   << (NewTable.size() - FuncletEntries.size()) << " entries ("
+                   << NewTable.size() << " total) [verified]\n";
       if (!DryRun)
         RegeneratedEHTables[C.BeginRVA] = std::move(NewTable);
     } else {
@@ -1398,9 +1435,9 @@ void PECOFFRewriteInstance::rewriteFile() {
         break;
       }
     const auto *COFFHdr = InputFile->getCOFFHeader();
-    uint32_t SecTableEnd = OptHdrOff + COFFHdr->SizeOfOptionalHeader +
-                           InputFile->getNumberOfSections() *
-                               sizeof(object::coff_section);
+    uint32_t SecTableEnd =
+        OptHdrOff + COFFHdr->SizeOfOptionalHeader +
+        InputFile->getNumberOfSections() * sizeof(object::coff_section);
     bool HeaderRoom =
         SecTableEnd + sizeof(object::coff_section) <= PE->SizeOfHeaders;
     if (!WillCreateBolt || !HeaderRoom) {
@@ -1647,9 +1684,9 @@ void PECOFFRewriteInstance::rewriteFile() {
           for (size_t Idx = 0; Idx < Table.size(); ++Idx) {
             support::endian::write32le(TableBytes.data() + Idx * EHEntrySize,
                                        Table[Idx].IP);
-            support::endian::write32le(
-                TableBytes.data() + Idx * EHEntrySize + 4,
-                static_cast<uint32_t>(Table[Idx].State));
+            support::endian::write32le(TableBytes.data() + Idx * EHEntrySize +
+                                           4,
+                                       static_cast<uint32_t>(Table[Idx].State));
           }
           OS.seek(NewSecRawPtr + TableOffset);
           OS.write(reinterpret_cast<const char *>(TableBytes.data()),
@@ -1863,6 +1900,7 @@ void PECOFFRewriteInstance::run() {
 
   preprocessProfileData();
   selectFunctionsToProcess();
+  readCxxEHIPToStateMaps();
 
   disassembleFunctions();
   processProfileDataPreCFG();
