@@ -16,12 +16,15 @@
 #include "bolt/Core/Linker.h"
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Rewrite/WinEHFuncInfoReader.h"
+#include "bolt/Rewrite/WinEHUnwindInfo.h"
 #include "bolt/Utils/NameResolver.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 #include <memory>
+#include <optional>
 
 namespace llvm {
 class ToolOutputFile;
@@ -34,35 +37,8 @@ class RelocationRef;
 namespace bolt {
 
 class BinaryContext;
+class BinaryFunction;
 class ProfileReaderBase;
-
-/// Parsed SEH unwind information for a single function.
-struct SEHUnwindInfo {
-  uint32_t EndRVA = 0;
-  uint8_t Version = 0;
-  uint8_t Flags = 0;
-  uint8_t PrologSize = 0;
-  uint8_t FrameRegister = 0;
-  uint8_t FrameOffset = 0;
-  SmallVector<uint16_t, 8> UnwindCodes;
-  uint32_t ExceptionHandlerRVA = 0;
-  bool HasExceptionHandler = false;
-  /// RVA of the MSVC C++ FuncInfo structure when the personality routine is
-  /// __CxxFrameHandler3 (i.e. \c IsCxxEH is set), otherwise 0.
-  uint32_t CxxFuncInfoRVA = 0;
-  /// True when the handler data decodes as a classic __CxxFrameHandler3
-  /// FuncInfo (recognized magic number).  __CxxFrameHandler4's compressed
-  /// format does not match and leaves this false.
-  bool IsCxxEH = false;
-  bool IsChained = false;
-  uint32_t ChainedBeginRVA = 0;
-  uint32_t ChainedEndRVA = 0;
-  uint32_t ChainedUnwindRVA = 0;
-  /// RVA of the chained RUNTIME_FUNCTION record itself (inside .xdata), i.e.
-  /// where ChainedBeginRVA/ChainedEndRVA are stored.  Used to repoint a
-  /// funclet's chain when its primary function is moved out-of-place.
-  uint32_t ChainedEntryRVA = 0;
-};
 
 class PECOFFRewriteInstance {
   object::COFFObjectFile *InputFile;
@@ -100,6 +76,9 @@ class PECOFFRewriteInstance {
   /// SEH unwind info indexed by function begin RVA.
   DenseMap<uint32_t, SEHUnwindInfo> FunctionSEHInfo;
 
+  DenseMap<uint64_t, std::string> FunctionNames;
+  DenseSet<uint64_t> GSHandlerSymbols;
+
   /// Parsed MSVC C++ FuncInfo indexed by function begin RVA, populated for
   /// functions whose personality is __CxxFrameHandler3.
   DenseMap<uint32_t, WinEHFuncInfo> FunctionCxxEHInfo;
@@ -115,6 +94,9 @@ class PECOFFRewriteInstance {
   /// RVAs of C++ EH functions eligible for reordering (currently: parsed
   /// __CxxFrameHandler3 personality, no try blocks, non-empty IPToState map).
   DenseSet<uint32_t> CxxEHCandidateRVAs;
+
+  DenseSet<uint32_t> GSCandidateRVAs;
+  DenseSet<uint32_t> RejectedGSCandidateRVAs;
 
   /// Regenerated, verified IPToState tables for reordered C++ EH functions,
   /// keyed by function begin RVA.  Populated by relocateCxxEHTables() in the
@@ -139,8 +121,11 @@ class PECOFFRewriteInstance {
   void adjustCommandLineOptions();
   void readSpecialSections();
   void readExceptionHandling();
+  void readFunctionNames();
+  void classifyExceptionHandlers();
   void readCxxEHIPToStateMaps();
   void discoverFileObjects();
+  void rejectCoveredGSCandidates(const BinaryFunction &Function);
 
   /// In lite mode, ignore functions without profile data before disassembly.
   void selectFunctionsToProcess();
@@ -149,6 +134,8 @@ class PECOFFRewriteInstance {
   void buildFunctionsCFG();
   void postProcessFunctions();
   void runOptimizationPasses();
+  std::optional<ArrayRef<uint8_t>>
+  getOriginalFunctionBytes(uint32_t RVA, uint32_t Size) const;
   void freezePrologInstructions();
   void emitAndLink();
 

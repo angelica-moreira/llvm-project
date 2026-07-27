@@ -9,6 +9,7 @@
 #include "bolt/Rewrite/WinEHFuncInfoReader.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/Errc.h"
 #include <utility>
 
 namespace llvm {
@@ -38,6 +39,16 @@ Expected<ArrayRef<uint8_t>> WinEHImageReader::read(uint32_t RVA,
   return createStringError(std::errc::result_out_of_range,
                            "RVA 0x%" PRIx32 " (%" PRIu32 " bytes) not mapped",
                            RVA, Size);
+}
+
+Expected<std::pair<uint32_t, ArrayRef<uint8_t>>>
+WinEHImageReader::sectionContaining(uint32_t RVA) const {
+  for (const Section &S : Sections) {
+    if (RVA >= S.RVA && static_cast<uint64_t>(RVA) - S.RVA < S.Data.size())
+      return std::make_pair(S.RVA, S.Data);
+  }
+  return createStringError(errc::invalid_argument,
+                           "RVA 0x%x is outside the image", RVA);
 }
 
 Expected<uint32_t> WinEHImageReader::readU32(uint32_t RVA) const {

@@ -58,7 +58,8 @@ public:
                          const DenseMap<uint64_t, OffsetMap> &OffsetMaps,
                          ArrayRef<BoltRelocatedFunc> RelocatedFuncs = {},
                          uint32_t BoltSectionRVA = 0,
-                         uint32_t BoltSectionSize = 0);
+                         uint32_t BoltSectionSize = 0,
+                         StringRef PDBPath = {});
 };
 
 namespace pdb_detail {

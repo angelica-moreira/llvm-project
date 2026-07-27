@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 #include <cstdint>
+#include <utility>
 
 namespace llvm {
 namespace bolt {
@@ -40,6 +41,9 @@ public:
   /// Return a view of \p Size bytes starting at \p RVA, or an error if the
   /// range is not fully contained in a single known section.
   Expected<ArrayRef<uint8_t>> read(uint32_t RVA, uint32_t Size) const;
+
+  Expected<std::pair<uint32_t, ArrayRef<uint8_t>>>
+  sectionContaining(uint32_t RVA) const;
 
   Expected<uint32_t> readU32(uint32_t RVA) const;
   Expected<int32_t> readI32(uint32_t RVA) const;

@@ -5,8 +5,17 @@
 # RUN: %clang_cl /O2 %S/TestPrograms/bubble_sort.c -o %t.exe 2>&1
 # RUN: llvm-bolt %t.exe -o %t.id.exe 2>&1 | FileCheck --check-prefix=CHECK-ID %s
 # RUN: diff %t.exe %t.id.exe
+# RUN: %clang_cl /O2 /Zi /Fd%t.pdb %S/TestPrograms/bubble_sort.c \
+# RUN:   -o %t.pdb.exe /link /debug 2>&1
+# RUN: %clang_cl /O2 /Zi /Fd%t.other.pdb %S/TestPrograms/matrix_mul.c \
+# RUN:   -o %t.other.exe /link /debug 2>&1
+# RUN: llvm-bolt %t.pdb.exe -o %t.mismatch.exe \
+# RUN:   --pecoff-pdb=%t.other.pdb 2>&1 | \
+# RUN:   FileCheck --check-prefix=CHECK-MISMATCH %s
 
 # CHECK-ID: BOLT-INFO: processing PE/COFF binary
 # CHECK-ID: BOLT-INFO: {{[0-9]+}} functions discovered from .pdata
 # CHECK-ID: BOLT-INFO: disassembled {{[0-9]+}} functions
 # CHECK-ID: BOLT-INFO: no profile data, producing identity copy
+
+# CHECK-MISMATCH: BOLT-WARNING: PDB does not match the input executable

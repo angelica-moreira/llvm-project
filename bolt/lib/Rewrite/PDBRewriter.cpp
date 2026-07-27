@@ -9,6 +9,7 @@
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/BinaryFunction.h"
+#include "bolt/Rewrite/PDBInputFile.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/DebugInfo/CodeView/CVSymbolVisitor.h"
@@ -191,46 +192,6 @@ bool rewriteLineSubsection(ArrayRef<uint8_t> Contents,
 } // namespace llvm
 
 namespace {
-
-/// Find the PDB path from the PE binary's debug directory.
-std::string findPDBPath(StringRef ExePath) {
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufOrErr =
-      MemoryBuffer::getFile(ExePath);
-  if (!BufOrErr)
-    return {};
-
-  Expected<std::unique_ptr<object::ObjectFile>> ObjOrErr =
-      object::ObjectFile::createObjectFile((*BufOrErr)->getMemBufferRef());
-  if (!ObjOrErr) {
-    consumeError(ObjOrErr.takeError());
-    return {};
-  }
-
-  auto *COFF = dyn_cast<object::COFFObjectFile>(ObjOrErr->get());
-  if (!COFF)
-    return {};
-
-  for (const auto &Entry : COFF->debug_directories()) {
-    if (Entry.Type != COFF::IMAGE_DEBUG_TYPE_CODEVIEW)
-      continue;
-    // CodeView info contains the PDB path after the signature.
-    uintptr_t DataAddr = 0;
-    if (Error E = COFF->getRvaPtr(Entry.AddressOfRawData, DataAddr)) {
-      consumeError(std::move(E));
-      continue;
-    }
-    const uint8_t *Data = reinterpret_cast<const uint8_t *>(DataAddr);
-    // Format: 'RSDS' signature (4) + GUID (16) + age (4) + path (null-term)
-    if (Entry.SizeOfData < 25) // at least 24 header + 1 byte path
-      continue;
-    if (Data[0] == 'R' && Data[1] == 'S' && Data[2] == 'D' && Data[3] == 'S') {
-      const char *PDBPath = reinterpret_cast<const char *>(Data + 4 + 16 + 4);
-      size_t MaxPathLen = Entry.SizeOfData - 24;
-      return std::string(PDBPath, strnlen(PDBPath, MaxPathLen));
-    }
-  }
-  return {};
-}
 
 struct PDBPatch {
   uint16_t StreamIndex;
@@ -615,27 +576,17 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
                              const DenseMap<uint64_t, OffsetMap> &OffsetMaps,
                              ArrayRef<BoltRelocatedFunc> RelocatedFuncs,
                              uint32_t BoltSectionRVA,
-                             uint32_t BoltSectionSize) {
+                             uint32_t BoltSectionSize, StringRef ExplicitPDBPath) {
 
-  // Find the PDB file.
-  std::string PDBPath = findPDBPath(InputExe);
-  if (PDBPath.empty()) {
-    BC.outs() << "BOLT-INFO: no PDB found, skipping debug info update\n";
+  Expected<PDBInputFile> PDBInput =
+      findPDBInputFile(InputExe, ExplicitPDBPath);
+  if (!PDBInput) {
+    consumeError(PDBInput.takeError());
+    BC.outs() << "BOLT-INFO: no matching PDB input, skipping debug info "
+                 "update\n";
     return;
   }
-
-  if (!sys::fs::exists(PDBPath)) {
-    // Try the PDB next to the input binary (common when copying both files).
-    SmallString<256> Adjacent(sys::path::parent_path(InputExe));
-    sys::path::append(Adjacent, sys::path::filename(PDBPath));
-    if (sys::fs::exists(Adjacent)) {
-      PDBPath = std::string(Adjacent);
-    } else {
-      BC.outs() << "BOLT-WARNING: PDB file " << PDBPath
-                << " not found, debug info will be stale\n";
-      return;
-    }
-  }
+  const std::string &PDBPath = PDBInput->Path;
 
   BC.outs() << "BOLT-INFO: updating PDB " << PDBPath << "\n";
 
@@ -660,6 +611,14 @@ void PDBRewriter::rewritePDB(StringRef InputExe, StringRef OutputExe,
   if (Error E = PDBFile.parseStreamData()) {
     BC.errs() << "BOLT-WARNING: cannot parse PDB streams: "
               << toString(std::move(E)) << "\n";
+    return;
+  }
+  Expected<pdb::InfoStream &> Info = PDBFile.getPDBInfoStream();
+  if (!Info || Info->getGuid() != PDBInput->Guid ||
+      Info->getAge() != PDBInput->Age) {
+    if (!Info)
+      consumeError(Info.takeError());
+    BC.errs() << "BOLT-WARNING: PDB does not match the input executable\n";
     return;
   }
 

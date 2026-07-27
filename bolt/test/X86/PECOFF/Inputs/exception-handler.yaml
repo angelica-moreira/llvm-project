@@ -2,20 +2,21 @@
 ## exception handler.  Used to verify that BOLT skips functions with
 ## exception handlers and still processes the rest.
 ##
-## .text layout (RVA 0x1000, 48 bytes):
+## .text layout (RVA 0x1000, 96 bytes):
 ##   func_a   @ 0x1000 .. 0x100F  (16 bytes) - no handler
-##   func_b   @ 0x1010 .. 0x101F  (16 bytes) - HAS exception handler
-##   func_c   @ 0x1020 .. 0x102F  (16 bytes) - no handler
+##   func_b   @ 0x1010 .. 0x101C  (13 bytes) - HAS exception handler
+##   func_c   @ 0x1050 .. 0x105F  (16 bytes) - no handler
 ##
-## .rdata (RVA 0x2000, 16 bytes) UNWIND_INFO:
+## .rdata (RVA 0x2000, 20 bytes) UNWIND_INFO:
 ##   offset 0: func_a unwind  (01 00 00 00)  v1, no flags
-##   offset 4: func_b unwind  (09 00 00 00 00 10 00 00)  v1, UNW_FLAG_EHANDLER, handler=0x1000
-##   offset 12: func_c unwind (01 00 00 00)  v1, no flags
+##   offset 4: func_b unwind  (09 00 00 00 00 10 00 00 20 00 00 00)
+##             v1, UNW_FLAG_EHANDLER, handler=0x1000, GS data=0x20
+##   offset 16: func_c unwind (01 00 00 00)  v1, no flags
 ##
 ## .pdata (RVA 0x4000, 36 bytes) three RUNTIME_FUNCTION entries:
 ##   {0x1000, 0x1010, 0x2000}  func_a -> unwind at rdata+0
-##   {0x1010, 0x1020, 0x2004}  func_b -> unwind at rdata+4
-##   {0x1020, 0x1030, 0x200C}  func_c -> unwind at rdata+12
+##   {0x1010, 0x101D, 0x2004}  func_b -> unwind at rdata+4
+##   {0x1050, 0x1060, 0x2010}  func_c -> unwind at rdata+16
 
 --- !COFF
 OptionalHeader:
@@ -87,17 +88,23 @@ sections:
   - Name:            .text
     Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
     VirtualAddress:  4096
-    VirtualSize:     48
-    SectionData:     554889E54883C4085DC3909090909090554889E54883C4085DC3909090909090554889E54883C4085DC39090909090900000
+    VirtualSize:     96
+    SectionData:     554889E54883C4085DC390909090909085C97406B801000000C331C0C3CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC554889E54883C4085DC3909090909090
   - Name:            .rdata
     Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
     VirtualAddress:  8192
-    VirtualSize:     16
-    SectionData:     '01000000090000000010000001000000'
+    VirtualSize:     20
+    SectionData:     '0100000009000000001000002000000001000000'
   - Name:            .pdata
     Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
     VirtualAddress:  16384
     VirtualSize:     36
-    SectionData:     '00100000101000000020000010100000201000000420000020100000301000000C200000'
-symbols:         []
+    SectionData:     '001000001010000000200000101000001D10000004200000501000006010000010200000'
+symbols:
+  - Name:            __GSHandlerCheck
+    Value:           0
+    SectionNumber:   1
+    SimpleType:      IMAGE_SYM_TYPE_NULL
+    ComplexType:     IMAGE_SYM_DTYPE_FUNCTION
+    StorageClass:    IMAGE_SYM_CLASS_EXTERNAL
 ...

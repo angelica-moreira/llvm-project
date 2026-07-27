@@ -21,6 +21,7 @@
 #include "bolt/Rewrite/BinaryPassManager.h"
 #include "bolt/Rewrite/ExecutableFileMemoryManager.h"
 #include "bolt/Rewrite/JITLinkLinker.h"
+#include "bolt/Rewrite/PDBInputFile.h"
 #include "bolt/Rewrite/PDBRewriter.h"
 #include "bolt/Utils/CommandLineOpts.h"
 #include "bolt/Utils/Utils.h"
@@ -82,6 +83,17 @@ cl::opt<bool> PECOFFRelocateEHOOP(
              "(experimental)"),
     cl::init(false));
 
+cl::opt<bool> PECOFFRelocateGS(
+    "pecoff-relocate-gs",
+    cl::desc("Reorder functions using the __GSHandlerCheck personality "
+             "(experimental)"),
+    cl::init(false));
+
+cl::opt<std::string> PECOFFPDBPath(
+    "pecoff-pdb",
+    cl::desc("PDB file used for PE/COFF personality resolution"),
+    cl::value_desc("filename"), cl::init(""));
+
 } // namespace opts
 
 namespace llvm {
@@ -99,11 +111,6 @@ struct RuntimeFunction {
   support::ulittle32_t EndAddress;
   support::ulittle32_t UnwindInfoAddress;
 };
-
-// x86-64 unwind info flags from UNWIND_INFO.Flags.
-constexpr uint8_t UNW_FLAG_EHANDLER = 0x01;
-constexpr uint8_t UNW_FLAG_UHANDLER = 0x02;
-constexpr uint8_t UNW_FLAG_CHAININFO = 0x04;
 
 // Populate \p Reader so it can resolve any RVA in the image; the C++ EH
 // FuncInfo and its sub-tables are typically spread across .rdata/.xdata.
@@ -289,7 +296,6 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   NamedRegionTimer T("readExceptionHandling", "read exception handling",
                      "rewrite", "Rewrite passes", opts::TimeRewrite);
   const object::coff_section *PDataSec = nullptr;
-  const object::coff_section *XDataSec = nullptr;
 
   for (const object::SectionRef &Section : InputFile->sections()) {
     Expected<StringRef> NameOrErr = Section.getName();
@@ -299,53 +305,11 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     }
     if (*NameOrErr == ".pdata")
       PDataSec = InputFile->getCOFFSection(Section);
-    else if (*NameOrErr == ".xdata")
-      XDataSec = InputFile->getCOFFSection(Section);
   }
 
   if (!PDataSec) {
     BC->outs() << "BOLT-WARNING: no .pdata section found\n";
     return;
-  }
-
-  // Get .xdata contents for UNWIND_INFO parsing.  Unwind data may live in
-  // .xdata or .rdata.
-  ArrayRef<uint8_t> XDataContents;
-  uint64_t XDataRVA = 0;
-  if (XDataSec) {
-    if (Error E = InputFile->getSectionContents(XDataSec, XDataContents)) {
-      BC->outs() << "BOLT-WARNING: cannot read .xdata section contents\n";
-      consumeError(std::move(E));
-    } else {
-      XDataRVA = XDataSec->VirtualAddress;
-    }
-  }
-  // Fall back to whichever section contains the unwind RVA from the first
-  // .pdata entry.  Many PE binaries put UNWIND_INFO in .rdata.
-  if (XDataContents.empty()) {
-    ArrayRef<uint8_t> PDataPeek;
-    if (Error E = InputFile->getSectionContents(PDataSec, PDataPeek)) {
-      BC->outs()
-          << "BOLT-WARNING: cannot peek .pdata for unwind section lookup\n";
-      consumeError(std::move(E));
-    }
-    if (PDataPeek.size() >= 12) {
-      uint32_t FirstUnwindRVA = support::endian::read32le(PDataPeek.data() + 8);
-      for (const object::SectionRef &Section : InputFile->sections()) {
-        const object::coff_section *CS = InputFile->getCOFFSection(Section);
-        uint32_t SecStart = CS->VirtualAddress;
-        uint32_t SecEnd = SecStart + CS->VirtualSize;
-        if (FirstUnwindRVA >= SecStart && FirstUnwindRVA < SecEnd) {
-          if (Error E = InputFile->getSectionContents(CS, XDataContents)) {
-            BC->outs() << "BOLT-WARNING: cannot read unwind data section\n";
-            consumeError(std::move(E));
-          } else {
-            XDataRVA = CS->VirtualAddress;
-          }
-          break;
-        }
-      }
-    }
   }
 
   // Get .pdata contents: array of RUNTIME_FUNCTION entries (12 bytes each)
@@ -357,8 +321,35 @@ void PECOFFRewriteInstance::readExceptionHandling() {
   }
 
   size_t NumEntries = PDataContents.size() / sizeof(RuntimeFunction);
+  if (PDataContents.size() % sizeof(RuntimeFunction)) {
+    BC->outs() << "BOLT-WARNING: malformed .pdata section size\n";
+    return;
+  }
+  uint64_t MalformedEntries = 0;
   auto *Entries =
       reinterpret_cast<const RuntimeFunction *>(PDataContents.data());
+
+  for (size_t I = 0; I < NumEntries; ++I) {
+    const uint32_t BeginRVA = Entries[I].BeginAddress;
+    const uint32_t EndRVA = Entries[I].EndAddress;
+    const uint32_t UnwindRVA = Entries[I].UnwindInfoAddress;
+    if (!BeginRVA || EndRVA <= BeginRVA || !UnwindRVA ||
+        (UnwindRVA & 3) ||
+        (I && (Entries[I - 1].BeginAddress >= BeginRVA ||
+               Entries[I - 1].EndAddress > BeginRVA))) {
+      BC->outs() << "BOLT-WARNING: malformed .pdata entry " << I << "\n";
+      return;
+    }
+  }
+
+  SmallVector<uint32_t> UnwindRVAs;
+  UnwindRVAs.reserve(NumEntries);
+  for (size_t I = 0; I < NumEntries; ++I)
+    if (Entries[I].UnwindInfoAddress)
+      UnwindRVAs.push_back(Entries[I].UnwindInfoAddress);
+  llvm::sort(UnwindRVAs);
+  UnwindRVAs.erase(std::unique(UnwindRVAs.begin(), UnwindRVAs.end()),
+                   UnwindRVAs.end());
 
   // First pass: parse UNWIND_INFO and detect chained entries
   DenseMap<uint32_t, uint32_t>
@@ -373,93 +364,61 @@ void PECOFFRewriteInstance::readExceptionHandling() {
     uint32_t EndRVA = Entries[I].EndAddress;
     uint32_t UnwindRVA = Entries[I].UnwindInfoAddress;
 
-    if (BeginRVA == 0 && EndRVA == 0)
-      continue;
-
     SEHUnwindInfo Info;
     Info.EndRVA = EndRVA;
+    Info.UnwindInfoRVA = UnwindRVA;
 
-    // Parse UNWIND_INFO from .xdata
-    if (!XDataContents.empty() && UnwindRVA >= XDataRVA) {
-      uint32_t Offset = UnwindRVA - XDataRVA;
-      if (Offset + 4 <= XDataContents.size()) {
-        const uint8_t *UW = XDataContents.data() + Offset;
-        Info.Version = UW[0] & 0x7;
-        Info.Flags = (UW[0] >> 3) & 0x1F;
-        Info.PrologSize = UW[1];
-        uint8_t CountOfCodes = UW[2];
-        Info.FrameRegister = UW[3] & 0xF;
-        Info.FrameOffset = (UW[3] >> 4) & 0xF;
-
-        // Read unwind codes
-        uint32_t CodesOffset = Offset + 4;
-        for (uint8_t C = 0;
-             C < CountOfCodes && CodesOffset + 2 <= XDataContents.size(); ++C) {
-          uint16_t Code =
-              support::endian::read16le(XDataContents.data() + CodesOffset);
-          Info.UnwindCodes.push_back(Code);
-          CodesOffset += 2;
-        }
-
-        // Aligned offset after unwind codes (must be 4-byte aligned)
-        uint32_t HandlerDataOffset = CodesOffset;
-        if (CountOfCodes % 2 != 0)
-          HandlerDataOffset += 2;
-
-        // Check for exception handler or chained info.
-        if (Info.Flags & UNW_FLAG_CHAININFO) {
-          Info.IsChained = true;
-          // Chained RUNTIME_FUNCTION follows the unwind codes
-          if (HandlerDataOffset + 12 <= XDataContents.size()) {
-            auto *Chain = reinterpret_cast<const RuntimeFunction *>(
-                XDataContents.data() + HandlerDataOffset);
-            Info.ChainedBeginRVA = Chain->BeginAddress;
-            Info.ChainedEndRVA = Chain->EndAddress;
-            Info.ChainedUnwindRVA = Chain->UnwindInfoAddress;
-            Info.ChainedEntryRVA = XDataRVA + HandlerDataOffset;
-            ChainToParent[BeginRVA] = Chain->BeginAddress;
-          }
-        } else if (Info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) {
-          Info.HasExceptionHandler = true;
-          if (HandlerDataOffset + 4 <= XDataContents.size()) {
-            Info.ExceptionHandlerRVA = support::endian::read32le(
-                XDataContents.data() + HandlerDataOffset);
-          }
-          // For __CxxFrameHandler3 the personality RVA is followed by a single
-          // RVA pointing at the FuncInfo structure.  A successful parse both
-          // recovers the metadata and confirms the personality (the compressed
-          // __CxxFrameHandler4 format does not match the FuncInfo magic).
-          if (HandlerDataOffset + 8 <= XDataContents.size()) {
-            uint32_t FuncInfoRVA = support::endian::read32le(
-                XDataContents.data() + HandlerDataOffset + 4);
-            if (Expected<WinEHFuncInfo> FI =
-                    parseWinEHFuncInfo(CxxEHImageReader, FuncInfoRVA,
-                                       /*ParseIPToStateMap=*/false)) {
-              Info.IsCxxEH = true;
-              Info.CxxFuncInfoRVA = FuncInfoRVA;
-              // Record the cleanup/catch funclet entry points so they can be
-              // pinned in place; their RVAs are referenced by the EH metadata.
-              for (const WinEHFuncInfo::UnwindMapEntry &UM : FI->UnwindMap)
-                if (UM.Action)
-                  CxxEHFuncletRVAs.insert(UM.Action);
-              for (const WinEHFuncInfo::TryBlock &TB : FI->TryBlocks)
-                for (const WinEHFuncInfo::HandlerType &HT : TB.Handlers)
-                  if (HT.Handler)
-                    CxxEHFuncletRVAs.insert(HT.Handler);
-              FunctionCxxEHInfo[BeginRVA] = std::move(*FI);
-              ++NumCxxEHFuncs;
-              // A first-cut reordering candidate: classic personality, no try
-              // blocks (simplest shape), and a non-empty state map to relocate.
-              if (FunctionCxxEHInfo[BeginRVA].TryBlocks.empty() &&
-                  FunctionCxxEHInfo[BeginRVA].NumIPToStateEntries > 0 &&
-                  FunctionCxxEHInfo[BeginRVA].IPToStateMapRVA)
-                CxxEHCandidateRVAs.insert(static_cast<uint32_t>(BeginRVA));
-            } else {
-              consumeError(FI.takeError());
-            }
+    if (Expected<std::pair<uint32_t, ArrayRef<uint8_t>>> Section =
+            CxxEHImageReader.sectionContaining(UnwindRVA)) {
+      const uint32_t XDataRVA = Section->first;
+      ArrayRef<uint8_t> XDataContents = Section->second;
+      auto NextUnwind = llvm::upper_bound(UnwindRVAs, UnwindRVA);
+      if (NextUnwind != UnwindRVAs.end() && *NextUnwind >= XDataRVA &&
+          static_cast<uint64_t>(*NextUnwind) - XDataRVA <=
+              XDataContents.size())
+        XDataContents =
+            XDataContents.take_front(*NextUnwind - XDataRVA);
+      const uint32_t Offset = UnwindRVA - XDataRVA;
+      if (Expected<ParsedSEHUnwindInfo> Parsed =
+              parseWinEHUnwindInfo(XDataContents, Offset, XDataRVA)) {
+        Info = std::move(Parsed->Info);
+        Info.EndRVA = EndRVA;
+        Info.UnwindInfoRVA = UnwindRVA;
+        if (Info.IsChained) {
+          ChainToParent[BeginRVA] = Info.ChainedBeginRVA;
+        } else if (Info.HandlerKind == WinEHHandlerKind::Unknown &&
+                   XDataContents.size() - Parsed->HandlerDataOffset >= 8) {
+          uint32_t FuncInfoRVA = support::endian::read32le(
+              XDataContents.data() + Parsed->HandlerDataOffset + 4);
+          if (Expected<WinEHFuncInfo> FI =
+                  parseWinEHFuncInfo(CxxEHImageReader, FuncInfoRVA,
+                                     /*ParseIPToStateMap=*/false)) {
+            Info.HandlerKind = WinEHHandlerKind::CxxFrameHandler3;
+            Info.CxxFuncInfoRVA = FuncInfoRVA;
+            for (const WinEHFuncInfo::UnwindMapEntry &UM : FI->UnwindMap)
+              if (UM.Action)
+                CxxEHFuncletRVAs.insert(UM.Action);
+            for (const WinEHFuncInfo::TryBlock &TB : FI->TryBlocks)
+              for (const WinEHFuncInfo::HandlerType &HT : TB.Handlers)
+                if (HT.Handler)
+                  CxxEHFuncletRVAs.insert(HT.Handler);
+            FunctionCxxEHInfo[BeginRVA] = std::move(*FI);
+            ++NumCxxEHFuncs;
+            if (FunctionCxxEHInfo[BeginRVA].TryBlocks.empty() &&
+                FunctionCxxEHInfo[BeginRVA].NumIPToStateEntries > 0 &&
+                FunctionCxxEHInfo[BeginRVA].IPToStateMapRVA)
+              CxxEHCandidateRVAs.insert(BeginRVA);
+          } else {
+            consumeError(FI.takeError());
           }
         }
+      } else {
+        consumeError(Parsed.takeError());
+        ++MalformedEntries;
       }
+    } else {
+      consumeError(Section.takeError());
+      ++MalformedEntries;
     }
 
     FunctionSEHInfo[BeginRVA] = std::move(Info);
@@ -467,22 +426,122 @@ void PECOFFRewriteInstance::readExceptionHandling() {
 
   // Second pass: resolve chains to root parents and extend parent ranges
   for (auto &[ChainedRVA, ParentRVA] : ChainToParent) {
-    // Walk chain to find root parent.  Use a visited set to break cycles
-    // in case the unwind data is corrupted.
+    SEHUnwindInfo &ChainInfo = FunctionSEHInfo[ChainedRVA];
+    auto ImmediateParent = FunctionSEHInfo.find(ParentRVA);
+    if (ImmediateParent == FunctionSEHInfo.end() ||
+        ImmediateParent->second.EndRVA != ChainInfo.ChainedEndRVA ||
+        ImmediateParent->second.UnwindInfoRVA !=
+            ChainInfo.ChainedUnwindRVA) {
+      ChainInfo.IsValid = false;
+      ++MalformedEntries;
+      continue;
+    }
+
     uint32_t Root = ParentRVA;
     DenseSet<uint32_t> Visited;
     Visited.insert(ChainedRVA);
     while (ChainToParent.count(Root) && Visited.insert(Root).second)
       Root = ChainToParent[Root];
+    if (ChainToParent.count(Root)) {
+      ChainInfo.IsValid = false;
+      ++MalformedEntries;
+      continue;
+    }
     ChainToParent[ChainedRVA] = Root;
   }
 
   BC->outs() << "BOLT-INFO: parsed " << FunctionSEHInfo.size()
              << " .pdata entries, " << ChainToParent.size() << " chained\n";
+  if (MalformedEntries)
+    BC->outs() << "BOLT-INFO: skipped " << MalformedEntries
+               << " malformed unwind records\n";
   BC->outs() << "BOLT-INFO: parsed " << NumCxxEHFuncs
              << " C++ (__CxxFrameHandler3) EH tables\n";
   BC->outs() << "BOLT-INFO: " << CxxEHFuncletRVAs.size()
              << " C++ EH funclets to pin\n";
+}
+
+void PECOFFRewriteInstance::readFunctionNames() {
+  for (const object::SymbolRef &Symbol : InputFile->symbols()) {
+    Expected<object::SymbolRef::Type> Type = Symbol.getType();
+    if (!Type) {
+      consumeError(Type.takeError());
+      continue;
+    }
+    if (*Type != object::SymbolRef::ST_Function)
+      continue;
+
+    Expected<uint64_t> Address = Symbol.getAddress();
+    if (!Address) {
+      consumeError(Address.takeError());
+      continue;
+    }
+    Expected<StringRef> Name = Symbol.getName();
+    if (!Name) {
+      consumeError(Name.takeError());
+      continue;
+    }
+    FunctionNames[*Address] = Name->str();
+    if (classifyWinEHHandlerName(*Name) ==
+        WinEHHandlerKind::GSHandlerCheck)
+      GSHandlerSymbols.insert(*Address);
+  }
+}
+
+void PECOFFRewriteInstance::classifyExceptionHandlers() {
+  if (!opts::PECOFFRelocateGS)
+    return;
+
+  std::unique_ptr<PDBSymbolResolver> Resolver;
+  if (Expected<PDBInputFile> PDBInput =
+          findPDBInputFile(*InputFile, InputFile->getFileName(),
+                           opts::PECOFFPDBPath)) {
+    if (Expected<std::unique_ptr<PDBSymbolResolver>> PDBResolver =
+            PDBSymbolResolver::create(*PDBInput))
+      Resolver = std::move(*PDBResolver);
+    else
+      consumeError(PDBResolver.takeError());
+  } else {
+    consumeError(PDBInput.takeError());
+  }
+
+  uint64_t Resolved = 0;
+  uint64_t Unresolved = 0;
+  for (auto &[BeginRVA, Info] : FunctionSEHInfo) {
+    if (Info.HandlerKind == WinEHHandlerKind::None ||
+        !Info.ExceptionHandlerRVA)
+      continue;
+
+    bool IsGSHandler =
+        GSHandlerSymbols.count(ImageBase + Info.ExceptionHandlerRVA);
+    if (!IsGSHandler && Resolver)
+      IsGSHandler = Resolver->hasExactSymbolName(Info.ExceptionHandlerRVA,
+                                                 "__GSHandlerCheck");
+
+    if (IsGSHandler && Info.HandlerDataMaxSize >= sizeof(uint32_t)) {
+      Info.HandlerKind = WinEHHandlerKind::GSHandlerCheck;
+      GSCandidateRVAs.insert(BeginRVA);
+      ++Resolved;
+    } else if (Info.HandlerKind == WinEHHandlerKind::Unknown) {
+      ++Unresolved;
+    }
+  }
+
+  BC->outs() << "BOLT-INFO: " << Resolved
+             << " functions use __GSHandlerCheck";
+  if (Unresolved)
+    BC->outs() << ", " << Unresolved << " handlers unresolved";
+  BC->outs() << "\n";
+}
+
+void PECOFFRewriteInstance::rejectCoveredGSCandidates(
+    const BinaryFunction &Function) {
+  const uint32_t BeginRVA =
+      static_cast<uint32_t>(Function.getAddress() - ImageBase);
+  const uint64_t EndRVA = uint64_t(BeginRVA) + Function.getMaxSize();
+  for (uint32_t RVA : GSCandidateRVAs)
+    if (RVA >= BeginRVA && RVA < EndRVA)
+      RejectedGSCandidateRVAs.insert(RVA);
 }
 
 void PECOFFRewriteInstance::readCxxEHIPToStateMaps() {
@@ -517,34 +576,10 @@ void PECOFFRewriteInstance::discoverFileObjects() {
   NamedRegionTimer T("discoverFileObjects", "discover file objects", "rewrite",
                      "Rewrite passes", opts::TimeRewrite);
 
-  // Build address-to-name map from the COFF symbol table.
-  DenseMap<uint64_t, StringRef> AddressToName;
-
-  for (const object::SymbolRef &Symbol : InputFile->symbols()) {
-    Expected<object::SymbolRef::Type> TypeOrErr = Symbol.getType();
-    if (!TypeOrErr) {
-      consumeError(TypeOrErr.takeError());
-      continue;
-    }
-    if (*TypeOrErr != object::SymbolRef::ST_Function)
-      continue;
-
-    Expected<uint64_t> AddressOrErr = Symbol.getAddress();
-    if (!AddressOrErr) {
-      consumeError(AddressOrErr.takeError());
-      continue;
-    }
-    Expected<StringRef> NameOrErr = Symbol.getName();
-    if (!NameOrErr) {
-      consumeError(NameOrErr.takeError());
-      continue;
-    }
-    AddressToName[*AddressOrErr] = *NameOrErr;
-  }
-
   // Enumerate functions from .pdata SEH data.
   uint64_t FuncsCreated = 0;
   uint64_t FuncsSkippedHandler = 0;
+  uint64_t FuncsSkippedUnwind = 0;
 
   for (const auto &[BeginRVA, Info] : FunctionSEHInfo) {
     if (Info.IsChained)
@@ -561,9 +596,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
       continue;
 
     std::string FuncName;
-    auto NameIt = AddressToName.find(Address);
-    if (NameIt != AddressToName.end())
-      FuncName = NameIt->second.str();
+    auto NameIt = FunctionNames.find(Address);
+    if (NameIt != FunctionNames.end())
+      FuncName = NameIt->second;
     else
       FuncName = ("func_0x" + Twine::utohexstr(Address)).str();
 
@@ -575,14 +610,20 @@ void PECOFFRewriteInstance::discoverFileObjects() {
     BF->setMaxSize(Size);
     BF->setOutputAddress(BF->getAddress());
 
-    if (Info.HasExceptionHandler) {
+    if (!Info.IsValid || Info.PrologSize > Size) {
+      BF->setSimple(false);
+      ++FuncsSkippedUnwind;
+    } else if (Info.HandlerKind != WinEHHandlerKind::None) {
       // With EH relocation enabled, leave reordering candidates simple so they
       // can be optimized; their EH metadata is regenerated after emission.
-      bool IsCandidate =
+      const bool IsCxxCandidate =
           opts::PECOFFRelocateEH &&
           CxxEHCandidateRVAs.count(static_cast<uint32_t>(BeginRVA)) &&
           !CxxEHFuncletRVAs.count(static_cast<uint32_t>(BeginRVA));
-      if (!IsCandidate) {
+      const bool IsGSCandidate =
+          opts::PECOFFRelocateGS &&
+          GSCandidateRVAs.count(static_cast<uint32_t>(BeginRVA));
+      if (!IsCxxCandidate && !IsGSCandidate) {
         BF->setSimple(false);
         ++FuncsSkippedHandler;
       }
@@ -602,6 +643,9 @@ void PECOFFRewriteInstance::discoverFileObjects() {
              << " functions discovered from .pdata\n";
   BC->outs() << "BOLT-INFO: " << FuncsSkippedHandler
              << " functions with exception handlers (skipped)\n";
+  if (FuncsSkippedUnwind)
+    BC->outs() << "BOLT-INFO: " << FuncsSkippedUnwind
+               << " functions with invalid unwind info (skipped)\n";
 }
 
 void PECOFFRewriteInstance::selectFunctionsToProcess() {
@@ -812,6 +856,30 @@ static bool originalHasREXPrefix(const uint8_t *Data, uint64_t Len) {
   return false;
 }
 
+std::optional<ArrayRef<uint8_t>>
+PECOFFRewriteInstance::getOriginalFunctionBytes(uint32_t RVA,
+                                                uint32_t Size) const {
+  for (const object::SectionRef &Sec : InputFile->sections()) {
+    const auto *COFFSec = InputFile->getCOFFSection(Sec);
+    if (RVA < COFFSec->VirtualAddress ||
+        uint64_t(RVA) >=
+            uint64_t(COFFSec->VirtualAddress) + COFFSec->VirtualSize)
+      continue;
+
+    const uint32_t SectionOffset = RVA - COFFSec->VirtualAddress;
+    if (uint64_t(SectionOffset) + Size > COFFSec->SizeOfRawData)
+      return std::nullopt;
+    const uint64_t FileOffset = COFFSec->PointerToRawData + SectionOffset;
+    if (FileOffset + Size > InputFile->getData().size())
+      return std::nullopt;
+    return ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(InputFile->getData().data() +
+                                          FileOffset),
+        Size);
+  }
+  return std::nullopt;
+}
+
 /// Force REX prefixes on prolog instructions to match the original encoding.
 /// MSVC emits redundant REX bytes (e.g. `40 55` for `push rbp`) that LLVM MC
 /// would normally drop.  SEH UNWIND_INFO CodeOffset fields depend on exact
@@ -832,24 +900,10 @@ void PECOFFRewriteInstance::freezePrologInstructions() {
     if (PrologSize == 0)
       continue;
 
-    // Locate the function bytes in the input binary.
-    uint32_t FuncRVA32 = static_cast<uint32_t>(FuncRVA);
-    const uint8_t *OrigData = nullptr;
-    for (const object::SectionRef &Sec : InputFile->sections()) {
-      const auto *CS = InputFile->getCOFFSection(Sec);
-      if (FuncRVA32 >= CS->VirtualAddress &&
-          FuncRVA32 < CS->VirtualAddress + CS->VirtualSize) {
-        uint32_t SecOffset = FuncRVA32 - CS->VirtualAddress;
-        // Clamp to SizeOfRawData — VirtualSize can exceed it (zero-fill).
-        if (SecOffset + PrologSize <= CS->SizeOfRawData) {
-          uint64_t FileOff = CS->PointerToRawData + SecOffset;
-          if (FileOff + PrologSize <= InputFile->getData().size())
-            OrigData = reinterpret_cast<const uint8_t *>(
-                InputFile->getData().data() + FileOff);
-        }
-        break;
-      }
-    }
+    std::optional<ArrayRef<uint8_t>> OriginalBytes =
+        getOriginalFunctionBytes(FuncRVA, PrologSize);
+    const uint8_t *OrigData =
+        OriginalBytes ? OriginalBytes->data() : nullptr;
 
     BinaryBasicBlock &EntryBB = BF.front();
     uint32_t OrigOffset = 0;
@@ -1295,9 +1349,49 @@ void PECOFFRewriteInstance::rewriteFile() {
     return std::nullopt;
   };
 
+  auto HasReusableUnwindInfo = [&](const BinaryFunction &Function) {
+    const uint32_t RVA =
+        static_cast<uint32_t>(Function.getAddress() - ImageBase);
+    const uint64_t EndRVA = uint64_t(RVA) + Function.getMaxSize();
+
+    std::optional<uint64_t> OriginalOffset =
+        VAToFileOffset(Function.getAddress());
+    if (!OriginalOffset || *OriginalOffset > FileData.size())
+      return false;
+
+    ArrayRef<uint8_t> OriginalBytes(
+        reinterpret_cast<const uint8_t *>(FileData.data() + *OriginalOffset),
+        FileData.size() - *OriginalOffset);
+    ArrayRef<uint8_t> EmittedBytes(
+        reinterpret_cast<const uint8_t *>(Function.getImageAddress()),
+        Function.getImageSize());
+    for (const auto &[EntryRVA, Info] : FunctionSEHInfo) {
+      if (EntryRVA < RVA || EntryRVA >= EndRVA)
+        continue;
+      const uint32_t Offset = EntryRVA - RVA;
+      if (Offset > OriginalBytes.size() || Offset >= EmittedBytes.size() ||
+          !isWinEHUnwindInfoReusable(Info, OriginalBytes.drop_front(Offset),
+                                     EmittedBytes.drop_front(Offset)))
+        return false;
+    }
+    return true;
+  };
+
+  for (const auto &BFI : BC->getBinaryFunctions()) {
+    const BinaryFunction &Function = BFI.second;
+    if (!Function.isEmitted() ||
+        Function.getOutputAddress() == Function.getAddress())
+      continue;
+    if (!HasReusableUnwindInfo(Function))
+      report_fatal_error(
+          "out-of-place PE/COFF function changed unwind-covered prolog");
+  }
+
   uint64_t InPlaceCount = 0;
   uint64_t OOPWritten = 0;
   uint64_t OverflowCount = 0;
+  uint64_t GSInPlaceWritten = 0;
+  uint64_t GSOOPWritten = 0;
 
   // Begin RVAs of C++ EH candidates actually written in-place, in ascending
   // order.  This is the authoritative gate for repointing FuncInfo: functions
@@ -1334,6 +1428,15 @@ void PECOFFRewriteInstance::rewriteFile() {
   // plus injected functions (patches created by createInstructionPatch).
   // Pre-allocate a padding buffer to avoid per-function heap allocation.
   SmallVector<uint8_t, 4096> PadBuf;
+  auto rejectFunctionMetadata = [&](const BinaryFunction &Function) {
+    const uint64_t Address = Function.getAddress();
+    ModifiedFunctions.erase(Address);
+    FunctionOffsetMaps.erase(Address);
+    RegeneratedEHTables.erase(
+        static_cast<uint32_t>(Address - ImageBase));
+    rejectCoveredGSCandidates(Function);
+  };
+
   auto writeFunction = [&](BinaryFunction &Function) {
     if (!Function.isEmitted() || Function.getImageSize() == 0)
       return;
@@ -1349,8 +1452,11 @@ void PECOFFRewriteInstance::rewriteFile() {
     else
       FileOff = VAToFileOffset(OutputAddr);
 
-    if (!FileOff)
+    if (!FileOff) {
+      if (!Function.isPatch())
+        rejectFunctionMetadata(Function);
       return;
+    }
 
     // For non-patch regular functions, check ModifiedFunctions.
     if (!Function.isPatch() && OutputAddr == OrigAddr) {
@@ -1358,31 +1464,18 @@ void PECOFFRewriteInstance::rewriteFile() {
         return;
       if (EmittedSize > Function.getMaxSize()) {
         ++OverflowCount;
+        rejectFunctionMetadata(Function);
         return;
       }
 
-      // Verify prolog bytes match the original — a mismatch means
-      // MC re-encoded differently and UNWIND_INFO would be wrong.
-      auto SEHIt =
-          FunctionSEHInfo.find(static_cast<uint32_t>(OrigAddr - ImageBase));
-      if (SEHIt != FunctionSEHInfo.end() && SEHIt->second.PrologSize > 0) {
-        uint8_t PrologSize = SEHIt->second.PrologSize;
-        auto OrigFileOff = VAToFileOffset(OrigAddr);
-        if (OrigFileOff && PrologSize <= EmittedSize &&
-            *OrigFileOff + PrologSize <= FileData.size()) {
-          const uint8_t *EmittedBytes =
-              reinterpret_cast<const uint8_t *>(Function.getImageAddress());
-          const uint8_t *OrigBytes =
-              reinterpret_cast<const uint8_t *>(FileData.data() + *OrigFileOff);
-          if (memcmp(EmittedBytes, OrigBytes, PrologSize) != 0) {
-            LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
-                              << " - prolog bytes changed by re-encoding\n");
-            if (opts::Verbosity >= 1)
-              BC->outs() << "BOLT-INFO: skipping " << Function.getPrintName()
-                         << " - prolog re-encoded differently\n";
-            return;
-          }
-        }
+      if (!HasReusableUnwindInfo(Function)) {
+        LLVM_DEBUG(dbgs() << "BOLT-DEBUG: skipping " << Function
+                          << " - unwind info cannot be reused\n");
+        if (opts::Verbosity >= 1)
+          BC->outs() << "BOLT-INFO: skipping " << Function.getPrintName()
+                     << " - unwind info cannot be reused\n";
+        rejectFunctionMetadata(Function);
+        return;
       }
     }
 
@@ -1413,11 +1506,15 @@ void PECOFFRewriteInstance::rewriteFile() {
       uint32_t RVA = static_cast<uint32_t>(OrigAddr - ImageBase);
       if (RegeneratedEHTables.count(RVA))
         EHInPlaceWritten.push_back(RVA);
+      if (GSCandidateRVAs.count(RVA))
+        ++GSInPlaceWritten;
     } else {
       ++OOPWritten;
       uint32_t RVA = static_cast<uint32_t>(OrigAddr - ImageBase);
       if (RegeneratedEHTables.count(RVA))
         EHOOPWritten.push_back({RVA, static_cast<uint32_t>(OutputRVA)});
+      if (GSCandidateRVAs.count(RVA))
+        ++GSOOPWritten;
     }
   };
 
@@ -1718,7 +1815,8 @@ void PECOFFRewriteInstance::rewriteFile() {
           uint32_t BoltEnd =
               BoltRVA + static_cast<uint32_t>(BFI->second.getImageSize());
           for (const auto &[FuncletRVA, Info] : FunctionSEHInfo) {
-            if (!Info.IsChained || Info.ChainedBeginRVA != OrigRVA ||
+            if (!Info.IsValid || !Info.IsChained ||
+                Info.ChainedBeginRVA != OrigRVA ||
                 !Info.ChainedEntryRVA)
               continue;
             if (std::optional<uint64_t> FO =
@@ -1793,6 +1891,12 @@ void PECOFFRewriteInstance::rewriteFile() {
   if (OverflowCount)
     BC->outs() << "BOLT-INFO: " << OverflowCount
                << " functions could not be optimized\n";
+  if (opts::PECOFFRelocateGS)
+    BC->outs() << "BOLT-INFO: " << GSInPlaceWritten + GSOOPWritten
+               << " __GSHandlerCheck functions rewritten ("
+               << GSInPlaceWritten << " in-place, " << GSOOPWritten
+               << " out-of-place), " << RejectedGSCandidateRVAs.size()
+               << " reverted\n";
   BC->outs() << "BOLT-INFO: output binary: " << opts::OutputFilename << "\n";
 }
 
@@ -1896,6 +2000,8 @@ void PECOFFRewriteInstance::run() {
 
   readSpecialSections();
   readExceptionHandling();
+  readFunctionNames();
+  classifyExceptionHandlers();
   discoverFileObjects();
 
   preprocessProfileData();
@@ -1920,7 +2026,8 @@ void PECOFFRewriteInstance::run() {
       PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename,
                               *BC, ImageBase, ModifiedFunctions,
                               FunctionOffsetMaps, RelocatedFuncs,
-                              BoltSectionRVA, BoltSectionSize);
+                              BoltSectionRVA, BoltSectionSize,
+                              opts::PECOFFPDBPath);
     return;
   }
 
@@ -2039,6 +2146,13 @@ void PECOFFRewriteInstance::run() {
   uint32_t BoltCurOff = 0;
   uint64_t OOPCount = 0;
   DenseSet<uint64_t> OOPFunctions;
+  DenseSet<uint64_t> SkippedFunctions;
+  auto skipFunction = [&](BinaryFunction &Function) {
+    Function.setSimple(false);
+    SkippedFunctions.insert(Function.getAddress());
+    rejectCoveredGSCandidates(Function);
+  };
+
   for (uint64_t FuncVA : ModifiedFunctions) {
     auto It = BC->getBinaryFunctions().find(FuncVA);
     if (It == BC->getBinaryFunctions().end())
@@ -2065,7 +2179,7 @@ void PECOFFRewriteInstance::run() {
 
     // In inplace-only mode, skip functions that do not fit.
     if (opts::PECOFFInplaceOnly) {
-      BF.setSimple(false);
+      skipFunction(BF);
       continue;
     }
 
@@ -2073,38 +2187,90 @@ void PECOFFRewriteInstance::run() {
       if (opts::Verbosity >= 1)
         BC->outs() << "BOLT-INFO: " << BF << " too small for patch ("
                    << BF.getMaxSize() << " < " << PatchSize << ")\n";
-      BF.setSimple(false);
+      skipFunction(BF);
       continue;
     }
 
     // Skip OOP for functions with jump tables — JT data in .rdata is
     // outside the emitted LinkGraph.
     if (BF.hasJumpTables()) {
-      BF.setSimple(false);
+      skipFunction(BF);
       continue;
     }
 
     // Skip OOP for contiguous .pdata groups (MSVC split functions).
     uint32_t FuncRVA = static_cast<uint32_t>(BF.getAddress() - ImageBase);
-    uint32_t FuncEndRVA = FuncRVA + BF.getMaxSize();
-    if (FunctionSEHInfo.count(FuncEndRVA) || SplitTargetRVAs.count(FuncRVA)) {
-      BF.setSimple(false);
+    uint64_t FuncEndRVA = uint64_t(FuncRVA) + BF.getMaxSize();
+    if ((FuncEndRVA <= UINT32_MAX &&
+         FunctionSEHInfo.count(static_cast<uint32_t>(FuncEndRVA))) ||
+        SplitTargetRVAs.count(FuncRVA)) {
+      skipFunction(BF);
       continue;
     }
+    bool HasSecondaryUnwindEntry = false;
+    for (const auto &Entry : FunctionSEHInfo) {
+      const uint32_t EntryRVA = Entry.first;
+      if (EntryRVA > FuncRVA && EntryRVA < FuncEndRVA) {
+        HasSecondaryUnwindEntry = true;
+        break;
+      }
+    }
+    if (HasSecondaryUnwindEntry) {
+      skipFunction(BF);
+      continue;
+    }
+    if (GSCandidateRVAs.count(FuncRVA)) {
+      skipFunction(BF);
+      continue;
+    }
+    auto Unwind = FunctionSEHInfo.find(FuncRVA);
+    if (Unwind != FunctionSEHInfo.end() && Unwind->second.PrologSize) {
+      const uint32_t PrologSize = Unwind->second.PrologSize;
+      std::optional<ArrayRef<uint8_t>> OriginalBytes =
+          getOriginalFunctionBytes(FuncRVA, PrologSize);
+      bool SafeProlog = OriginalBytes.has_value();
+      uint32_t Offset = 0;
+      while (SafeProlog && Offset < PrologSize) {
+        MCInst Inst;
+        uint64_t Size = 0;
+        if (!BC->DisAsm->getInstruction(
+                Inst, Size, OriginalBytes->drop_front(Offset), 0, nulls()) ||
+            !Size || Offset + Size > PrologSize) {
+          SafeProlog = false;
+          break;
+        }
+        if (BC->MIB->isBranch(Inst) || BC->MIB->hasPCRelOperand(Inst)) {
+          SafeProlog = false;
+          break;
+        }
+        Offset += Size;
+      }
+      if (!SafeProlog) {
+        skipFunction(BF);
+        continue;
+      }
+    }
 
-    // Assign new address in .bolt section.
-    BoltCurOff = alignTo(BoltCurOff, 16);
-    uint64_t NewVA = ImageBase + BoltSecVA + BoltCurOff;
-    BF.setOutputAddress(NewVA);
-    BoltCurOff += HotSize;
-
-    // Create a JMP patch at the original address.
     bool PatchOK = true;
-    BF.forEachEntryPoint([&](uint64_t Offset, const MCSymbol *Symbol) {
+    BF.forEachEntryPoint([&](uint64_t Offset, const MCSymbol *) {
       if (Offset + PatchSize > BF.getMaxSize()) {
         PatchOK = false;
         return false;
       }
+      return true;
+    });
+    if (!PatchOK) {
+      skipFunction(BF);
+      continue;
+    }
+
+    // Assign a new address and create entry patches only after validating all
+    // entry points.
+    BoltCurOff = alignTo(BoltCurOff, 16);
+    uint64_t NewVA = ImageBase + BoltSecVA + BoltCurOff;
+    BF.setOutputAddress(NewVA);
+    BoltCurOff += HotSize;
+    BF.forEachEntryPoint([&](uint64_t Offset, const MCSymbol *Symbol) {
       InstructionListType JmpSeq;
       BC->MIB->createLongTailCall(JmpSeq, Symbol, BC->Ctx.get());
       BC->createInstructionPatch(
@@ -2112,11 +2278,6 @@ void PECOFFRewriteInstance::run() {
           NameResolver::append(Symbol->getName(), ".org.0"));
       return true;
     });
-
-    if (!PatchOK) {
-      BF.setSimple(false);
-      continue;
-    }
 
     ++OOPCount;
     OOPFunctions.insert(FuncVA);
@@ -2127,6 +2288,12 @@ void PECOFFRewriteInstance::run() {
       BC->outs() << "BOLT-INFO: " << BF << " (" << HotSize << "B) moved to"
                  << " .bolt+0x" << Twine::utohexstr(BoltCurOff - HotSize)
                  << " with entry patch\n";
+  }
+  for (uint64_t Address : SkippedFunctions) {
+    ModifiedFunctions.erase(Address);
+    FunctionOffsetMaps.erase(Address);
+    RegeneratedEHTables.erase(
+        static_cast<uint32_t>(Address - ImageBase));
   }
   if (OOPCount) {
     BC->outs() << "BOLT-INFO: " << OOPCount
@@ -2170,7 +2337,8 @@ void PECOFFRewriteInstance::run() {
                        opts::TimeRewrite);
     PDBRewriter::rewritePDB(InputFile->getFileName(), opts::OutputFilename, *BC,
                             ImageBase, ModifiedFunctions, FunctionOffsetMaps,
-                            RelocatedFuncs, BoltSectionRVA, BoltSectionSize);
+                            RelocatedFuncs, BoltSectionRVA, BoltSectionSize,
+                            opts::PECOFFPDBPath);
   }
 }
 

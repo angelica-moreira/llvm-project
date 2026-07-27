@@ -23,6 +23,7 @@ add_llvm_library(LLVMBOLTRewrite
   LinuxKernelRewriter.cpp
   MachORewriteInstance.cpp
   PECOFFRewriteInstance.cpp
+  PDBInputFile.cpp
   PDBRewriter.cpp
   MetadataManager.cpp
   BuildIDRewriter.cpp
@@ -31,7 +32,9 @@ add_llvm_library(LLVMBOLTRewrite
   RSeqRewriter.cpp
   SDTRewriter.cpp
   GNUPropertyRewriter.cpp
+  WinEHHandlerInfo.cpp
   WinEHFuncInfoReader.cpp
+  WinEHUnwindInfo.cpp
 
   NO_EXPORT
   DISABLE_LLVM_LINK_LLVM_DYLIB
