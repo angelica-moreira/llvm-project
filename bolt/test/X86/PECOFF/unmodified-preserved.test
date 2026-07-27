@@ -1,0 +1,11 @@
+## Test that unmodified functions are not written back after profile-guided
+## optimization when no layout changes occur.
+
+# RUN: yaml2obj %p/Inputs/two-funcs.yaml -o %t.exe
+# RUN: printf "1 func_0x140001030 0 1 func_0x140001030 0 0 1\n" > %t.fdata
+# RUN: llvm-bolt %t.exe -o %t.out.exe -data=%t.fdata -reorder-blocks=ext-tsp \
+# RUN:   2>&1 | FileCheck %s
+# RUN: diff %t.exe %t.out.exe
+
+# CHECK: BOLT-INFO: 0 functions had layout modified
+# CHECK: BOLT-INFO: 0 functions rewritten

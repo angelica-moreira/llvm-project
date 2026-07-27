@@ -11,6 +11,9 @@ add_bolt_unittest(CoreTests
   MCPlusBuilder.cpp
   MemoryMaps.cpp
   DynoStats.cpp
+  PDBRewriter.cpp
+  WinEHFuncInfoReader.cpp
+  WinEHUnwindInfo.cpp
 
   # FIXME CoreTests uses `llvm::detail::TakeError(llvm::Error)`, but linking
   #       to LLVMTestingSupport introduces a transitive dependency on the

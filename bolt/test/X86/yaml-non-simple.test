@@ -1,4 +1,5 @@
 ## Check that YAML profile for non-simple function is not reported as stale.
+# REQUIRES: system-linux
 
 # RUN: split-file %s %t
 # RUN: llvm-mc -filetype=obj -triple x86_64-unknown-unknown %t/main.s -o %t.o

@@ -213,12 +213,19 @@ Expected<std::unique_ptr<BinaryContext>> BinaryContext::createBinaryContext(
 
   const std::string TripleName = TheTriple.str();
 
+  // Save the original object format before lookupTarget modifies the triple.
+  Triple::ObjectFormatType OrigFormat = TheTriple.getObjectFormat();
+
   std::string Error;
   const Target *TheTarget =
       TargetRegistry::lookupTarget(ArchName, TheTriple, Error);
   if (!TheTarget)
     return createStringError(make_error_code(std::errc::not_supported),
                              Twine("BOLT-ERROR: ", Error));
+
+  // Restore the original object format after lookupTarget normalization.
+  if (TheTriple.getObjectFormat() != OrigFormat)
+    TheTriple.setObjectFormat(OrigFormat);
 
   std::unique_ptr<const MCRegisterInfo> MRI(
       TheTarget->createMCRegInfo(TheTriple));

@@ -2,6 +2,7 @@ add_llvm_library(LLVMBOLTProfile
   BoltAddressTranslation.cpp
   DataAggregator.cpp
   DataReader.cpp
+  ETWDataAggregator.cpp
   Heatmap.cpp
   StaleProfileMatching.cpp
   YAMLProfileReader.cpp

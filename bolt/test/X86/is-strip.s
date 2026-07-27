@@ -1,4 +1,5 @@
 ## This test checks whether a binary is stripped or not.
+# REQUIRES: system-linux
 
 # RUN: %clang++ %cflags %p/Inputs/linenumber.cpp -o %t -Wl,-q
 # RUN: llvm-bolt %t -o %t.out 2>&1 | FileCheck %s -check-prefix=CHECK-NOSTRIP

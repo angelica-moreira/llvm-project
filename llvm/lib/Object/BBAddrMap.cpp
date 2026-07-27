@@ -213,3 +213,42 @@ llvm::object::decodeBBAddrMapPayload(AddressExtractor &Extractor,
                       std::move(MetadataDecodeErr));
   return FunctionEntries;
 }
+
+/// AddressExtractor for COFF that resolves relocations via a translation map.
+/// Falls back to the raw address when no relocation exists for a given offset.
+namespace {
+class COFFAddressExtractor : public AddressExtractor {
+  const DenseMap<uint64_t, uint64_t> &Translations;
+  bool IsRelocatable;
+
+public:
+  COFFAddressExtractor(const DataExtractor &Data, unsigned AddressSize,
+                       const DenseMap<uint64_t, uint64_t> &Translations,
+                       bool IsRelocatable)
+      : AddressExtractor(Data, AddressSize), Translations(Translations),
+        IsRelocatable(IsRelocatable) {}
+
+  Expected<uint64_t> extractAddress(DataExtractor::Cursor &Cur) override {
+    uint64_t Offset = Cur.tell();
+    Expected<uint64_t> AddressOrErr = AddressExtractor::extractAddress(Cur);
+    if (!AddressOrErr)
+      return AddressOrErr.takeError();
+    if (!IsRelocatable)
+      return *AddressOrErr;
+    auto It = Translations.find(Offset);
+    if (It == Translations.end())
+      return *AddressOrErr;
+    return It->second;
+  }
+};
+} // namespace
+
+Expected<std::vector<BBAddrMap>> llvm::object::decodeBBAddrMapSection(
+    DataExtractor Data, unsigned AddrSize,
+    const DenseMap<uint64_t, uint64_t> &FunctionOffsetTranslations,
+    bool IsRelocatable, StringRef SectionDesc,
+    std::vector<PGOAnalysisMap> *PGOAnalyses) {
+  COFFAddressExtractor Extractor(Data, AddrSize, FunctionOffsetTranslations,
+                                 IsRelocatable);
+  return decodeBBAddrMapPayload(Extractor, PGOAnalyses);
+}

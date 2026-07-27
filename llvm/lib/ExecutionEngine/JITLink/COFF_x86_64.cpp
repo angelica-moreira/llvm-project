@@ -52,6 +52,10 @@ private:
 
 class COFFLinkGraphBuilder_x86_64 : public COFFLinkGraphBuilder {
 private:
+  // Cached across all relocations so the __ImageBase lookup (a linear symbol
+  // scan) runs once instead of once per relocation.
+  GetImageBaseSymbol GetImageBase;
+
   Error addRelocations() override {
     LLVM_DEBUG(dbgs() << "Processing relocations:\n");
 
@@ -94,12 +98,14 @@ private:
 
     Edge::Kind Kind = Edge::Invalid;
     const char *FixupPtr = BlockToFix.getContent().data() + Offset;
-    Symbol *ImageBase = GetImageBaseSymbol()(getGraph());
+    Symbol *ImageBase = GetImageBase(getGraph());
 
     switch (Rel.getType()) {
     case COFF::RelocationTypeAMD64::IMAGE_REL_AMD64_ADDR32NB: {
-      if (!ImageBase)
+      if (!ImageBase) {
         ImageBase = &addImageBaseSymbol();
+        GetImageBase.reset(ImageBase);
+      }
       Kind = EdgeKind_coff_x86_64::Pointer32NB;
       Addend = *reinterpret_cast<const support::little32_t *>(FixupPtr);
       break;

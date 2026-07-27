@@ -17,6 +17,7 @@
 #include "Win64EHDumper.h"
 #include "llvm-readobj.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/COFF.h"
@@ -41,13 +42,16 @@
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeStreamMerger.h"
 #include "llvm/DebugInfo/CodeView/TypeTableCollection.h"
+#include "llvm/Object/BBAddrMap.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/ELFTypes.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/WindowsResource.h"
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertUTF.h"
+#include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/ScopedPrinter.h"
@@ -109,6 +113,7 @@ public:
   void printStackMap() const override;
   void printAddrsig() override;
   void printCGProfile() override;
+  void printBBAddrMaps(bool PrettyPGOAnalysis) override;
   void printStringTable() override;
 
 private:
@@ -2484,6 +2489,142 @@ void COFFDumper::printCGProfile() {
     W.printNumber("From", getSymbolName(FromIndex), FromIndex);
     W.printNumber("To", getSymbolName(ToIndex), ToIndex);
     W.printNumber("Weight", Count);
+  }
+}
+
+void COFFDumper::printBBAddrMaps(bool PrettyPGOAnalysis) {
+  for (const SectionRef &Sec : Obj->sections()) {
+    StringRef Name = unwrapOrError(Obj->getFileName(), Sec.getName());
+    if (Name != ".llvm_bb_addr_map")
+      continue;
+
+    ListScope L(W, "BBAddrMap");
+
+    bool IsRelocatable = Obj->isRelocatableObject();
+
+    // Build relocation translation map. In relocatable objects, function
+    // addresses are zero and resolved via relocations.
+    DenseMap<uint64_t, uint64_t> FunctionOffsetTranslations;
+    SmallVector<std::pair<uint64_t, StringRef>, 4> RelocEntries;
+    for (const RelocationRef &Reloc : Sec.relocations()) {
+      FunctionOffsetTranslations[Reloc.getOffset()] = 0;
+      StringRef SymName;
+      symbol_iterator SymI = Reloc.getSymbol();
+      if (SymI != Obj->symbol_end()) {
+        Expected<StringRef> SymNameOrErr = SymI->getName();
+        if (SymNameOrErr)
+          SymName = *SymNameOrErr;
+      }
+      RelocEntries.push_back({Reloc.getOffset(), SymName});
+    }
+    llvm::sort(RelocEntries,
+               [](const auto &A, const auto &B) { return A.first < B.first; });
+
+    StringRef Contents = unwrapOrError(Obj->getFileName(), Sec.getContents());
+
+    unsigned AddrSize = Obj->getBytesInAddress();
+    DataExtractor Data(Contents, /*IsLittleEndian=*/true, AddrSize);
+    std::vector<PGOAnalysisMap> PGOAnalyses;
+    Expected<std::vector<BBAddrMap>> BBAddrMapOrErr =
+        decodeBBAddrMapSection(Data, AddrSize, FunctionOffsetTranslations,
+                               IsRelocatable, Name, &PGOAnalyses);
+    if (!BBAddrMapOrErr) {
+      reportUniqueWarning("unable to decode .llvm_bb_addr_map section: " +
+                          toString(BBAddrMapOrErr.takeError()));
+      continue;
+    }
+
+    size_t RelocIdx = 0;
+    for (const auto &[AM, PAM] : zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
+      DictScope D(W, "Function");
+      W.printHex("At", AM.getFunctionAddress());
+
+      std::string FuncName = "<?>";
+      if (IsRelocatable) {
+        if (RelocIdx < RelocEntries.size())
+          FuncName = std::string(RelocEntries[RelocIdx].second);
+      } else {
+        uint64_t FuncAddr = AM.getFunctionAddress();
+        for (const SymbolRef &Sym : Obj->symbols()) {
+          Expected<uint64_t> AddrOrErr = Sym.getAddress();
+          if (AddrOrErr && *AddrOrErr == FuncAddr) {
+            Expected<StringRef> NameOrErr = Sym.getName();
+            if (NameOrErr) {
+              FuncName = std::string(*NameOrErr);
+              break;
+            }
+          }
+        }
+      }
+      W.printString("Name", FuncName);
+
+      {
+        ListScope BBRL(W, "BB Ranges");
+        for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
+          DictScope BBRD(W);
+          W.printHex("Base Address", BBR.BaseAddress);
+          ListScope BBEL(W, "BB Entries");
+          for (const BBAddrMap::BBEntry &BBE : BBR.BBEntries) {
+            DictScope BBED(W);
+            W.printNumber("ID", BBE.ID);
+            W.printHex("Offset", BBE.Offset);
+            if (!BBE.CallsiteEndOffsets.empty())
+              W.printList("Callsite End Offsets", BBE.CallsiteEndOffsets);
+            if (PAM.FeatEnable.BBHash)
+              W.printHex("Hash", BBE.Hash);
+            W.printHex("Size", BBE.Size);
+            W.printBoolean("HasReturn", BBE.hasReturn());
+            W.printBoolean("HasTailCall", BBE.hasTailCall());
+            W.printBoolean("IsEHPad", BBE.isEHPad());
+            W.printBoolean("CanFallThrough", BBE.canFallThrough());
+            W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
+          }
+          ++RelocIdx;
+        }
+      }
+
+      if (PAM.FeatEnable.hasPGOAnalysis()) {
+        DictScope PD(W, "PGO analyses");
+        if (PAM.FeatEnable.FuncEntryCount)
+          W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
+
+        if (PAM.FeatEnable.hasPGOAnalysisBBData()) {
+          ListScope L(W, "PGO BB entries");
+          for (const PGOAnalysisMap::PGOBBEntry &PBBE : PAM.BBEntries) {
+            DictScope L(W);
+
+            if (PAM.FeatEnable.BBFreq) {
+              if (PrettyPGOAnalysis) {
+                std::string BlockFreqStr;
+                raw_string_ostream SS(BlockFreqStr);
+                printRelativeBlockFreq(SS, PAM.BBEntries.front().BlockFreq,
+                                       PBBE.BlockFreq);
+                W.printString("Frequency", BlockFreqStr);
+              } else {
+                W.printNumber("Frequency", PBBE.BlockFreq.getFrequency());
+              }
+              if (PAM.FeatEnable.PostLinkCfg)
+                W.printNumber("PostLink Frequency", PBBE.PostLinkBlockFreq);
+            }
+
+            if (PAM.FeatEnable.BrProb) {
+              ListScope L(W, "Successors");
+              for (const auto &Succ : PBBE.Successors) {
+                DictScope L(W);
+                W.printNumber("ID", Succ.ID);
+                if (PrettyPGOAnalysis) {
+                  W.printObject("Probability", Succ.Prob);
+                } else {
+                  W.printHex("Probability", Succ.Prob.getNumerator());
+                }
+                if (PAM.FeatEnable.PostLinkCfg)
+                  W.printNumber("PostLink Probability", Succ.PostLinkFreq);
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }
 

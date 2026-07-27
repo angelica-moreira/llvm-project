@@ -1,7 +1,7 @@
 ## This script checks that YamlProfileReader in llvm-bolt is reading data
 ## correctly and stale data is corrected by profile inference.
 
-REQUIRES: asserts
+REQUIRES: system-linux, asserts
 RUN: yaml2obj %p/Inputs/blarge.yaml &> %t.exe
 RUN: llvm-bolt %t.exe -o %t.null --b %p/Inputs/blarge_profile_stale.yaml \
 RUN:   --infer-stale-profile=0 --profile-ignore-hash=1 --profile-use-dfs=0 \

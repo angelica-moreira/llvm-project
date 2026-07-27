@@ -518,6 +518,8 @@ static void dumpObject(ObjectFile &Obj, ScopedPrinter &Writer,
       Dumper->printCGProfile();
     if (opts::Addrsig)
       Dumper->printAddrsig();
+    if (opts::BBAddrMap)
+      Dumper->printBBAddrMaps(opts::PrettyPGOAnalysisMap);
     if (opts::CodeView)
       Dumper->printCodeViewDebugInfo();
     if (opts::CodeViewMergedTypes)

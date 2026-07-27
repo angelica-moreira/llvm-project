@@ -1,0 +1,8 @@
+## Test that llvm-bolt gracefully handles a PE/COFF binary with no .pdata
+## section. It should report the missing section and still produce output.
+
+# RUN: yaml2obj %p/Inputs/no-pdata.yaml -o %t.exe
+# RUN: llvm-bolt %t.exe -o %t.out.exe 2>&1 | FileCheck %s
+
+# CHECK: BOLT-INFO: processing PE/COFF binary
+# CHECK: BOLT-WARNING: no .pdata section found

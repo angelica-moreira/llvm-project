@@ -778,8 +778,11 @@ void BinaryEmitter::emitLineInfoEnd(const BinaryFunction &BF,
 
 void BinaryEmitter::emitJumpTables(const BinaryFunction &BF) {
   MCSection *ReadOnlySection = BC.MOFI->getReadOnlySection();
-  MCSection *ReadOnlyColdSection = BC.MOFI->getContext().getELFSection(
-      ".rodata.cold", ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+  // COFF and MachO have no separate cold read-only section.
+  MCSection *ReadOnlyColdSection =
+      BC.isELF() ? BC.MOFI->getContext().getELFSection(
+                       ".rodata.cold", ELF::SHT_PROGBITS, ELF::SHF_ALLOC)
+                 : ReadOnlySection;
 
   if (!BF.hasJumpTables())
     return;

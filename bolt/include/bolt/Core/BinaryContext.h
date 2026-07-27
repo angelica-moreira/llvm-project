@@ -26,6 +26,7 @@
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/iterator.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/ExecutionEngine/Orc/SymbolStringPool.h"
@@ -35,6 +36,7 @@
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCPseudoProbe.h"
+#include "llvm/MC/MCSectionCOFF.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
@@ -717,6 +719,12 @@ public:
   /// Indicates if relocations are available for usage.
   bool HasRelocations{false};
 
+  /// When set, retain an offset annotation on every disassembled instruction,
+  /// not just calls/branches/returns.  Needed by the PE/COFF C++ EH relocator,
+  /// which requires per-instruction input->output address translation to
+  /// regenerate MSVC ip2state tables after reordering.
+  bool KeepAllOffsets{false};
+
   /// Indicates if the binary is stripped
   bool IsStripped{false};
 
@@ -889,6 +897,8 @@ public:
   bool isELF() const { return TheTriple->isOSBinFormatELF(); }
 
   bool isMachO() const { return TheTriple->isOSBinFormatMachO(); }
+
+  bool isCOFF() const { return TheTriple->isOSBinFormatCOFF(); }
 
   bool isAArch64() const {
     return TheTriple->getArch() == llvm::Triple::aarch64;
@@ -1086,6 +1096,10 @@ public:
     if (isELF())
       return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS,
                                 ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+    else if (isCOFF())
+      return Ctx->getCOFFSection(SectionName, COFF::IMAGE_SCN_CNT_CODE |
+                                                  COFF::IMAGE_SCN_MEM_EXECUTE |
+                                                  COFF::IMAGE_SCN_MEM_READ);
     else
       return Ctx->getMachOSection("__TEXT", SectionName,
                                   MachO::S_ATTR_PURE_INSTRUCTIONS,
@@ -1094,7 +1108,14 @@ public:
 
   /// Return data section with a given name.
   MCSection *getDataSection(StringRef SectionName) const {
-    return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+    if (isCOFF())
+      return Ctx->getCOFFSection(SectionName,
+                                 COFF::IMAGE_SCN_CNT_INITIALIZED_DATA |
+                                     COFF::IMAGE_SCN_MEM_READ);
+    if (isELF())
+      return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
+    return Ctx->getMachOSection("__DATA", SectionName, 0,
+                                SectionKind::getData());
   }
 
   /// \name Pre-assigned Section Names
@@ -1475,8 +1496,9 @@ public:
   /// Return true if instruction \p Inst requires an offset for further
   /// processing (e.g. assigning a profile).
   bool keepOffsetForInstruction(const MCInst &Inst) const {
-    if (MIB->isCall(Inst) || MIB->isBranch(Inst) || MIB->isReturn(Inst) ||
-        MIB->isPrefix(Inst) || MIB->isIndirectBranch(Inst)) {
+    if (KeepAllOffsets || MIB->isCall(Inst) || MIB->isBranch(Inst) ||
+        MIB->isReturn(Inst) || MIB->isPrefix(Inst) ||
+        MIB->isIndirectBranch(Inst)) {
       return true;
     }
     return false;
