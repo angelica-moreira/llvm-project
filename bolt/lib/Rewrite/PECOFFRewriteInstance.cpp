@@ -1383,8 +1383,9 @@ void PECOFFRewriteInstance::rewriteFile() {
         Function.getOutputAddress() == Function.getAddress())
       continue;
     if (!HasReusableUnwindInfo(Function))
-      report_fatal_error(
-          "out-of-place PE/COFF function changed unwind-covered prolog");
+      report_fatal_error(Twine("out-of-place PE/COFF function 0x") +
+                         Twine::utohexstr(Function.getAddress()) +
+                         " changed unwind-covered prolog");
   }
 
   uint64_t InPlaceCount = 0;
@@ -2239,7 +2240,8 @@ void PECOFFRewriteInstance::run() {
           SafeProlog = false;
           break;
         }
-        if (BC->MIB->isBranch(Inst) || BC->MIB->hasPCRelOperand(Inst)) {
+        if (BC->MIB->isBranch(Inst) || BC->MIB->isCall(Inst) ||
+            BC->MIB->hasPCRelOperand(Inst)) {
           SafeProlog = false;
           break;
         }
